@@ -42,8 +42,9 @@ public:
     void stop()
     {
         is_stopped = true;
-        task->deactivate();
-        if (!server_host_ports.empty())
+        if (task)
+            task->deactivate();
+        if (!server_host_ports.empty() && heartbeat_task)
             heartbeat_task->deactivate();
     }
 

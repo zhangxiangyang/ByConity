@@ -17,6 +17,7 @@
 #include <Processors/QueryPipeline.h>
 #include <Processors/Transforms/MergeSortingTransform.h>
 #include <Processors/Transforms/PartialSortingTransform.h>
+#include <Processors/Transforms/FinishSortingTransform.h>
 #include <Processors/Transforms/LimitsCheckingTransform.h>
 #include <Processors/Merges/MergingSortedTransform.h>
 #include <IO/Operators.h>
@@ -26,14 +27,14 @@
 namespace DB
 {
 
-static ITransformingStep::Traits getTraits(size_t limit)
+static ITransformingStep::Traits getTraits(size_t limit, bool is_final_sorting = false)
 {
     return ITransformingStep::Traits
         {
             {
                 .preserves_distinct_columns = true,
-                .returns_single_stream = false,
-                .preserves_number_of_streams = true,
+                .returns_single_stream = is_final_sorting,
+                .preserves_number_of_streams = !is_final_sorting,
                 .preserves_sorting = false,
             },
             {
@@ -44,16 +45,18 @@ static ITransformingStep::Traits getTraits(size_t limit)
 
 SortingStep::SortingStep(
     const DataStream & input_stream_,
-    const SortDescription & description_,
+    SortDescription result_description_,
     UInt64 limit_,
-    bool partial_)
-    : ITransformingStep(input_stream_, input_stream_.header, getTraits(limit_))
-    , description(description_)
+    bool partial_,
+    SortDescription prefix_description_)
+    : ITransformingStep(input_stream_, input_stream_.header, getTraits(limit_, !partial_))
+    , result_description(result_description_)
     , limit(limit_)
     , partial(partial_)
+    , prefix_description(prefix_description_)
 {
     /// TODO: check input_stream is partially sorted by the same description.
-    output_stream->sort_description = description;
+    output_stream->sort_description = result_description;
     output_stream->sort_mode = input_stream_.has_single_port ? DataStream::SortMode::Stream
                                                              : DataStream::SortMode::Port;
 }
@@ -78,7 +81,43 @@ void SortingStep::transformPipeline(QueryPipeline & pipeline, const BuildQueryPi
     auto local_settings = settings.context->getSettingsRef();
     SizeLimits size_limits(local_settings.max_rows_to_sort, local_settings.max_bytes_to_sort, local_settings.sort_overflow_mode);
 
-    auto desc_copy = description;
+    auto desc_copy = result_description;
+
+    // finish sorting
+    if (!prefix_description.empty())
+    {
+        bool need_finish_sorting = (prefix_description.size() < result_description.size());
+        if (pipeline.getNumStreams() > 1)
+        {
+            UInt64 limit_for_merging = (need_finish_sorting ? 0 : limit);
+            auto transform = std::make_shared<MergingSortedTransform>(
+                    pipeline.getHeader(),
+                    pipeline.getNumStreams(),
+                    prefix_description,
+                    local_settings.max_block_size, limit_for_merging);
+
+            pipeline.addTransform(std::move(transform));
+        }
+
+        if (need_finish_sorting)
+        {
+            pipeline.addSimpleTransform([&](const Block & header, QueryPipeline::StreamType stream_type) -> ProcessorPtr
+            {
+                if (stream_type != QueryPipeline::StreamType::Main)
+                    return nullptr;
+
+                return std::make_shared<PartialSortingTransform>(header, result_description, limit);
+            });
+
+            /// NOTE limits are not applied to the size of temporary sets in FinishSortingTransform
+            pipeline.addSimpleTransform([&](const Block & header) -> ProcessorPtr
+            {
+                return std::make_shared<FinishSortingTransform>(
+                    header, prefix_description, result_description, local_settings.max_block_size, limit);
+            });
+        }
+        return;
+    }
 
     pipeline.addSimpleTransform([&](const Block & header, QueryPipeline::StreamType stream_type) -> ProcessorPtr
                                 {
@@ -107,7 +146,7 @@ void SortingStep::transformPipeline(QueryPipeline & pipeline, const BuildQueryPi
                                         return nullptr;
 
                                     return std::make_shared<MergeSortingTransform>(
-                                        header, description, local_settings.max_block_size, limit,
+                                        header, result_description, local_settings.max_block_size, limit,
                                         local_settings.max_bytes_before_remerge_sort / pipeline.getNumStreams(),
                                         local_settings.remerge_sort_lowered_memory_bytes_ratio,
                                         local_settings.max_bytes_before_external_sort,
@@ -135,7 +174,7 @@ void SortingStep::describeActions(FormatSettings & settings) const
 {
     String prefix(settings.offset, ' ');
     settings.out << prefix << "Sort description: ";
-    dumpSortDescription(description, input_streams.front().header, settings.out);
+    dumpSortDescription(result_description, input_streams.front().header, settings.out);
     settings.out << '\n';
 
     if (limit)
@@ -144,54 +183,55 @@ void SortingStep::describeActions(FormatSettings & settings) const
 
 void SortingStep::describeActions(JSONBuilder::JSONMap & map) const
 {
-    map.add("Sort Description", explainSortDescription(description, input_streams.front().header));
+    map.add("Sort Description", explainSortDescription(result_description, input_streams.front().header));
 
     if (limit)
         map.add("Limit", limit);
 }
 
-void SortingStep::serialize(WriteBuffer & buffer) const
+std::shared_ptr<SortingStep> SortingStep::fromProto(const Protos::SortingStep & proto, ContextPtr)
 {
-    IQueryPlanStep::serializeImpl(buffer);
-    serializeItemVector<SortColumnDescription>(description, buffer);
-    writeBinary(limit, buffer);
-    writeBinary(partial, buffer);
-}
-
-QueryPlanStepPtr SortingStep::deserialize(ReadBuffer & buffer, ContextPtr)
-{
-    String step_description;
-    readBinary(step_description, buffer);
-
-    DataStream input_stream;
-    input_stream = deserializeDataStream(buffer);
-
-    SortDescription sort_description;
-    sort_description = deserializeItemVector<SortColumnDescription>(buffer);
-
-    UInt64 limit;
-    readBinary(limit, buffer);
-
-    bool partial;
-    readVarUInt(partial, buffer);
-
-    auto step =  std::make_unique<SortingStep>(
-        input_stream,
-        sort_description,
-        limit,
-        partial);
-
+    auto [step_description, base_input_stream] = ITransformingStep::deserializeFromProtoBase(proto.query_plan_base());
+    SortDescription result_description;
+    for (const auto & proto_element : proto.result_description())
+    {
+        SortColumnDescription element;
+        element.fillFromProto(proto_element);
+        result_description.emplace_back(std::move(element));
+    }
+    auto limit = proto.limit();
+    auto partial = proto.partial();
+    SortDescription prefix_description;
+    for (const auto & proto_element : proto.prefix_description())
+    {
+        SortColumnDescription element;
+        element.fillFromProto(proto_element);
+        prefix_description.emplace_back(std::move(element));
+    }
+    auto step = std::make_shared<SortingStep>(base_input_stream, result_description, limit, partial, prefix_description);
     step->setStepDescription(step_description);
     return step;
+}
+
+void SortingStep::toProto(Protos::SortingStep & proto, bool) const
+{
+    ITransformingStep::serializeToProtoBase(*proto.mutable_query_plan_base());
+    for (const auto & element : result_description)
+        element.toProto(*proto.add_result_description());
+    proto.set_limit(limit);
+    proto.set_partial(partial);
+    for (const auto & element : prefix_description)
+        element.toProto(*proto.add_prefix_description());
 }
 
 std::shared_ptr<IQueryPlanStep> SortingStep::copy(ContextPtr) const
 {
     return std::make_shared<SortingStep>(
         input_streams[0],
-        description,
+        result_description,
         limit,
-        partial);
+        partial,
+        prefix_description);
 }
 
 }

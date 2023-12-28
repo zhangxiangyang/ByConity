@@ -17,15 +17,25 @@
 
 #include <memory>
 #include <vector>
-#include "common/types.h"
+#include <fmt/core.h>
+#include <fmt/format.h>
+#include <common/types.h>
 
 namespace DB
 {
 class IBroadcastReceiver;
 class IBroadcastSender;
+class BroadcastSenderProxy;
+class DiskPartitionWriter;
+class DiskExchangeDataManager;
 using BroadcastReceiverPtr = std::shared_ptr<IBroadcastReceiver>;
+using BroadcastReceiverPtrs = std::vector<BroadcastReceiverPtr>;
 using BroadcastSenderPtr = std::shared_ptr<IBroadcastSender>;
 using BroadcastSenderPtrs = std::vector<BroadcastSenderPtr>;
+using BroadcastSenderProxyPtr = std::shared_ptr<BroadcastSenderProxy>;
+using BroadcastSenderProxyPtrs = std::vector<BroadcastSenderProxyPtr>;
+using DiskPartitionWriterPtr = std::shared_ptr<DiskPartitionWriter>;
+using DiskExchangeDataManagerPtr = std::shared_ptr<DiskExchangeDataManager>;
 
 /// Status code indicates the status of the broadcaster which consists by connected senders and receiver.
 /// We should cancel data transport immediately when return positive status code and close gracefully when meet negative code.
@@ -39,10 +49,13 @@ enum BroadcastStatusCode
     SEND_TIMEOUT = 9013,
     RECV_CANCELLED = 9014,
     SEND_CANCELLED = 9015,
-    SEND_NOT_READY = 9016,
+    RECV_NOT_READY = 9016,
+    SEND_NOT_READY = 9017,
     RECV_UNKNOWN_ERROR = 90099,
     SEND_UNKNOWN_ERROR = 900100
 };
+
+String toString(BroadcastStatusCode code);
 
 struct BroadcastStatus
 {
@@ -73,3 +86,25 @@ struct BroadcastStatus
 
 
 }
+
+template <>
+struct fmt::formatter<DB::BroadcastStatusCode>
+{
+    constexpr auto parse(format_parse_context & ctx)
+    {
+        const auto * it = ctx.begin();
+        const auto * end = ctx.end();
+
+        /// Only support {}.
+        if (it != end && *it != '}')
+            throw format_error("Invalid format for struct ExchangeDataKey");
+
+        return it;
+    }
+
+    template <typename FormatContext>
+    auto format(const DB::BroadcastStatusCode & code, FormatContext & ctx)
+    {
+        return format_to(ctx.out(), "{}", toString(code));
+    }
+};

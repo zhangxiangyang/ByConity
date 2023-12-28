@@ -21,17 +21,26 @@
 
 #pragma once
 
-#include <Interpreters/PreparedSets.h>
-#include <Interpreters/DatabaseAndTableWithAlias.h>
-#include <Core/SortDescription.h>
+#include <memory>
 #include <Core/Names.h>
-#include <Storages/ProjectionsDescription.h>
+#include <Core/SortDescription.h>
 #include <Interpreters/AggregateDescription.h>
 #include <Interpreters/Context_fwd.h>
-#include <memory>
+#include <Interpreters/DatabaseAndTableWithAlias.h>
+#include <Interpreters/PreparedSets.h>
+#include <Parsers/ASTSelectQuery.h>
+#include <Storages/IStorage_fwd.h>
+#include <Storages/ProjectionsDescription.h>
+#include <Storages/MergeTree/Index/MergeTreeIndexHelper.h>
 
 namespace DB
 {
+
+namespace Protos
+{
+    class InputOrderInfo;
+    class SelectQueryInfo;
+}
 
 class ExpressionActions;
 using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
@@ -60,6 +69,9 @@ using ReadInOrderOptimizerPtr = std::shared_ptr<const ReadInOrderOptimizer>;
 class Cluster;
 using ClusterPtr = std::shared_ptr<Cluster>;
 
+struct MergeTreeDataSelectAnalysisResult;
+using MergeTreeDataSelectAnalysisResultPtr = std::shared_ptr<MergeTreeDataSelectAnalysisResult>;
+
 struct PrewhereInfo
 {
     /// Actions which are executed in order to alias columns are used for prewhere actions.
@@ -73,15 +85,14 @@ struct PrewhereInfo
     String prewhere_column_name;
     bool remove_prewhere_column = false;
     bool need_filter = false;
+    MergeTreeIndexContextPtr index_context;
 
     PrewhereInfo() = default;
+    PrewhereInfo(const PrewhereInfo &) = default;
     explicit PrewhereInfo(ActionsDAGPtr prewhere_actions_, String prewhere_column_name_)
             : prewhere_actions(std::move(prewhere_actions_)), prewhere_column_name(std::move(prewhere_column_name_)) {}
 
     std::string dump() const;
-
-    void serialize(WriteBuffer & buf) const;
-    static PrewhereInfoPtr deserialize(ReadBuffer & buf, ContextPtr context);
 };
 
 /// Helper struct to store all the information about the filter expression.
@@ -120,8 +131,8 @@ struct InputOrderInfo
 
     bool operator !=(const InputOrderInfo & other) const { return !(*this == other); }
 
-    void serialize(WriteBuffer & buf) const;
-    void deserialize(ReadBuffer & buf);
+    void toProto(Protos::InputOrderInfo & proto) const;
+    static std::shared_ptr<InputOrderInfo> fromProto(const Protos::InputOrderInfo & proto, ContextPtr context);
 };
 
 class IMergeTreeDataPart;
@@ -148,6 +159,7 @@ struct ProjectionCandidate
     ManyExpressionActions group_by_elements_actions;
 };
 
+class InterpreterSelectQuery;
 /** Query along with some additional data,
   *  that can be used during query processing
   *  inside storage engines.
@@ -156,6 +168,7 @@ struct SelectQueryInfo
 {
     ASTPtr query;
     ASTPtr view_query; /// Optimized VIEW query
+    ASTPtr partition_filter; /// partition filter
 
     /// Cluster for the query.
     ClusterPtr cluster;
@@ -172,6 +185,8 @@ struct SelectQueryInfo
     ReadInOrderOptimizerPtr order_optimizer;
     /// Can be modified while reading from storage
     InputOrderInfoPtr input_order_info;
+
+    MergeTreeIndexContextPtr index_context;
 
     /// Prepared sets are used for indices by storage engine.
     /// Example: x IN (1, 2, 3)
@@ -190,8 +205,34 @@ struct SelectQueryInfo
     /// Read from local table
     bool read_local_table = true;
 
-    void serialize(WriteBuffer &) const;
-    void deserialize(ReadBuffer &);
+    /// Read from index
+    bool read_bitmap_index = false;
+
+    void toProto(Protos::SelectQueryInfo & proto) const;
+    void fillFromProto(const Protos::SelectQueryInfo & proto);
+
+    const ASTSelectQuery * getSelectQuery() const
+    {
+        if (!query)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Query info query is not set");
+
+        auto * select_query = query->as<ASTSelectQuery>();
+        if (!select_query)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Query info query is not a ASTSelectQuery");
+
+        return select_query;
+    }
+
+    ASTSelectQuery * getSelectQuery()
+    {
+        return const_cast<ASTSelectQuery *>((const_cast<const SelectQueryInfo *>(this))->getSelectQuery());
+    }
+
+    /// caller must hold the interpreter to prevent some resources in query_info from being released
+    static std::shared_ptr<InterpreterSelectQuery> buildQueryInfoFromQuery(ContextPtr context, const StoragePtr & storage, const String & query, SelectQueryInfo & query_info);
 };
+
+const PrewhereInfoPtr & getPrewhereInfo(const SelectQueryInfo & query_info);
+MergeTreeIndexContextPtr getIndexContext(const SelectQueryInfo & query_info);
 
 }

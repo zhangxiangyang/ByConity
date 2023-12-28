@@ -15,9 +15,10 @@
 
 #include <WorkerTasks/CloudMergeTreeMutateTask.h>
 
-#include <CloudServices/commitCnchParts.h>
+#include <CloudServices/CnchDataWriter.h>
 #include <Interpreters/Context.h>
 #include <Storages/StorageCloudMergeTree.h>
+#include <Transaction/ICnchTransaction.h>
 #include <WorkerTasks/MergeTreeDataMutator.h>
 
 namespace DB
@@ -48,7 +49,9 @@ void CloudMergeTreeMutateTask::executeImpl()
         throw Exception("Merge task " + params.task_id + " is cancelled", ErrorCodes::ABORTED);
 
     CnchDataWriter cnch_writer(storage, getContext(), ManipulationType::Mutate, params.task_id);
-    cnch_writer.dumpAndCommitCnchParts(data_parts);
+    auto res = cnch_writer.dumpAndCommitCnchParts(data_parts);
+    getContext()->getCurrentTransaction()->commitV2();
+    cnch_writer.preload(res.parts);
 }
 
 }

@@ -17,6 +17,7 @@
 
 #include <Optimizer/MaterializedView/MaterializeViewChecker.h>
 #include <Optimizer/PredicateUtils.h>
+#include <Optimizer/Utils.h>
 
 namespace DB
 {
@@ -26,7 +27,8 @@ namespace ErrorCodes
 }
 
 std::optional<MaterializedViewStructurePtr>
-MaterializedViewStructure::buildFrom(StorageMaterializedView & view, PlanNodePtr & query, ContextMutablePtr context)
+MaterializedViewStructure::buildFrom(
+    const StorageID & view_storage_id, const StorageID & target_storage_id, PlanNodePtr & query, ContextMutablePtr context)
 {
     static Poco::Logger * log = &Poco::Logger::get("MaterializedViewStructure");
     MaterializedViewPlanChecker checker;
@@ -34,7 +36,7 @@ MaterializedViewStructure::buildFrom(StorageMaterializedView & view, PlanNodePtr
     if (!is_valid)
         return {};
 
-    auto target_table = DatabaseCatalog::instance().tryGetTable(view.getTargetTableId(), context);
+    auto target_table = DatabaseCatalog::instance().tryGetTable(target_storage_id, context);
     if (!target_table)
     {
         LOG_WARNING(log, "materialized view target table not found.");
@@ -86,7 +88,7 @@ MaterializedViewStructure::buildFrom(StorageMaterializedView & view, PlanNodePtr
         LOG_WARNING(
             log,
             "size of materialized view physical columns is inconsistent with select outputs for " +
-                view.getTargetTableId().getFullTableName());
+                target_storage_id.getFullTableName());
         return {};
     }
 
@@ -94,12 +96,12 @@ MaterializedViewStructure::buildFrom(StorageMaterializedView & view, PlanNodePtr
     for (auto & table_column : table_columns)
     {
         auto & query_column = query->getCurrentDataStream().header.getByPosition(index);
-        if (!removeLowCardinality(removeNullable(query_column.type))->equals(*removeLowCardinality(removeNullable(table_column.type))))
+        if (!removeNullable(removeLowCardinality(query_column.type))->equals(*removeNullable(removeLowCardinality(table_column.type))))
         {
             LOG_WARNING(
                 log,
                 "materialized view physical columns type is inconsistent with select outputs for column " + table_column.name + " in "
-                    + view.getTargetTableId().getFullTableName());
+                    + target_storage_id.getFullTableName());
             return {};
         }
 
@@ -111,15 +113,23 @@ MaterializedViewStructure::buildFrom(StorageMaterializedView & view, PlanNodePtr
     std::shared_ptr<const AggregatingStep> aggregating_step = top_aggregate_node
         ? dynamic_pointer_cast<const AggregatingStep>(top_aggregate_node->getStep())
         : std::shared_ptr<const AggregatingStep>{};
+    auto symbol_type = Utils::extractNameToType(*query);
+    if (!symbol_type)
+    {
+        LOG_WARNING(
+            log, "materialized view " + view_storage_id.getFullTableName() + " has ambiguous column names, please re-define the MV");
+        return {};
+    }
     return std::make_shared<MaterializedViewStructure>(
-        view.getStorageID(),
-        view.getTargetTableId(),
+        view_storage_id,
+        target_storage_id,
         std::move(join_graph),
         std::move(other_predicates),
         std::move(*symbol_map),
         std::move(output_columns),
         std::move(output_columns_to_table_columns_map),
         std::move(expression_equivalences),
-        std::move(aggregating_step));
+        std::move(aggregating_step),
+        std::move(*symbol_type));
 }
 }

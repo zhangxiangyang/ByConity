@@ -66,7 +66,8 @@ public:
         MergeTreeRangeReader * prev_reader_,
         const PrewhereExprInfo * prewhere_info_,
         ImmutableDeleteBitmapPtr delete_bitmap_,
-        bool last_reader_in_chain_);
+        bool last_reader_in_chain_,
+        size_t filtered_ratio_to_use_skip_read_);
 
     MergeTreeRangeReader() = default;
 
@@ -84,7 +85,7 @@ public:
     {
     public:
         DelayedStream() = default;
-        DelayedStream(size_t from_mark, IMergeTreeReader * merge_tree_reader);
+        DelayedStream(size_t from_mark, size_t current_task_last_mark_, IMergeTreeReader * merge_tree_reader);
 
         /// Read @num_rows rows from @from_mark starting from @offset row
         /// Returns the number of rows added to block.
@@ -103,11 +104,12 @@ public:
         size_t current_offset = 0;
         /// Num of rows we have to read
         size_t num_delayed_rows = 0;
+        /// Last mark from all ranges of current task.
+        size_t current_task_last_mark = 0;
 
         /// Actual reader of data from disk
         IMergeTreeReader * merge_tree_reader = nullptr;
         const MergeTreeIndexGranularity * index_granularity = nullptr;
-        bool continue_reading = false;
         bool is_finished = true;
 
         /// Current position from the begging of file in rows
@@ -121,7 +123,7 @@ public:
     {
     public:
         Stream() = default;
-        Stream(size_t from_mark, size_t to_mark, IMergeTreeReader * merge_tree_reader);
+        Stream(size_t from_mark, size_t to_mark, size_t current_task_last_mark, IMergeTreeReader * merge_tree_reader);
 
         /// Returns the number of rows added to block.
         size_t read(Columns & columns, size_t num_rows, bool skip_remaining_rows_in_current_granule);
@@ -176,6 +178,8 @@ public:
 
         using RangesInfo = std::vector<RangeInfo>;
 
+        static size_t getLastMark(const MergeTreeRangeReader::ReadResult::RangesInfo & ranges);
+
         const RangesInfo & startedRanges() const { return started_ranges; }
         const NumRows & rowsPerGranule() const { return rows_per_granule; }
 
@@ -218,6 +222,7 @@ public:
         bool need_filter = false;
 
         Block block_before_prewhere;
+        Block bitmap_block;
 
     private:
         RangesInfo started_ranges;
@@ -254,8 +259,9 @@ public:
 private:
 
     ReadResult startReadingChain(size_t max_rows, MarkRanges & ranges);
-    Columns continueReadingChain(ReadResult & result, size_t & num_rows);
+    Columns continueReadingChain(ReadResult & result, size_t & num_rows, bool filter_when_read);
     void executePrewhereActionsAndFilterColumns(ReadResult & result);
+    void extractBitmapIndexColumns(Columns & columns, Block & bitmap_block);
 
     IMergeTreeReader * merge_tree_reader = nullptr;
     const MergeTreeIndexGranularity * index_granularity = nullptr;
@@ -269,6 +275,8 @@ private:
 
     bool last_reader_in_chain = false;
     bool is_initialized = false;
+
+    size_t filtered_ratio_to_use_skip_read = 0;
 };
 
 }

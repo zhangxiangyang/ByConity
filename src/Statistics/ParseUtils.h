@@ -14,11 +14,12 @@
  */
 
 #pragma once
+#include <type_traits>
 #include <Statistics/BucketBounds.h>
 #include <Statistics/CatalogAdaptor.h>
 #include <Statistics/CollectorSettings.h>
 #include <Statistics/StatisticsCommon.h>
-#include <Statistics/StatsCpcSketch.h>
+#include <Statistics/StatsHllSketch.h>
 #include <Statistics/StatsNdvBucketsResult.h>
 #include <Statistics/TableHandler.h>
 #include <Statistics/TypeUtils.h>
@@ -30,8 +31,9 @@ enum class WrapperKind
 {
     Invalid = 0,
     None = 1,
-    StringToHash64 = 2, // when necessary, apply "cityHash64" in sql
-    DecimalToFloat64 = 3, // when necessary, apply "toFloat64" in sql
+    StringToHash64 = 2, // apply "cityHash64" in sql
+    DecimalToFloat64 = 3, // apply "toFloat64" in sql
+    FixedStringToHash64 = 4, // apply "cityHash64 . toString" in sql
 };
 
 
@@ -44,29 +46,27 @@ struct ColumnCollectConfig
     bool need_minmax = false;
 };
 
-inline ColumnCollectConfig get_column_config(const CollectorSettings & settings, const DataTypePtr & type)
+inline ColumnCollectConfig getColumnConfig(const CollectorSettings & settings, const DataTypePtr & type)
 {
     ColumnCollectConfig config;
     config.need_count = true;
     config.need_ndv = true;
     config.need_histogram = true;
-    config.need_minmax = true;
+    config.need_minmax = false;
 
     if (!settings.collect_histogram)
     {
         config.need_histogram = false;
-    }
-    else if (!settings.collect_floating_histogram)
-    {
-        if (isFloat(type) || isDecimal(type))
-        {
-            config.need_histogram = false;
-        }
+        config.need_minmax = true;
     }
 
-    if (isStringOrFixedString(type))
+    if (isString(type))
     {
         config.wrapper_kind = WrapperKind::StringToHash64;
+    }
+    else if (isFixedString(type))
+    {
+        config.wrapper_kind = WrapperKind::FixedStringToHash64;
     }
     else if (isColumnedAsDecimal(type))
     {
@@ -94,21 +94,34 @@ inline T getSingleValue(const Block & block, size_t index)
     {
         return col->getUInt(0);
     }
+    else if constexpr (std::is_same_v<T, double>)
+    {
+        if (col->isNullAt(0))
+        {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        union
+        {
+            Float64 f64;
+            UInt64 u64;
+        } x;
+        x.u64 = col->get64(0);
+        return x.f64;
+    }
     else
     {
         static_assert(impl::always_false_v<T>, "not implemented");
     }
 }
 
-inline Float64 getNdvFromBase64(std::string_view b64_blob)
+inline Float64 getNdvFromSketchBinary(std::string_view blob)
 {
-    if (b64_blob.empty())
+    if (blob.empty())
     {
         return 0;
     }
-    auto blob = base64Decode(b64_blob);
-    auto cpc = createStatisticsUntyped<StatsCpcSketch>(StatisticsTag::CpcSketch, blob);
-    return cpc->get_estimate();
+    auto hll = createStatisticsUntyped<StatsHllSketch>(StatisticsTag::HllSketch, blob);
+    return hll->getEstimate();
 }
 
 inline String getWrappedColumnName(const ColumnCollectConfig & config, const String & col_name)
@@ -120,6 +133,8 @@ inline String getWrappedColumnName(const ColumnCollectConfig & config, const Str
             return col_name;
         case WrapperKind::StringToHash64:
             return fmt::format(FMT_STRING("cityHash64({})"), col_name);
+        case WrapperKind::FixedStringToHash64:
+            return fmt::format(FMT_STRING("cityHash64(toString({}))"), col_name);
         case WrapperKind::DecimalToFloat64:
             return fmt::format(FMT_STRING("toFloat64({})"), col_name);
         default:
@@ -127,5 +142,16 @@ inline String getWrappedColumnName(const ColumnCollectConfig & config, const Str
     }
 }
 
+inline String getKllFuncNameWithConfig(UInt64 kll_log_k)
+{
+    if (kll_log_k == DEFAULT_KLL_SKETCH_LOG_K)
+    {
+        return "kll";
+    }
+    else
+    {
+        return fmt::format("kll({})", kll_log_k);
+    }
+}
 
 }

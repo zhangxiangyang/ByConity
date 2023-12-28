@@ -64,6 +64,7 @@ void BlockIO::reset()
     if (process_list_entry)
         process_list_entry->get().releaseQueryStreams();
     pipeline.reset();
+    coordinator.reset();
     plan_segment_process_entry.reset();
     process_list_entry.reset();
 
@@ -78,6 +79,7 @@ BlockIO & BlockIO::operator= (BlockIO && rhs)
     /// Explicitly reset fields, so everything is destructed in right order
     reset();
 
+    coordinator = std::move(rhs.coordinator);
     process_list_entry      = std::move(rhs.process_list_entry);
     plan_segment_process_entry = std::move(rhs.plan_segment_process_entry);
     in                      = std::move(rhs.in);
@@ -88,6 +90,8 @@ BlockIO & BlockIO::operator= (BlockIO && rhs)
     exception_callback      = std::move(rhs.exception_callback);
 
     null_format             = std::move(rhs.null_format);
+
+    remote_execution_conn = std::move(rhs.remote_execution_conn);
 
     return *this;
 }

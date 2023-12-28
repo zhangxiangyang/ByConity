@@ -19,7 +19,7 @@
 #include <CloudServices/CnchPartsHelper.h>
 #include <CloudServices/CnchServerClientPool.h>
 #include <CloudServices/DedupWorkerStatus.h>
-#include <CloudServices/commitCnchParts.h>
+#include <CloudServices/CnchDataWriter.h>
 #include <Interpreters/InterpreterDropQuery.h>
 #include <MergeTreeCommon/MergeTreeDataDeduper.h>
 #include <Parsers/ASTDropQuery.h>
@@ -29,7 +29,12 @@
 
 namespace ProfileEvents
 {
-extern const Event BackgroundDedupSchedulePoolTask;
+    extern const Event ScheduledDedupTaskNumber;
+}
+
+namespace CurrentMetrics
+{
+    extern const Metric BackgroundDedupSchedulePoolTask;
 }
 
 namespace DB
@@ -106,7 +111,8 @@ void CloudMergeTreeDedupWorker::iterate()
         return;
     }
 
-    // ProfileEvents::increment(ProfileEvents::BackgroundDedupSchedulePoolTask);
+    ProfileEvents::increment(ProfileEvents::ScheduledDedupTaskNumber);
+    CurrentMetrics::Increment metric_increment{CurrentMetrics::BackgroundDedupSchedulePoolTask};
 
     DedupWorkerStatus copy_status = getDedupWorkerStatus();
 
@@ -171,22 +177,22 @@ void CloudMergeTreeDedupWorker::iterate()
         sorted_partitions.insert(part->info.partition_id);
 
     CnchDedupHelper::DedupScope scope = storage.getSettings()->partition_level_unique_keys
-        ? CnchDedupHelper::DedupScope::Partitions(sorted_partitions)
-        : CnchDedupHelper::DedupScope::Table();
+        ? CnchDedupHelper::DedupScope::PartitionDedup(sorted_partitions)
+        : CnchDedupHelper::DedupScope::TableDedup();
 
     Stopwatch watch;
-    CnchLockHolder cnch_lock(
-        *context,
+    auto cnch_lock = txn->createLockHolder(
         CnchDedupHelper::getLocksToAcquire(
-            scope, txn->getTransactionID(), storage, storage.getSettings()->dedup_acquire_lock_timeout.value.totalMilliseconds()));
-    cnch_lock.lock();
+            scope, txn->getTransactionID(), storage, storage.getSettings()->unique_acquire_write_lock_timeout.value.totalMilliseconds()));
+
+    cnch_lock->lock();
 
     /// get staged parts again after acquired the locks
     ts = context->getTimestamp(); /// must get a new ts after locks are acquired
     staged_parts = CnchDedupHelper::getStagedPartsToDedup(scope, *cnch_table, ts);
     if (staged_parts.empty())
     {
-        LOG_INFO(log, "no more staged parts after acquried the locks, they may have been processed by other thread");
+        LOG_INFO(log, "no more staged parts after acquired the locks, they may have been processed by other thread");
         return;
     }
 
@@ -199,9 +205,9 @@ void CloudMergeTreeDedupWorker::iterate()
         LOG_DEBUG(log, "Dedup staged part: {}, commit time: {} ms.", part->name, part->commit_time.toMillisecond());
     }
 
-    if (scope.isPartitions())
+    if (!scope.isTableDedup())
     {
-        scope = CnchDedupHelper::DedupScope::Partitions(sorted_partitions);
+        scope = CnchDedupHelper::DedupScope::PartitionDedup(sorted_partitions);
     }
     MergeTreeDataPartsCNCHVector visible_parts = CnchDedupHelper::getVisiblePartsToDedup(scope, *cnch_table, ts);
 

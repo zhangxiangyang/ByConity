@@ -74,6 +74,12 @@ public:
         ADD_CONSTRAINT,
         DROP_CONSTRAINT,
 
+        ADD_FOREIGN_KEY,
+        DROP_FOREIGN_KEY,
+
+        ADD_UNIQUE_NOT_ENFORCED,
+        DROP_UNIQUE_NOT_ENFORCED,
+
         ADD_PROJECTION,
         DROP_PROJECTION,
         MATERIALIZE_PROJECTION,
@@ -95,6 +101,7 @@ public:
 
         DROP_PARTITION_WHERE,
         FETCH_PARTITION_WHERE,
+        RECLUSTER_PARTITION_WHERE,
 
         BUILD_BITMAP_OF_PARTITION_WHERE,
         BUILD_BITMAP_OF_PARTITION,
@@ -117,6 +124,10 @@ public:
         LIVE_VIEW_REFRESH,
 
         SAMPLE_PARTITION_WHERE,
+
+        CHANGE_ENGINE,
+
+        MODIFY_DATABASE_SETTING,
     };
 
     Type type = NO_TYPE;
@@ -161,9 +172,25 @@ public:
     */
     ASTPtr constraint_decl;
 
+    /** The ADD FOREIGN KEY query stores the ForeignKeyDeclaration there.
+    */
+    ASTPtr foreign_key_decl;
+
+    /** The ADD UNIQUE query stores the ForeignKeyDeclaration there.
+    */
+    ASTPtr unique_not_enforced_decl;
+
     /** The DROP CONSTRAINT query stores the name for deletion.
     */
     ASTPtr constraint;
+
+    /** The DROP FOREIGN KEY query stores the name for deletion.
+    */
+    ASTPtr foreign_key;
+
+    /** The DROP UNIQUE query stores the name for deletion.
+    */
+    ASTPtr unique_not_enforced;
 
     /** The ADD PROJECTION query stores the ProjectionDeclaration there.
      */
@@ -209,13 +236,16 @@ public:
     /// For CLEAR MAP KEY map_column('map_key1', 'map_key2'...)
     ASTPtr map_keys;
 
-    /// For FASTDELETE / INGESTION query, the optional list of columns to overwrite
+    /// For INGESTION query, the optional list of columns to overwrite
     ASTPtr columns;
     /// For Ingestion columns
     ASTPtr keys;
 
     /// For sample / split / resharding expression
     ASTPtr with_sharding_exp;
+
+    /// For Engine = EngineName(...), the name with optional parameters is stored here.
+    ASTPtr engine;
 
     bool detach = false;        /// true for DETACH PARTITION
 
@@ -281,7 +311,15 @@ protected:
 class ASTAlterQuery : public ASTQueryWithTableAndOutput, public ASTQueryWithOnCluster
 {
 public:
-    bool is_live_view{false}; /// true for ALTER LIVE VIEW
+    enum class AlterObjectType
+    {
+        TABLE,
+        DATABASE,
+        LIVE_VIEW,
+        UNKNOWN,
+    };
+
+    AlterObjectType alter_object = AlterObjectType::UNKNOWN;
 
     ASTExpressionList * command_list = nullptr;
 

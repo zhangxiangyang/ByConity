@@ -18,11 +18,14 @@
 #include <Core/Types.h>
 #include <Optimizer/CardinalityEstimate/PlanNodeStatistics.h>
 #include <Optimizer/Cascades/GroupExpression.h>
+#include <Optimizer/Property/Constants.h>
 #include <Optimizer/Property/Property.h>
+#include <Optimizer/Property/SymbolEquivalencesDeriver.h>
 #include <Optimizer/Rule/Transformation/JoinEnumOnGraph.h>
-#include <Optimizer/SymbolEquivalencesDeriver.h>
+#include <Optimizer/DataDependency/DataDependency.h>
 
 #include <memory>
+#include <string>
 
 namespace DB
 {
@@ -48,7 +51,14 @@ public:
     bool isSimpleChildren() const { return simple_children; }
     bool isTableScan() const { return is_table_scan; }
     bool isMagic() const { return is_magic; }
-    UInt32 getMaxTableScans() const { return max_table_scans; }
+    UInt64 getMaxTableScans() const
+    {
+        return max_table_scans;
+    }
+    UInt64 getMaxTableScanRows() const
+    {
+        return max_table_scan_rows;
+    }
 
     void setMagic(bool is_magic_) { is_magic = is_magic_; }
 
@@ -71,7 +81,8 @@ public:
         {
             return lowest_cost_expressions.at(property_set);
         }
-        throw Exception("Cascades can not build plan", ErrorCodes::PLAN_BUILD_ERROR);
+        throw Exception(
+            "Cascades can not build plan, Group " + std::to_string(id) + " " + property_set.toString(), ErrorCodes::PLAN_BUILD_ERROR);
     }
 
     bool hasWinner(const Property & property_set) const { return lowest_cost_expressions.contains(property_set); }
@@ -89,7 +100,12 @@ public:
 
     const std::vector<GroupExprPtr> & getLogicalExpressions() const { return logical_expressions; }
     const std::vector<GroupExprPtr> & getPhysicalExpressions() const { return physical_expressions; }
-    ConstQueryPlanStepPtr & getStep() const { return logical_expressions[0]->getStep(); }
+    QueryPlanStepPtr & getStep() const
+    {
+        if (logical_expressions.size() == 0)
+            return physical_expressions[0]->getStep();
+        return logical_expressions[0]->getStep();
+    }
     PlanNodePtr createLeafNode(ContextMutablePtr context) const;
 
     /**
@@ -113,6 +129,16 @@ public:
     void addJoinSet(const JoinSet & join_set) { join_sets.insert(join_set); }
 
     const std::unordered_map<Property, WinnerPtr, PropertyHash> & getLowestCostExpressions() const { return lowest_cost_expressions; }
+
+    const std::optional<Constants> & getConstants() const
+    {
+        return constants;
+    }
+
+    const std::optional<DataDependency> & getDataDependency() const
+    {
+        return data_dependency;
+    }
 
     const SymbolEquivalencesPtr & getEquivalences() const { return equivalences; }
 
@@ -153,9 +179,12 @@ private:
 
     std::unordered_set<CTEId> cte_set;
 
-    UInt32 max_table_scans = 0;
+    UInt64 max_table_scans = 0;
+    UInt64 max_table_scan_rows = 0;
 
     SymbolEquivalencesPtr equivalences;
+    std::optional<Constants> constants;
+    std::optional<DataDependency> data_dependency;
 
     bool simple_children = true;
     bool is_table_scan = false;

@@ -14,24 +14,28 @@
  */
 
 #include <memory>
-#include <Protos/DataModelHelpers.h>
-
 #include <Catalog/DataModelPartWrapper.h>
 #include <Disks/DiskHelpers.h>
+#include <Disks/HDFS/DiskByteHDFS.h>
 #include <Disks/SingleDiskVolume.h>
 #include <IO/Operators.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
+#include <MergeTreeCommon/CnchServerTopology.h>
 #include <MergeTreeCommon/MergeTreeMetaBase.h>
+#include <Protos/DataModelHelpers.h>
 #include <Protos/RPCHelpers.h>
 #include <Protos/data_models.pb.h>
-#include <Storages/Hive/HiveDataPart.h>
+#include <Storages/HDFS/HDFSCommon.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH.h>
 #include <Transaction/TxnTimestamp.h>
+#include "common/logger_useful.h"
 #include <Common/Exception.h>
 #include <common/JSON.h>
 #include <Disks/HDFS/DiskByteHDFS.h>
 #include <Storages/HDFS/HDFSCommon.h>
+#include <Storages/RemoteFile/CnchFileCommon.h>
+#include <Poco/Logger.h>
 
 namespace DB
 {
@@ -98,16 +102,39 @@ createPartFromModelCommon(const MergeTreeMetaBase & storage, const Protos::DataM
 
     DiskPtr remote_disk = getDiskForPathId(storage.getStoragePolicy(IStorage::StorageLocation::MAIN), path_id);
     auto mock_volume = std::make_shared<SingleDiskVolume>("volume_mock", remote_disk, 0);
-    auto part = std::make_shared<MergeTreeDataPartCNCH>(
-        storage, part_name, *info, mock_volume, relative_path.value_or(info->getPartNameWithHintMutation()));
+    UUID part_id = UUIDHelpers::Nil;
+    switch(remote_disk->getType())
+    {
+        case DiskType::Type::ByteS3:
+        {
+            part_id = RPCHelpers::createUUID(part_model.part_id());
+            if (!relative_path.has_value())
+                relative_path = UUIDHelpers::UUIDToString(part_id);
+            break;
+        }
+        case DiskType::Type::ByteHDFS:
+        {
+            if (!relative_path.has_value())
+                relative_path = info->getPartNameWithHintMutation();
+            break;
+        }
+        default:
+            throw Exception(fmt::format("Unsupported disk type {} in createPartFromModelCommon",
+                DiskType::toString(remote_disk->getType())), ErrorCodes::LOGICAL_ERROR);
+    }
+    auto part = std::make_shared<MergeTreeDataPartCNCH>(storage, part_name, *info,
+        mock_volume, relative_path, nullptr, part_id);
 
     if (part_model.has_staging_txn_id())
     {
         part->staging_txn_id = part_model.staging_txn_id();
-        /// this part shares the same relative path with the corresponding staged part
-        MergeTreePartInfo staged_part_info = part->info;
-        staged_part_info.mutation = part->staging_txn_id;
-        part->relative_path = staged_part_info.getPartNameWithHintMutation();
+        if (remote_disk->getType() == DiskType::Type::ByteHDFS)
+        {
+            /// this part shares the same relative path with the corresponding staged part
+            MergeTreePartInfo staged_part_info = part->info;
+            staged_part_info.mutation = part->staging_txn_id;
+            part->relative_path = staged_part_info.getPartNameWithHintMutation();
+        }
     }
 
     part->bytes_on_disk = part_model.size();
@@ -121,6 +148,8 @@ createPartFromModelCommon(const MergeTreeMetaBase & storage, const Protos::DataM
         part->loadIndexGranularity(part_model.marks_count(), index_granularities);
     }
     part->deleted = part_model.has_deleted() && part_model.deleted();
+    part->delete_flag = part_model.has_delete_flag() && part_model.delete_flag();
+    part->low_priority = part_model.has_low_priority() && part_model.low_priority();
     part->bucket_number = part_model.bucket_number();
     part->table_definition_hash = part_model.table_definition_hash();
     part->mutation_commit_time = part_model.has_mutation_commit_time() ? part_model.mutation_commit_time() : 0;
@@ -151,6 +180,11 @@ createPartFromModelCommon(const MergeTreeMetaBase & storage, const Protos::DataM
     part->covered_parts_count = part_model.has_covered_parts_count() ? part_model.covered_parts_count() : 0;
     part->covered_parts_size = part_model.has_covered_parts_size() ? part_model.covered_parts_size() : 0;
     part->covered_parts_rows = part_model.has_covered_parts_rows() ? part_model.covered_parts_rows() : 0;
+
+    std::unordered_set<std::string> projection_parts_names(part_model.projections().begin(), part_model.projections().end());
+    part->setProjectionPartsNames(projection_parts_names);
+    part->setHostPort(part_model.disk_cache_host_port(), part_model.assign_compute_host_port());
+
     return part;
 }
 
@@ -196,13 +230,7 @@ MutableMergeTreeDataPartCNCHPtr createPartFromModel(
     return part;
 }
 
-/// MOCK get namenode_id
-UInt32 getNameNodeIdForDisk(const StoragePolicyPtr &, const DiskPtr &)
-{
-    return 0;
-}
-
-void fillPartModel(const IStorage & storage, const IMergeTreeDataPart & part, Protos::DataModelPart & part_model, bool ignore_column_commit_time)
+void fillPartModel(const IStorage & storage, const IMergeTreeDataPart & part, Protos::DataModelPart & part_model, bool ignore_column_commit_time, UInt64 txn_id)
 {
     /// fill part info
     Protos::DataModelPartInfo * model_info = part_model.mutable_part_info();
@@ -220,16 +248,27 @@ void fillPartModel(const IStorage & storage, const IMergeTreeDataPart & part, Pr
     const auto cnch_part = std::dynamic_pointer_cast<const MergeTreeDataPartCNCH>(part.shared_from_this());
     if (cnch_part)
         part_model.set_marks_count(cnch_part->getMarksCount());
-    part_model.set_txnid(part.info.mutation);
+
+    /// Normally, the DataModelPart::txnID and DataModelPart::part_info::mutation are always the same.
+    /// But in some special cases(like ATTACH PARTITION, see CnchAttachProcessor::prepareParts),
+    /// the DataModelPart::txnID not equal to DataModelPart::part_info::mutation.
+    /// To handle this case, we need to set txnID and part_info::mutation separately.
+    /// And when getting txnID, use DataModelPart::txnID by default, and use mutation as fallback, see ServerDataPart::txnID() .
+    part_model.set_txnid(txn_id ? txn_id : part.info.mutation);
     part_model.set_bucket_number(part.bucket_number);
     part_model.set_table_definition_hash(part.table_definition_hash);
     part_model.set_commit_time(part.commit_time.toUInt64());
-    part_model.set_data_path_id(getNameNodeIdForDisk(part.storage.getStoragePolicy(IStorage::StorageLocation::MAIN), part.volume->getDisk()));
+    // TODO support multiple namenode , mock 0 now.
+    part_model.set_data_path_id(0);
 
     if (part.deleted)
         part_model.set_deleted(part.deleted);
     if (part.mutation_commit_time)
         part_model.set_mutation_commit_time(part.mutation_commit_time);
+    if (part.delete_flag)
+        part_model.set_delete_flag(part.delete_flag);
+    if (part.low_priority)
+        part_model.set_low_priority(part.low_priority);
 
     if (!ignore_column_commit_time && part.columns_commit_time)
     {
@@ -282,6 +321,24 @@ void fillPartModel(const IStorage & storage, const IMergeTreeDataPart & part, Pr
     {
         part_model.set_covered_parts_rows(part.covered_parts_rows);
     }
+    // For part in hdfs, it's id will be filled with 0
+    RPCHelpers::fillUUID(part.getUUID(), *(part_model.mutable_part_id()));
+
+    if (!part.disk_cache_host_port.empty())
+    {
+        part_model.set_disk_cache_host_port(part.disk_cache_host_port);
+    }
+
+    if (!part.assign_compute_host_port.empty())
+    {
+        part_model.set_assign_compute_host_port(part.assign_compute_host_port);
+    }
+
+    for (const auto & projection : part.getProjectionPartsNames())
+        part_model.add_projections(projection);
+
+    // For part in hdfs, it's id will be filled with 0
+    RPCHelpers::fillUUID(part.getUUID(), *(part_model.mutable_part_id()));
 }
 
 void fillPartInfoModel(const IMergeTreeDataPart & part, Protos::DataModelPartInfo & part_info_model)
@@ -309,6 +366,8 @@ void fillPartsModelForSend(
             part_model.set_columns(storage.getPartColumns(part_model.columns_commit_time())->toString());
             sent_columns_commit_time.insert(part_model.columns_commit_time());
         }
+        part_model.set_disk_cache_host_port(part->disk_cache_host_port);
+        part_model.set_assign_compute_host_port(part->assign_compute_host_port);
     }
 }
 
@@ -320,7 +379,7 @@ std::shared_ptr<MergeTreePartition> createPartitionFromMetaModel(const MergeTree
     return partition_ptr;
 }
 
-std::shared_ptr<MergeTreePartition> createParitionFromMetaString(const MergeTreeMetaBase & storage, const String & parition_minmax_info)
+std::shared_ptr<MergeTreePartition> createPartitionFromMetaString(const MergeTreeMetaBase & storage, const String & parition_minmax_info)
 {
     std::shared_ptr<MergeTreePartition> partition_ptr = std::make_shared<MergeTreePartition>();
     ReadBufferFromString partition_minmax_buf(parition_minmax_info);
@@ -335,7 +394,7 @@ void fillLockInfoModel(const LockInfo & info, Protos::DataModelLockInfo & model)
     model.set_timeout(info.timeout);
     model.set_lock_id(info.lock_id);
     Protos::DataModelLockField * field = model.mutable_lock_field();
-    RPCHelpers::fillUUID(info.table_uuid, *(field->mutable_uuid()));
+    field->set_table_prefix(info.table_uuid_with_prefix);
     if (info.hasBucket())
         field->set_bucket(info.bucket);
     if (info.hasPartition())
@@ -346,12 +405,16 @@ LockInfoPtr createLockInfoFromModel(const Protos::DataModelLockInfo & model)
 {
     LockMode mode = static_cast<LockMode>(model.lock_mode());
     const auto & field = model.lock_field();
-    UUID uuid = RPCHelpers::createUUID(field.uuid());
     Int64 bucket = field.has_bucket() ? field.bucket() : -1;
     const String & partition = field.has_partition() ? field.partition() : "";
 
     auto lock_info = std::make_shared<LockInfo>(model.txn_id());
-    lock_info->setLockID(model.lock_id()).setMode(mode).setTimeout(model.timeout()).setUUID(uuid).setBucket(bucket).setPartition(partition);
+    lock_info->setLockID(model.lock_id())
+        .setMode(mode)
+        .setTimeout(model.timeout())
+        .setTablePrefix(field.table_prefix())
+        .setBucket(bucket)
+        .setPartition(partition);
     return lock_info;
 }
 
@@ -369,7 +432,7 @@ createServerPartsFromModels(const MergeTreeMetaBase & storage, const pb::Repeate
     return res;
 }
 
-static ServerDataPartPtr createServerPartFromDataPart(const MergeTreeMetaBase & storage, const IMergeTreeDataPartPtr & part)
+ServerDataPartPtr createServerPartFromDataPart(const MergeTreeMetaBase & storage, const IMergeTreeDataPartPtr & part)
 {
     auto part_model = std::make_shared<Protos::DataModelPart>();
     fillPartModel(storage, *part, *part_model);
@@ -390,75 +453,49 @@ ServerDataPartsVector createServerPartsFromDataParts(const MergeTreeMetaBase & s
 }
 
 IMergeTreeDataPartsVector createPartVectorFromServerParts(
-    const MergeTreeMetaBase & storage, const ServerDataPartsVector & parts, const std::optional<std::string> & relative_path)
+    const MergeTreeMetaBase & storage, const ServerDataPartsVector & parts)
 {
     IMergeTreeDataPartsVector res;
     res.reserve(parts.size());
     for (const auto & part : parts)
     {
         /// already deal with prev_part in ServerDataPart::toCNCHDataPart.
-        res.push_back(part->toCNCHDataPart(storage, relative_path));
+        res.push_back(part->toCNCHDataPart(storage, std::nullopt));
     }
     return res;
 }
 
-void fillCnchHivePartsModel(const HiveDataPartsCNCHVector & parts, pb::RepeatedPtrField<Protos::CnchHivePartModel> & parts_model)
+size_t fillCnchFilePartsModel(const FileDataPartsCNCHVector & parts, pb::RepeatedPtrField<Protos::CnchFilePartModel> & parts_model)
 {
     for (const auto & part : parts)
     {
         auto & part_model = *parts_model.Add();
         auto & info = *part_model.mutable_part_info();
-        auto skip_list = part->getSkipSplits();
-        auto size = skip_list.size();
         *info.mutable_name() = part->info.name;
-        *info.mutable_partition_id() = part->info.partition_id;
-        *part_model.mutable_relative_path() = part->relative_path;
-        part_model.set_skip_lists(size);
-        part_model.set_hdfs_uri(part->getHDFSUri());
-
-        for (auto & skip_num : skip_list)
-            *part_model.mutable_skip_numbers()->Add() = skip_num;
     }
+
+    return parts.size();
 }
 
-HiveDataPartsCNCHVector
-createCnchHiveDataParts(const ContextPtr & context, const pb::RepeatedPtrField<Protos::CnchHivePartModel> & parts_model)
+FileDataPartsCNCHVector createCnchFileDataParts(const ContextPtr & /*context*/, const pb::RepeatedPtrField<Protos::CnchFilePartModel> & parts_model)
 {
-    HiveDataPartsCNCHVector res;
+    FileDataPartsCNCHVector res;
     res.reserve(parts_model.size());
-
-    /// share the disk configuration
-    DiskPtr disk;
-
-    for (const auto & part : parts_model)
+    for (const auto & part: parts_model)
     {
-        const auto & part_name = part.part_info().name();
-        const auto & partition_id = part.part_info().partition_id();
-
-        std::unordered_set<Int64> required_skip_lists;
-        for (const auto & skip_number : part.skip_numbers())
-            required_skip_lists.insert(skip_number);
-
-        if (!disk)
-        {
-            HDFSConnectionParams params = context->getHdfsConnectionParams();
-            if (part.has_hdfs_uri())
-            {
-                Poco::URI uri(part.hdfs_uri());
-                params = hdfsParamsFromUrl(uri);
-            }
-            disk = std::make_shared<DiskByteHDFS>(part.hdfs_uri(), "", params);
-        }
-
-        res.emplace_back(std::make_shared<const HiveDataPart>(
-            part_name,
-            part.relative_path(),
-            part.has_hdfs_uri() ? part.hdfs_uri() : context->getHdfsNNProxy(),
-            disk,
-            HivePartInfo(part_name, partition_id),
-            required_skip_lists));
+        res.emplace_back(std::make_shared<FileDataPart>(part.part_info().name()));
     }
     return res;
+}
+
+String getServerVwNameFrom(const Protos::DataModelTable & model)
+{
+    return model.has_server_vw_name() ? model.server_vw_name() : DEFAULT_SERVER_VW_NAME;
+}
+
+String getServerVwNameFrom(const Protos::TableIdentifier & model)
+{
+    return model.has_server_vw_name() ? model.server_vw_name() : DEFAULT_SERVER_VW_NAME;
 }
 
 }

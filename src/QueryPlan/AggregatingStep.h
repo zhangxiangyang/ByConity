@@ -14,19 +14,23 @@
  */
 
 #pragma once
+#include <Core/SortDescription.h>
 #include <DataStreams/SizeLimits.h>
 #include <Interpreters/Aggregator.h>
 #include <Interpreters/Context_fwd.h>
+#include <Protos/plan_node_utils.pb.h>
 #include <QueryPlan/ITransformingStep.h>
 #include <Storages/SelectQueryInfo.h>
+#include <Core/Names.h>
 
 namespace DB
 {
-
 struct AggregatingTransformParams;
 using AggregatingTransformParamsPtr = std::shared_ptr<AggregatingTransformParams>;
 class WriteBuffer;
 class ReadBuffer;
+
+bool hasNonParallelAggregateFunctions(const AggregateDescriptions &);
 
 struct GroupingSetsParams
 {
@@ -34,12 +38,19 @@ struct GroupingSetsParams
 
     GroupingSetsParams(Names used_key_names_) : used_key_names(std::move(used_key_names_)) { }
 
-    GroupingSetsParams(ColumnNumbers used_keys_, ColumnNumbers missing_keys_) : used_keys(std::move(used_keys_)), missing_keys(std::move(missing_keys_)) { }
+    GroupingSetsParams(ColumnNumbers used_keys_, ColumnNumbers missing_keys_)
+        : used_keys(std::move(used_keys_)), missing_keys(std::move(missing_keys_))
+    {
+    }
 
     Names used_key_names;
 
     ColumnNumbers used_keys;
     ColumnNumbers missing_keys;
+
+public:
+    void toProto(Protos::GroupingSetsParams & proto) const;
+    void fillFromProto(const Protos::GroupingSetsParams & proto);
 };
 
 using GroupingSetsParamsList = std::vector<GroupingSetsParams>;
@@ -48,14 +59,22 @@ struct GroupingDescription
 {
     Names argument_names;
     String output_name;
+
+public:
+    void toProto(Protos::GroupingDescription & proto) const;
+    void fillFromProto(const Protos::GroupingDescription & proto);
 };
 
 using GroupingDescriptions = std::vector<GroupingDescription>;
 
 Block appendGroupingSetColumn(Block header);
 
-void computeGroupingFunctions(QueryPipeline & pipeline, const GroupingDescriptions & groupings, const Names & keys,
-                              const GroupingSetsParamsList & grouping_set_params, const BuildQueryPipelineSettings & build_settings);
+void computeGroupingFunctions(
+    QueryPipeline & pipeline,
+    const GroupingDescriptions & groupings,
+    const Names & keys,
+    const GroupingSetsParamsList & grouping_set_params,
+    const BuildQueryPipelineSettings & build_settings);
 
 /// Aggregation. See AggregatingTransform.
 class AggregatingStep : public ITransformingStep
@@ -64,6 +83,7 @@ public:
     AggregatingStep(
         const DataStream & input_stream_,
         Aggregator::Params params_,
+        const NameSet & keys_not_hashed_,
         GroupingSetsParamsList grouping_sets_params_,
         bool final_,
         size_t max_block_size_,
@@ -76,6 +96,7 @@ public:
         : AggregatingStep(
             input_stream_,
             Names(),
+            keys_not_hashed_,
             std::move(params_),
             std::move(grouping_sets_params_),
             final_,
@@ -94,15 +115,19 @@ public:
     AggregatingStep(
         const DataStream & input_stream_,
         Names keys_,
+        const NameSet & keys_not_hashed_,
         AggregateDescriptions aggregates_,
         GroupingSetsParamsList grouping_sets_params_,
         bool final_,
-        GroupingDescriptions groupings_ = {}, bool /*totals_*/ = false,
-        bool should_produce_results_in_order_of_bucket_number_ = true)
+        SortDescription group_by_sort_description_ = {},
+        GroupingDescriptions groupings_ = {},
+        bool overflow_row_ = false,
+        bool should_produce_results_in_order_of_bucket_number_ = false)
         : AggregatingStep(
             input_stream_,
             keys_,
-            createParams(input_stream_.header, aggregates_, keys_),
+            keys_not_hashed_,
+            createParams(input_stream_.header, aggregates_, keys_, overflow_row_),
             std::move(grouping_sets_params_),
             final_,
             0,
@@ -110,7 +135,7 @@ public:
             0,
             false,
             nullptr,
-            SortDescription(),
+            group_by_sort_description_,
             groupings_,
             false,
             should_produce_results_in_order_of_bucket_number_)
@@ -121,6 +146,7 @@ public:
     AggregatingStep(
         const DataStream & input_stream_,
         Names keys_,
+        const NameSet & keys_not_hashed_,
         Aggregator::Params params_,
         GroupingSetsParamsList grouping_sets_params_,
         bool final_,
@@ -148,24 +174,38 @@ public:
     const Aggregator::Params & getParams() const { return params; }
     const AggregateDescriptions & getAggregates() const { return params.aggregates; }
     const Names & getKeys() const { return keys; }
+    const NameSet & getKeysNotHashed() const { return keys_not_hashed; }
     const GroupingSetsParamsList & getGroupingSetsParams() const { return grouping_sets_params; }
+    const SortDescription & getGroupBySortDescription() const { return group_by_sort_description; }
+    void setGroupBySortDescription(const SortDescription & group_by_sort_description_)
+    {
+        group_by_sort_description = group_by_sort_description_;
+    }
     bool isFinal() const { return final; }
+    bool isPartial() const { return !final; }
     bool isGroupingSet() const { return !grouping_sets_params.empty(); }
     const GroupingDescriptions & getGroupings() const { return groupings; }
     bool shouldProduceResultsInOrderOfBucketNumber() const { return should_produce_results_in_order_of_bucket_number; }
-
+    bool needOverflowRow() const
+    {
+        return params.overflow_row;
+    }
     bool isNormal() const { return final && !isGroupingSet() /*&& !totals && !having*/ && groupings.empty(); }
 
-    void serialize(WriteBuffer & buf) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr);
+    void toProto(Protos::AggregatingStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<AggregatingStep> fromProto(const Protos::AggregatingStep & proto, ContextPtr context);
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
-    static Aggregator::Params createParams(Block header_before_aggregation, AggregateDescriptions aggregates, Names group_by_keys);
+    static Aggregator::Params
+    createParams(Block header_before_aggregation, AggregateDescriptions aggregates, Names group_by_keys, bool overflow_row);
     GroupingSetsParamsList prepareGroupingSetsParams() const;
 
 private:
     Poco::Logger * log = &Poco::Logger::get("TableScanStep");
     Names keys;
+
+    NameSet keys_not_hashed; // keys which can be output directly, same as function `any`, but no type loss.
+
     Aggregator::Params params;
     GroupingSetsParamsList grouping_sets_params;
     bool final;

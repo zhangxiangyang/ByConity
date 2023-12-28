@@ -24,41 +24,42 @@ namespace DB
 class ColumnPruning : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    explicit ColumnPruning(bool distinct_to_aggregate_ = false) 
+        : distinct_to_aggregate(distinct_to_aggregate_) { }
     String name() const override { return "ColumnPruning"; }
+    static String selectColumnWithMinSize(NamesAndTypesList source_columns, StoragePtr storage);
+
+private:
+    bool isEnabled(ContextMutablePtr context) const override { return context->getSettingsRef().enable_column_pruning; }
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool distinct_to_aggregate;
 };
 
-class ColumnPruningVisitor : public SimplePlanRewriter<NameSet>
+class ColumnPruningVisitor : public PlanNodeVisitor<PlanNodePtr, NameSet>
 {
 public:
-    explicit ColumnPruningVisitor(ContextMutablePtr context_, CTEInfo & cte_info_, PlanNodePtr & root)
-        : SimplePlanRewriter(context_, cte_info_), post_order_cte_helper(cte_info_, root)
+    explicit ColumnPruningVisitor(ContextMutablePtr context_, CTEInfo & cte_info_, PlanNodePtr & root, bool distinct_to_aggregate_)
+        : context(std::move(context_)), post_order_cte_helper(cte_info_, root), distinct_to_aggregate(distinct_to_aggregate_)
     {
     }
 
 private:
-    PlanNodePtr visitLimitByNode(LimitByNode & node, NameSet & context) override;
-    PlanNodePtr visitWindowNode(WindowNode & node, NameSet & context) override;
-    PlanNodePtr visitDistinctNode(DistinctNode & node, NameSet & context) override;
-    PlanNodePtr visitJoinNode(JoinNode & node, NameSet & context) override;
-    PlanNodePtr visitSortingNode(SortingNode & node, NameSet & require) override;
-    PlanNodePtr visitMergeSortingNode(MergeSortingNode & node, NameSet & context) override;
-    PlanNodePtr visitMergingSortedNode(MergingSortedNode & node, NameSet & context) override;
-    PlanNodePtr visitPartialSortingNode(PartialSortingNode & node, NameSet & context) override;
-    PlanNodePtr visitAggregatingNode(AggregatingNode & node, NameSet & context) override;
-    PlanNodePtr visitTableScanNode(TableScanNode & node, NameSet & context) override;
-    PlanNodePtr visitFilterNode(FilterNode & node, NameSet & c) override;
-    PlanNodePtr visitProjectionNode(ProjectionNode & node, NameSet & c) override;
-    PlanNodePtr visitApplyNode(ApplyNode & node, NameSet & c) override;
-    PlanNodePtr visitUnionNode(UnionNode & node, NameSet & context) override;
-    PlanNodePtr visitExceptNode(ExceptNode & node, NameSet & context) override;
-    PlanNodePtr visitIntersectNode(IntersectNode & node, NameSet & context) override;
-    PlanNodePtr visitAssignUniqueIdNode(AssignUniqueIdNode & node, NameSet & context) override;
-    PlanNodePtr visitExchangeNode(ExchangeNode & node, NameSet & context) override;
-    PlanNodePtr visitCTERefNode(CTERefNode & node, NameSet & context) override;
 
+    PlanNodePtr visitPlanNode(PlanNodeBase & node, NameSet & require) override;
+
+#define VISITOR_DEF(TYPE) PlanNodePtr visit##TYPE##Node(TYPE##Node &, NameSet &) override;
+    APPLY_STEP_TYPES(VISITOR_DEF)
+#undef VISITOR_DEF
+
+    template <bool require_all>
+    PlanNodePtr visitDefault(PlanNodeBase & node, NameSet & require);
+
+    static PlanNodePtr convertDistinctToGroupBy(PlanNodePtr node, ContextMutablePtr context);
+
+    ContextMutablePtr context;
     CTEPostorderVisitHelper post_order_cte_helper;
     std::unordered_map<CTEId, NameSet> cte_require_columns{};
+    bool distinct_to_aggregate;
 };
 
 }

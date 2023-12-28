@@ -31,13 +31,13 @@ namespace IngestColumnCnch
     struct IngestPartitionParam;
 }
 
-class StorageCloudMergeTree final : public shared_ptr_helper<StorageCloudMergeTree>, public MergeTreeCloudData
+class StorageCloudMergeTree : public shared_ptr_helper<StorageCloudMergeTree>, public MergeTreeCloudData
 {
     friend struct shared_ptr_helper<StorageCloudMergeTree>;
     friend class CloudMergeTreeBlockOutputStream;
 
 public:
-    ~StorageCloudMergeTree() override;
+    virtual ~StorageCloudMergeTree() override;
 
     std::string getName() const override { return "CloudMergeTree"; }
 
@@ -88,7 +88,7 @@ public:
         const PartitionCommands & /* commands */,
         ContextPtr /* context */) override;
 
-    void ingestPartition(const StorageMetadataPtr &, const PartitionCommand & command, ContextPtr local_context);
+    Pipe ingestPartition(const StorageMetadataPtr &, const PartitionCommand & command, ContextPtr local_context);
 
     std::set<Int64> getRequiredBucketNumbers() const { return required_bucket_numbers; }
     void setRequiredBucketNumbers(std::set<Int64> & required_bucket_numbers_) { required_bucket_numbers = required_bucket_numbers_; }
@@ -99,6 +99,9 @@ public:
 
     CloudMergeTreeDedupWorker * tryGetDedupWorker() { return dedup_worker.get(); }
     CloudMergeTreeDedupWorker * getDedupWorker();
+
+    QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageMetadataPtr &, SelectQueryInfo &) const override;
+    bool getQueryProcessingStageWithAggregateProjection(ContextPtr query_context, const StorageMetadataPtr & metadata_snapshot, SelectQueryInfo & query_info) const;
 
 protected:
     MutationCommands getFirstAlterMutationCommandsForPart(const DataPartPtr & part) const override;

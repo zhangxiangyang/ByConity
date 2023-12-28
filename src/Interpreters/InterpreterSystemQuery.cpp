@@ -25,6 +25,7 @@
 #include <Common/ActionLock.h>
 #include <Common/typeid_cast.h>
 #include <Common/getNumberOfPhysicalCPUCores.h>
+#include <Common/JeprofControl.h>
 #include <Common/SymbolIndex.h>
 #include <Common/ThreadPool.h>
 #include <Common/escapeForFileName.h>
@@ -32,7 +33,10 @@
 #include <MergeTreeCommon/CnchServerTopology.h>
 #include <MergeTreeCommon/CnchServerManager.h>
 #include <MergeTreeCommon/CnchTopologyMaster.h>
+#include <MergeTreeCommon/GlobalGCManager.h>
 #include <CloudServices/CnchBGThreadCommon.h>
+#include <CloudServices/CnchPartGCThread.h>
+#include <CloudServices/CnchServerClientPool.h>
 #include <DaemonManager/DaemonManagerClient.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -73,6 +77,7 @@
 #include <Parsers/formatAST.h>
 #include <Poco/UUIDGenerator.h>
 #include <Poco/URI.h>
+#include <Poco/JSON/Parser.h>
 #include <TableFunctions/ITableFunction.h>
 #include <FormaterTool/HDFSDumper.h>
 #include <csignal>
@@ -82,9 +87,19 @@
 #include <Interpreters/CnchSystemLog.h>
 #include <Interpreters/CnchQueryMetrics/QueryMetricLog.h>
 #include <Interpreters/CnchQueryMetrics/QueryWorkerMetricLog.h>
+#include <Interpreters/AutoStatsTaskLog.h>
+#include "common/sleep.h"
 
 #if !defined(ARCADIA_BUILD)
 #    include "config_core.h"
+#endif
+
+#if USE_RDKAFKA
+#include <Storages/Kafka/CnchKafkaOffsetManager.h>
+#endif
+
+#if USE_MYSQL
+#include <Databases/MySQL/DatabaseCnchMaterializedMySQL.h>
 #endif
 
 namespace DB
@@ -204,7 +219,7 @@ void InterpreterSystemQuery::startStopAction(StorageActionBlockType action_type,
     else
     {
         auto access = getContext()->getAccess();
-        for (auto & elem : DatabaseCatalog::instance().getDatabases())
+        for (auto & elem : DatabaseCatalog::instance().getDatabases(getContext()))
         {
             for (auto iterator = elem.second->getTablesIterator(getContext()); iterator->isValid(); iterator->next())
             {
@@ -269,7 +284,7 @@ BlockIO InterpreterSystemQuery::execute()
 
     volume_ptr = {};
     if (!query.storage_policy.empty() && !query.volume.empty())
-        volume_ptr = getContext()->getStoragePolicy(query.storage_policy)->getVolumeByName(query.volume);
+        volume_ptr = getContext()->getStoragePolicy(query.storage_policy)->getVolumeByName(query.volume, true);
 
     /// Common system command
     switch (query.type)
@@ -320,9 +335,17 @@ BlockIO InterpreterSystemQuery::execute()
             getContext()->checkAccess(AccessType::SYSTEM_DROP_UNCOMPRESSED_CACHE);
             system_context->dropUncompressedCache();
             break;
+        case Type::DROP_NVM_CACHE:
+            getContext()->checkAccess(AccessType::SYSTEM_DROP_NVM_CACHE);
+            system_context->dropNvmCache();
+            break;
         case Type::DROP_MMAP_CACHE:
             getContext()->checkAccess(AccessType::SYSTEM_DROP_MMAP_CACHE);
             system_context->dropMMappedFileCache();
+            break;
+        case Type::DROP_QUERY_CACHE:
+            getContext()->checkAccess(AccessType::SYSTEM_DROP_QUERY_CACHE);
+            getContext()->dropQueryCache();
             break;
         case Type::DROP_CHECKSUMS_CACHE:
             dropChecksumsCache(table_id);
@@ -410,7 +433,8 @@ BlockIO InterpreterSystemQuery::execute()
                 [&] { if (auto asynchronous_metric_log = getContext()->getAsynchronousMetricLog()) asynchronous_metric_log->flush(true); },
                 [&] { if (auto opentelemetry_span_log = getContext()->getOpenTelemetrySpanLog()) opentelemetry_span_log->flush(true); },
                 [&] { if (auto zookeeper_log = getContext()->getZooKeeperLog()) zookeeper_log->flush(true); },
-                [&] { if (auto processors_profile_log = getContext()->getProcessorsProfileLog()) processors_profile_log->flush(true); }
+                [&] { if (auto processors_profile_log = getContext()->getProcessorsProfileLog()) processors_profile_log->flush(true); },
+                [&] { if (auto auto_stats_task_log = getContext()->getAutoStatsTaskLog()) auto_stats_task_log->flush(true); }
             );
             break;
         }
@@ -430,6 +454,13 @@ BlockIO InterpreterSystemQuery::execute()
         case Type::STOP_RESOURCE_GROUP:
             system_context->stopResourceGroup();
             break;
+        case Type::JEPROF_DUMP:
+#if USE_JEMALLOC
+            JeprofControl::instance().dump();
+            break;
+#else
+            throw Exception("Jemalloc is not used", ErrorCodes::BAD_ARGUMENTS);
+#endif
         default:
         {
             if (getContext()->getServerType() == ServerType::cnch_server)
@@ -448,8 +479,17 @@ BlockIO InterpreterSystemQuery::executeCnchCommand(ASTSystemQuery & query, Conte
     {
         case Type::START_CONSUME:
         case Type::STOP_CONSUME:
+        case Type::DROP_CONSUME:
         case Type::RESTART_CONSUME:
-            startOrStopConsume(query.type);
+            controlConsume(query.type);
+            break;
+        case Type::START_MATERIALIZEDMYSQL:
+        case Type::STOP_MATERIALIZEDMYSQL:
+        case Type::RESYNC_MATERIALIZEDMYSQL_TABLE:
+            executeMaterializedMyQLInCnchServer(query);
+            break;
+        case Type::RESET_CONSUME_OFFSET:
+            resetConsumeOffset(query, system_context);
             break;
         case Type::STOP_MERGES:
         case Type::START_MERGES:
@@ -459,19 +499,39 @@ BlockIO InterpreterSystemQuery::executeCnchCommand(ASTSystemQuery & query, Conte
         case Type::FORCE_GC:
         case Type::START_DEDUP_WORKER:
         case Type::STOP_DEDUP_WORKER:
+        case Type::START_CLUSTER:
+        case Type::STOP_CLUSTER:
             executeBGTaskInCnchServer(system_context, query.type);
+            break;
+        case Type::GC:
+            executeGc(query);
             break;
         case Type::DEDUP:
             executeDedup(query);
             break;
         case Type::DUMP_SERVER_STATUS:
-            dumpCnchServerManagerStatus();
+            dumpCnchServerStatus();
             break;
         case Type::DROP_CNCH_PART_CACHE:
             dropCnchPartCache(query);
             break;
         case Type::SYNC_DEDUP_WORKER:
             executeSyncDedupWorker(system_context);
+            break;
+        case Type::CLEAN_TRANSACTION:
+            cleanTransaction(query.txn_id);
+            break;
+        case Type::CLEAN_TRASH_TABLE:
+            executeCleanTrashTable(query);
+            break;
+        case Type::CLEAN_FILESYSTEM_LOCK:
+            cleanFilesystemLock();
+            break;
+        case Type::LOCK_MEMORY_LOCK:
+            lockMemoryLock(query, table_id, system_context);
+            break;
+        case Type::RECALCULATE_METRICS:
+            recalculateMetrics(query);
             break;
         default:
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "System command {} is not supported in CNCH", ASTSystemQuery::typeToString(query.type));
@@ -576,28 +636,34 @@ void InterpreterSystemQuery::executeBGTaskInCnchServer(ContextMutablePtr & syste
     switch (type)
     {
         case Type::START_MERGES:
-            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::MergeMutate, CnchBGThreadAction::Start);
+            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::MergeMutate, CnchBGThreadAction::Start, CurrentThread::getQueryId().toString());
             break;
         case Type::STOP_MERGES:
-            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::MergeMutate, CnchBGThreadAction::Stop);
+            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::MergeMutate, CnchBGThreadAction::Stop, CurrentThread::getQueryId().toString());
             break;
         case Type::REMOVE_MERGES:
-            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::MergeMutate, CnchBGThreadAction::Remove);
+            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::MergeMutate, CnchBGThreadAction::Remove, CurrentThread::getQueryId().toString());
             break;
         case Type::START_GC:
-            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::PartGC, CnchBGThreadAction::Start);
+            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::PartGC, CnchBGThreadAction::Start, CurrentThread::getQueryId().toString());
             break;
         case Type::STOP_GC:
-            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::PartGC, CnchBGThreadAction::Stop);
+            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::PartGC, CnchBGThreadAction::Stop, CurrentThread::getQueryId().toString());
             break;
         case Type::FORCE_GC:
-            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::PartGC, CnchBGThreadAction::Wakeup);
+            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::PartGC, CnchBGThreadAction::Wakeup, CurrentThread::getQueryId().toString());
             break;
         case Type::START_DEDUP_WORKER:
-            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::DedupWorker, CnchBGThreadAction::Start);
+            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::DedupWorker, CnchBGThreadAction::Start, CurrentThread::getQueryId().toString());
             break;
         case Type::STOP_DEDUP_WORKER:
-            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::DedupWorker, CnchBGThreadAction::Stop);
+            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::DedupWorker, CnchBGThreadAction::Stop, CurrentThread::getQueryId().toString());
+            break;
+        case Type::START_CLUSTER:
+            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::Clustering, CnchBGThreadAction::Start, CurrentThread::getQueryId().toString());
+            break;
+        case Type::STOP_CLUSTER:
+            daemon_manager->controlDaemonJob(storage->getStorageID(), CnchBGThreadType::Clustering, CnchBGThreadAction::Stop, CurrentThread::getQueryId().toString());
             break;
         default:
             throw Exception("Unknown command type " + toString(ASTSystemQuery::typeToString(type)), ErrorCodes::LOGICAL_ERROR);
@@ -618,7 +684,7 @@ void InterpreterSystemQuery::executeSyncDedupWorker(ContextMutablePtr & system_c
     cnch_storage->waitForStagedPartsToPublish(system_context);
 }
 
-void InterpreterSystemQuery::startOrStopConsume(ASTSystemQuery::Type type)
+void InterpreterSystemQuery::controlConsume(ASTSystemQuery::Type type)
 {
     if (table_id.empty())
         throw Exception("Empty table id for executing START/STOP consume", ErrorCodes::LOGICAL_ERROR);
@@ -628,25 +694,111 @@ void InterpreterSystemQuery::startOrStopConsume(ASTSystemQuery::Type type)
     if (!cnch_kafka)
         throw Exception("CnchKafka is supported but provided " + storage->getName(), ErrorCodes::BAD_ARGUMENTS);
 
-    auto daemon_manager = getContext()->getDaemonManagerClient();
+    auto local_context = getContext();
+    auto daemon_manager = local_context->getDaemonManagerClient();
 
-    auto catalog = getContext()->getCnchCatalog();
+    auto catalog = local_context->getCnchCatalog();
     using Type = ASTSystemQuery::Type;
     switch (type)
     {
         case Type::START_CONSUME:
-            daemon_manager->controlDaemonJob(cnch_kafka->getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Start);
+            daemon_manager->controlDaemonJob(cnch_kafka->getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Start, local_context->getCurrentQueryId());
             break;
         case Type::STOP_CONSUME:
-            daemon_manager->controlDaemonJob(cnch_kafka->getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Stop);
+            daemon_manager->controlDaemonJob(cnch_kafka->getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Stop, local_context->getCurrentQueryId());
             break;
         case Type::RESTART_CONSUME:
-            daemon_manager->controlDaemonJob(cnch_kafka->getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Stop);
+            daemon_manager->controlDaemonJob(cnch_kafka->getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Stop, local_context->getCurrentQueryId());
             usleep(500 * 1000);
-            daemon_manager->controlDaemonJob(cnch_kafka->getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Start);
+            daemon_manager->controlDaemonJob(cnch_kafka->getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Start, local_context->getCurrentQueryId());
+            break;
+        case Type::DROP_CONSUME:
+            daemon_manager->controlDaemonJob(cnch_kafka->getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Drop, local_context->getCurrentQueryId());
             break;
         default:
             throw Exception("Unknown command type " + String(ASTSystemQuery::typeToString(type)), ErrorCodes::LOGICAL_ERROR);
+    }
+}
+
+void InterpreterSystemQuery::resetConsumeOffset(ASTSystemQuery & query, ContextMutablePtr & system_context)
+{
+    Poco::JSON::Parser json_parser;
+    Poco::Dynamic::Var result = json_parser.parse(query.string_data);
+    auto object = result.extract<Poco::JSON::Object::Ptr>();
+
+    if (!object->has("database_name") || !object->has("table_name"))
+        throw Exception("Database and table name are required for ResetConsumeOffset", ErrorCodes::BAD_ARGUMENTS);
+
+    String database_name = object->getValue<std::string>("database_name");
+    String table_name = object->getValue<std::string>("table_name");
+    auto storage = system_context->getCnchCatalog()->getTable(*system_context, database_name, table_name, system_context->getTimestamp());
+    auto * cnch_kafka = dynamic_cast<StorageCnchKafka *>(storage.get());
+    if (!cnch_kafka)
+        throw Exception("CnchKafka is expected but provided " + storage->getName(), ErrorCodes::BAD_ARGUMENTS);
+    CnchKafkaOffsetManagerPtr kafka_offset_manager = std::make_shared<CnchKafkaOffsetManager>(cnch_kafka->getStorageID(), system_context);
+
+    if (object->has("offset_value"))
+    {
+        int64_t offset = object->getValue<int64_t>("offset_value");
+        kafka_offset_manager->resetOffsetToSpecialPosition(offset);
+    }
+    else if (object->has("timestamp"))
+    {
+        uint64_t timestamp = object->getValue<uint64_t>("timestamp");
+        kafka_offset_manager->resetOffsetWithTimestamp(timestamp);
+    }
+    else if (object->has("offset_values"))
+    {
+        String topic_name = object->getValue<std::string>("topic_name");
+        Poco::JSON::Array::Ptr children = object->getArray("offset_values");
+        cppkafka::TopicPartitionList tpl;
+        for (const auto & e : *children)
+        {
+            auto e_object = e.extract<Poco::JSON::Object::Ptr>();
+            if (e_object->has("offset") && e_object->has("partition"))
+            {
+                int64_t offset = e_object->getValue<int64_t>("offset");
+                int partition_number = e_object->getValue<int>("partition");
+                tpl.push_back({topic_name, partition_number, offset});
+            }
+            else
+                throw Exception("sub-object under offset_values Array need to has offset and partition!, input: "
+                                    + query.string_data, ErrorCodes::BAD_ARGUMENTS);
+        }
+
+        kafka_offset_manager->resetOffsetWithSpecificOffsets(tpl);
+    }
+    else
+        throw Exception("offset should be set by one of the parameters: timestamp, offset_value, offset_values. input: "
+                            + query.string_data, ErrorCodes::BAD_ARGUMENTS);
+}
+
+void InterpreterSystemQuery::executeMaterializedMyQLInCnchServer(const ASTSystemQuery & query)
+{
+    ContextPtr local_context = getContext();
+    auto database = DatabaseCatalog::instance().getDatabase(query.database, local_context);
+    auto * materialized_mysql = dynamic_cast<DatabaseCnchMaterializedMySQL*>(database.get());
+    if (!materialized_mysql)
+        throw Exception("Expect CnchMaterializedMySQL, but got " + database->getEngineName(), ErrorCodes::BAD_ARGUMENTS);
+
+    auto daemon_manager = getContext()->getDaemonManagerClient();
+
+    using Type = ASTSystemQuery::Type;
+    switch (query.type)
+    {
+        /// TODO: record the status in catalog for persistent
+        case Type::START_MATERIALIZEDMYSQL:
+            daemon_manager->controlDaemonJob(materialized_mysql->getStorageID(), CnchBGThreadType::MaterializedMySQL, CnchBGThreadAction::Start, local_context->getCurrentQueryId());
+            break;
+        case Type::STOP_MATERIALIZEDMYSQL:
+            daemon_manager->controlDaemonJob(materialized_mysql->getStorageID(), CnchBGThreadType::MaterializedMySQL, CnchBGThreadAction::Stop, local_context->getCurrentQueryId());
+            break;
+        case Type::RESYNC_MATERIALIZEDMYSQL_TABLE:
+            /// Here we use getContext() rather than system_context as query forwarding needs process_list_entry
+            materialized_mysql->manualResyncTable(query.table, getContext());
+            break;
+        default:
+            throw Exception(String(ASTSystemQuery::typeToString(query.type)) + " is not supported now", ErrorCodes::NOT_IMPLEMENTED);
     }
 }
 
@@ -726,15 +878,12 @@ StoragePtr InterpreterSystemQuery::tryRestartReplica(const StorageID & replica, 
 
     auto columns = InterpreterCreateQuery::getColumnsDescription(*create.columns_list->columns, system_context, true);
     auto constraints = InterpreterCreateQuery::getConstraintsDescription(create.columns_list->constraints);
+    auto foreign_keys = InterpreterCreateQuery::getForeignKeysDescription(create.columns_list->foreign_keys);
+    auto unique = InterpreterCreateQuery::getUniqueNotEnforcedDescription(create.columns_list->unique);
     auto data_path = database->getTableDataPath(create);
 
-    table = StorageFactory::instance().get(create,
-        data_path,
-        system_context,
-        system_context->getGlobalContext(),
-        columns,
-        constraints,
-        false);
+    table = StorageFactory::instance().get(
+        create, data_path, system_context, system_context->getGlobalContext(), columns, constraints, foreign_keys, unique, false);
 
     database->attachTable(replica.table_name, table, data_path);
 
@@ -747,7 +896,7 @@ void InterpreterSystemQuery::restartReplicas(ContextMutablePtr system_context)
     std::vector<StorageID> replica_names;
     auto & catalog = DatabaseCatalog::instance();
 
-    for (auto & elem : catalog.getDatabases())
+    for (auto & elem : catalog.getDatabases(getContext()))
         for (auto it = elem.second->getTablesIterator(getContext()); it->isValid(); it->next())
             if (dynamic_cast<const StorageReplicatedMergeTree *>(it->table().get()))
                 replica_names.emplace_back(it->databaseName(), it->name());
@@ -789,7 +938,7 @@ void InterpreterSystemQuery::dropReplica(ASTSystemQuery & query)
     else if (!query.database.empty())
     {
         getContext()->checkAccess(AccessType::SYSTEM_DROP_REPLICA, query.database);
-        DatabasePtr database = DatabaseCatalog::instance().getDatabase(query.database);
+        DatabasePtr database = DatabaseCatalog::instance().getDatabase(query.database, getContext());
         for (auto iterator = database->getTablesIterator(getContext()); iterator->isValid(); iterator->next())
             dropReplicaImpl(query, iterator->table());
         LOG_TRACE(log, "Dropped replica {} from database {}", query.replica, backQuoteIfNeed(database->getDatabaseName()));
@@ -797,7 +946,7 @@ void InterpreterSystemQuery::dropReplica(ASTSystemQuery & query)
     else if (query.is_drop_whole_replica)
     {
         getContext()->checkAccess(AccessType::SYSTEM_DROP_REPLICA);
-        auto databases = DatabaseCatalog::instance().getDatabases();
+        auto databases = DatabaseCatalog::instance().getDatabases(getContext());
 
         for (auto & elem : databases)
         {
@@ -813,7 +962,7 @@ void InterpreterSystemQuery::dropReplica(ASTSystemQuery & query)
         String remote_replica_path = fs::path(query.replica_zk_path)  / "replicas" / query.replica;
 
         /// This check is actually redundant, but it may prevent from some user mistakes
-        for (auto & elem : DatabaseCatalog::instance().getDatabases())
+        for (auto & elem : DatabaseCatalog::instance().getDatabases(getContext()))
         {
             DatabasePtr & database = elem.second;
             for (auto iterator = database->getTablesIterator(getContext()); iterator->isValid(); iterator->next())
@@ -876,6 +1025,21 @@ bool InterpreterSystemQuery::dropReplicaImpl(ASTSystemQuery & query, const Stora
     LOG_TRACE(log, "Dropped replica {} of {}", query.replica, table->getStorageID().getNameForLogs());
 
     return true;
+}
+
+void InterpreterSystemQuery::recalculateMetrics(ASTSystemQuery & query)
+{
+    getContext()->checkAccess(AccessType::SYSTEM_RECALCULATE_METRICS, table_id);
+
+    auto mgr = getContext()->getPartCacheManager();
+    if (!mgr)
+        throw Exception("No PartCacheManager found", ErrorCodes::LOGICAL_ERROR);
+
+    StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
+    if (!table) {
+        throw Exception(ErrorCodes::UNKNOWN_TABLE, "Table {}.{} not found.", quoteString(query.database), quoteString(query.table));
+    }
+    mgr->forceRecalculate(table);
 }
 
 void InterpreterSystemQuery::syncReplica(ASTSystemQuery &)
@@ -960,34 +1124,53 @@ void InterpreterSystemQuery::executeMetastoreCmd(ASTSystemQuery & query) const
     }
 }
 
+void InterpreterSystemQuery::executeCleanTrashTable(const ASTSystemQuery & query)
+{
+    auto local_context = getContext();
+    // note: don't use table_id because it's not from trash
+    StorageID id(query.database, query.table, query.table_uuid);
+    if (id.database_name.empty())
+        id.database_name = local_context->getCurrentDatabase();
+    GlobalGCManager::systemCleanTrash(local_context, id, log);
+}
+
+void InterpreterSystemQuery::executeGc(const ASTSystemQuery & query)
+{
+    auto local_context = getContext();
+    if (auto server_type = local_context->getServerType(); server_type != ServerType::cnch_server)
+        throw Exception("SYSTEM GC is only available on CNCH server", ErrorCodes::NOT_IMPLEMENTED);
+
+    auto storage = DatabaseCatalog::instance().getTable(table_id, local_context);
+    CnchPartGCThread gc_thread(local_context, storage->getStorageID());
+    gc_thread.executeManually(query.partition, local_context);
+}
+
 void InterpreterSystemQuery::executeDedup(const ASTSystemQuery & query)
 {
     if (auto server_type = getContext()->getServerType(); server_type != ServerType::cnch_server && server_type != ServerType::cnch_worker)
         throw Exception("SYSTEM DEDUP is only available on CNCH server or worker", ErrorCodes::NOT_IMPLEMENTED);
 
-    auto ts = getContext()->getTimestamp();
-    auto catalog = getContext()->getCnchCatalog();
-    auto storage = catalog->getTable(*getContext(), query.database, query.table, ts);
+    auto storage = DatabaseCatalog::instance().getTable(table_id, getContext());
     if (auto * cnch_table = dynamic_cast<StorageCnchMergeTree *>(storage.get()))
-    {
         cnch_table->executeDedupForRepair(query.partition, getContext());
-    }
     else
-    {
-        throw Exception("Table " + query.database + "." + query.table + " is not a CnchMergeTree", ErrorCodes::BAD_ARGUMENTS);
-    }
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table {} is not a CnchMergeTree", table_id.getNameForLogs());
 }
 
-void InterpreterSystemQuery::dumpCnchServerManagerStatus()
+void InterpreterSystemQuery::dumpCnchServerStatus()
 {
-    bool is_leader = getContext()->getCnchServerManager()->isLeader();
-    auto current_topology = getContext()->getCnchTopologyMaster()->getCurrentTopology();
-    LOG_DEBUG(log, "\nCurrent node is leader: {};\nCurrent topology: {}", is_leader, dumpTopologies(current_topology));
+    auto context = getContext();
+    auto server_manager = context->getCnchServerManager();
+    if (server_manager)
+        server_manager->dumpServerStatus();
+    auto topology_master = context->getCnchTopologyMaster();
+    if (topology_master)
+        topology_master->dumpStatus();
 }
 
 void InterpreterSystemQuery::dropCnchPartCache(ASTSystemQuery & query)
 {
-    if (!query.database.empty() && !query.table.empty())
+    if (!query.database.empty() && !query.table.empty() && getContext()->getPartCacheManager())
     {
         auto storage = DatabaseCatalog::instance().getTable(StorageID{query.database, query.table}, getContext());
         if (storage)
@@ -1024,7 +1207,7 @@ void InterpreterSystemQuery::dropChecksumsCache(const StorageID & table_id) cons
 
 void InterpreterSystemQuery::clearBrokenTables(ContextMutablePtr & ) const
 {
-    const auto databases = DatabaseCatalog::instance().getDatabases();
+    const auto databases = DatabaseCatalog::instance().getDatabases(getContext());
 
     for (const auto & elem : databases)
         elem.second->clearBrokenTables();
@@ -1048,10 +1231,13 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::DROP_DNS_CACHE: [[fallthrough]];
         case Type::DROP_MARK_CACHE: [[fallthrough]];
         case Type::DROP_MMAP_CACHE: [[fallthrough]];
+        case Type::DROP_QUERY_CACHE:
+            [[fallthrough]];
         case Type::DROP_CHECKSUMS_CACHE: [[fallthrough]];
 #if USE_EMBEDDED_COMPILER
         case Type::DROP_COMPILED_EXPRESSION_CACHE: [[fallthrough]];
 #endif
+        case Type::DROP_NVM_CACHE: [[fallthrough]];
         case Type::DROP_UNCOMPRESSED_CACHE:
         {
             required_access.emplace_back(AccessType::SYSTEM_DROP_CACHE);
@@ -1169,6 +1355,11 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
             required_access.emplace_back(AccessType::SYSTEM_RESTART_REPLICA);
             break;
         }
+        case Type::RECALCULATE_METRICS:
+        {
+            required_access.emplace_back(AccessType::SYSTEM_RECALCULATE_METRICS, query.database, query.table);
+            break;
+        }
         case Type::FLUSH_DISTRIBUTED:
         {
             required_access.emplace_back(AccessType::SYSTEM_FLUSH_DISTRIBUTED, query.database, query.table);
@@ -1191,6 +1382,7 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
 
         case Type::START_CONSUME: [[fallthrough]];
         case Type::STOP_CONSUME: [[fallthrough]];
+        case Type::DROP_CONSUME: [[fallthrough]];
         case Type::RESTART_CONSUME:
         {
             required_access.emplace_back(AccessType::SYSTEM_CONSUME, query.database, query.table);
@@ -1336,16 +1528,147 @@ void InterpreterSystemQuery::executeActionOnCNCHLog(const String & table_name, A
 {
     if (table_name == CNCH_SYSTEM_LOG_KAFKA_LOG_TABLE_NAME)
         executeActionOnCNCHLogImpl(getContext()->getCloudKafkaLog(), type, table_name, log);
+    else if (table_name == CNCH_SYSTEM_LOG_MATERIALIZED_MYSQL_LOG_TABLE_NAME)
+        executeActionOnCNCHLogImpl(getContext()->getCloudMaterializedMySQLLog(), type, table_name, log);
     else if (table_name == CNCH_SYSTEM_LOG_QUERY_METRICS_TABLE_NAME)
         executeActionOnCNCHLogImpl(getContext()->getQueryMetricsLog(), type, table_name, log);
     else if (table_name == CNCH_SYSTEM_LOG_QUERY_WORKER_METRICS_TABLE_NAME)
         executeActionOnCNCHLogImpl(getContext()->getQueryWorkerMetricsLog(), type, table_name, log);
+    else if (table_name == CNCH_SYSTEM_LOG_QUERY_LOG_TABLE_NAME)
+        executeActionOnCNCHLogImpl(getContext()->getCnchQueryLog(), type, table_name, log);
     else
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "there is no log corresponding to table name {}, available names are {}, {}, {}",
+            "there is no log corresponding to table name {}, available names are {}, {}, {}, {}",
             table_name,
             CNCH_SYSTEM_LOG_KAFKA_LOG_TABLE_NAME,
+            CNCH_SYSTEM_LOG_MATERIALIZED_MYSQL_LOG_TABLE_NAME,
             CNCH_SYSTEM_LOG_QUERY_METRICS_TABLE_NAME,
-            CNCH_SYSTEM_LOG_QUERY_WORKER_METRICS_TABLE_NAME);
+            CNCH_SYSTEM_LOG_QUERY_WORKER_METRICS_TABLE_NAME,
+            CNCH_SYSTEM_LOG_QUERY_LOG_TABLE_NAME);
 }
+
+void InterpreterSystemQuery::cleanTransaction(UInt64 txn_id)
+{
+    /// similar to daemon manager implementation
+    TxnTimestamp current_time = getContext()->getTimestamp();
+    auto catalog = getContext()->getCnchCatalog();
+    auto & server_pool = getContext()->getCnchServerClientPool();
+    const UInt64 safe_remove_interval = getContext()->getConfigRef().getInt("cnch_txn_safe_remove_seconds", 5 * 60); // default 5 min
+    auto txn_record = catalog->getTransactionRecord(txn_id);
+    try
+    {
+        auto client = server_pool.tryGetByRPCAddress(txn_record.location());
+        bool server_exists = static_cast<bool>(client);
+        if (!client)
+            client = server_pool.get();
+
+        LOG_TRACE(
+            log,
+            "Select server ({}) for txn {}, stats: {}, coordinator location: {}", client->getRPCAddress(), txn_record.txnID(), txnStatusToString(txn_record.status()), txn_record.location());
+
+        switch (txn_record.status())
+        {
+            case CnchTransactionStatus::Aborted:
+            {
+                client->cleanTransaction(txn_record);
+                break;
+            }
+            case CnchTransactionStatus::Finished:
+            {
+                if (!txn_record.cleanTs())
+                {
+                    if (txn_record.hasMainTableUUID())
+                    {
+                        auto table = getContext()->getCnchCatalog()->tryGetTableByUUID(*getContext(), UUIDHelpers::UUIDToString(txn_record.mainTableUUID()), txn_record.txnID());
+                        auto server_vw_name = table ? table->getStorageID().server_vw_name : "server_vw_default";
+                        auto host_port = getContext()->getCnchTopologyMaster()->getTargetServer(
+                            UUIDHelpers::UUIDToString(txn_record.mainTableUUID()), server_vw_name, false);
+                        client = server_pool.get(host_port);
+                    }
+                    client->cleanTransaction(txn_record);
+                }
+                else if (current_time.toSecond() - txn_record.cleanTs().toSecond() > safe_remove_interval) {
+                    catalog->removeTransactionRecord(txn_record);
+                }
+                break;
+            }
+            case CnchTransactionStatus::Running:
+            {
+                if (!server_exists)
+                {
+                    client->cleanTransaction(txn_record);
+                }
+                else if (client->getTransactionStatus(txn_record.txnID()) == CnchTransactionStatus::Inactive)
+                {
+                    client->cleanTransaction(txn_record);
+                }
+                break;
+            }
+            default:
+                throw Exception("Invalid status received", ErrorCodes::LOGICAL_ERROR);
+        }
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+    }
+}
+
+void InterpreterSystemQuery::cleanFilesystemLock()
+{
+    auto lock_records = getContext()->getCnchCatalog()->getAllFilesysLock();
+    for (const auto & record : lock_records)
+    {
+        cleanTransaction(record.txn_id());
+    }
+}
+
+void InterpreterSystemQuery::lockMemoryLock(const ASTSystemQuery & query, const StorageID & table_id, ContextPtr local_context)
+{
+    /// SYSTEM LOCK MEMORY LOCK db.tb PARTITON '2012-01-01' FOR 4 SECONDS TASK_DOMAIN
+
+    auto & txn_coordinator = local_context->getCnchTransactionCoordinator();
+    auto transaction = txn_coordinator.createTransaction(
+        CreateTransactionOption().setInitiator(CnchTransactionInitiator::Merge).setPriority(CnchTransactionPriority::low));
+
+    SCOPE_EXIT({
+        try
+        {
+            txn_coordinator.finishTransaction(transaction);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, __PRETTY_FUNCTION__);
+        }
+    });
+
+    StoragePtr storage = local_context->getCnchCatalog()->tryGetTable(*local_context, table_id.database_name, table_id.table_name);
+    if (!storage)
+        throw Exception("Failed to get StoragePtr for table", ErrorCodes::BAD_ARGUMENTS);
+
+    auto * merge_tree = dynamic_cast<StorageCnchMergeTree *>(storage.get());
+    if (!merge_tree)
+        throw Exception("storage is not merge tree table", ErrorCodes::LOGICAL_ERROR);
+
+    String partition_id = merge_tree->getPartitionIDFromQuery(query.partition, local_context);
+    LOG_DEBUG(log, "execute lock Memory lock on partition_id {} on table {} for {} s with string data {}", partition_id, table_id.getFullTableName(), query.seconds, query.string_data);
+
+    TxnTimestamp txn_id = transaction->getTransactionID();
+    LockInfoPtr partition_lock = std::make_shared<LockInfo>(txn_id);
+    partition_lock->setMode(LockMode::X);
+    partition_lock->setTimeout(1000); //1 seconds
+    if (!query.string_data.empty())
+        partition_lock->setTablePrefix(LockInfo::task_domain + UUIDHelpers::UUIDToString(storage->getStorageUUID()));
+    else
+        partition_lock->setUUID(storage->getStorageUUID());
+    partition_lock->setPartition(partition_id);
+
+    Stopwatch lock_watch;
+
+    auto cnch_lock = transaction->createLockHolder({std::move(partition_lock)});
+    cnch_lock->lock();
+    LOG_DEBUG(log, "Acquired lock in {} ms", lock_watch.elapsedMilliseconds());
+    sleepForSeconds(query.seconds);
+}
+
 }

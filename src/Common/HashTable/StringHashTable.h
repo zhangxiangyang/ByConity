@@ -150,10 +150,10 @@ public:
 };
 
 template <size_t initial_size_degree = 8>
-struct StringHashTableGrower : public HashTableGrower<initial_size_degree>
+struct StringHashTableGrower : public HashTableGrowerWithPrecalculation<initial_size_degree>
 {
     // Smooth growing for string maps
-    void increaseSize() { this->size_degree += 1; }
+    void increaseSize() { this->increaseSizeDegree(1); }
 };
 
 template <typename Mapped>
@@ -426,5 +426,14 @@ public:
         m2.clearAndShrink();
         m3.clearAndShrink();
         ms.clearAndShrink();
+    }
+
+    void clear()
+    {
+        m1.clearHasZero();
+        m1.clear();
+        m2.clear();
+        m3.clear();
+        ms.clear();
     }
 };

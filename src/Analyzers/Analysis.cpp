@@ -57,6 +57,11 @@ void Analysis::setTableStorageScope(ASTIdentifier & db_and_table, ScopePtr scope
     MAP_SET(table_storage_scopes, &db_and_table, scope);
 }
 
+std::unordered_map<ASTIdentifier *, ScopePtr> & Analysis::getTableStorageScopeMap()
+{
+    return table_storage_scopes;
+}
+
 ScopePtr Analysis::getTableStorageScope(ASTIdentifier & db_and_table)
 {
     MAP_GET(table_storage_scopes, &db_and_table);
@@ -84,19 +89,51 @@ ASTs & Analysis::getTableAliasColumns(ASTIdentifier & db_and_table)
     MAP_GET(table_alias_columns, &db_and_table);
 }
 
-bool Analysis::hasExpressionType(const ASTPtr & expression)
+bool Analysis::hasExpressionColumnWithType(const ASTPtr & expression)
 {
-    return expression_types.find(expression) != expression_types.end();
+    return expression_column_with_types.find(expression) != expression_column_with_types.end();
 }
 
-void Analysis::setExpressionType(const ASTPtr & expression, const DataTypePtr & type)
+void Analysis::setExpressionColumnWithType(const ASTPtr & expression, const ColumnWithType & column_with_type)
 {
-    expression_types[expression] = type;
+    expression_column_with_types[expression] = column_with_type;
+}
+
+std::optional<ColumnWithType> Analysis::tryGetExpressionColumnWithType(const ASTPtr & expression)
+{
+    if (auto it = expression_column_with_types.find(expression); it != expression_column_with_types.end())
+        return it->second;
+
+    return std::nullopt;
 }
 
 DataTypePtr Analysis::getExpressionType(const ASTPtr & expression)
 {
-    MAP_GET(expression_types, expression);
+    if(auto it = expression_column_with_types.find(expression); it != expression_column_with_types.end())
+        return expression_column_with_types[expression].type;
+    else
+        throw Exception("Object not found in expression_column_with_types", ErrorCodes::LOGICAL_ERROR);
+}
+
+ExpressionTypes Analysis::getExpressionTypes()
+{
+    ExpressionTypes expression_types;
+    for(auto & it : expression_column_with_types)
+        expression_types[it.first] = expression_column_with_types[it.first].type;
+    return expression_types;
+}
+
+void Analysis::setPrewhere(ASTSelectQuery & select_query, const ASTPtr & prewhere)
+{
+    MAP_SET(prewheres, &select_query, prewhere);
+}
+
+ASTPtr Analysis::tryGetPrewhere(ASTSelectQuery & select_query)
+{
+    if (auto it = prewheres.find(&select_query); it != prewheres.end())
+        return it->second;
+
+    return nullptr;
 }
 
 JoinUsingAnalysis & Analysis::getJoinUsingAnalysis(ASTTableJoin & table_join)
@@ -111,12 +148,29 @@ JoinOnAnalysis & Analysis::getJoinOnAnalysis(ASTTableJoin & table_join)
 
 const StorageAnalysis & Analysis::getStorageAnalysis(const IAST & ast)
 {
-    MAP_GET(storage_results, &ast);
+    if (storage_results.count(&ast) == 0)
+        throw Exception("storage not found in storage_results", ErrorCodes::LOGICAL_ERROR); 
+    return storage_results[&ast];
+}
+
+const LinkedHashMap<const IAST *, StorageAnalysis> & Analysis::getStorages() const
+{
+    return storage_results;
 }
 
 UInt64 Analysis::getLimitByValue(ASTSelectQuery & select_query)
 {
     MAP_GET(limit_by_values, &select_query);
+}
+
+std::vector<ASTPtr> & Analysis::getLimitByItem(ASTSelectQuery & select_query)
+{
+    return limit_by_items[&select_query];
+}
+
+UInt64 Analysis::getLimitByOffsetValue(ASTSelectQuery & select_query)
+{
+    MAP_GET(limit_by_offset_values, &select_query);
 }
 
 UInt64 Analysis::getLimitLength(ASTSelectQuery & select_query)
@@ -140,6 +194,29 @@ std::optional<ResolvedField> Analysis::tryGetColumnReference(const ASTPtr & ast)
         return column_references.at(ast);
 
     return std::nullopt;
+}
+
+void Analysis::addReadColumn(const IAST * table_ast, size_t field_index)
+{
+    read_columns[table_ast].emplace(field_index);
+}
+
+void Analysis::addReadColumn(const ResolvedField & resolved_field, bool add_used)
+{
+    const auto & field_desc = resolved_field.getFieldDescription();
+    // only need do this in the initial SELECT query
+    if (field_desc.origin_columns.size() == 1)
+    {
+        const auto & origin_column = field_desc.origin_columns.front();
+        addReadColumn(origin_column.table_ast, origin_column.index_of_scope);
+        if (add_used)
+            addUsedColumn(origin_column.storage->getStorageID(), origin_column.column);
+    }
+}
+
+const std::set<size_t> & Analysis::getReadColumns(const IAST & table_ast)
+{
+    return read_columns[&table_ast];
 }
 
 void Analysis::setLambdaArgumentReference(const ASTPtr & ast, const ResolvedField & resolved)
@@ -223,20 +300,15 @@ void Analysis::registerCTE(ASTSubquery & subquery)
         iter->second.ref_count++;
 }
 
-bool Analysis::isSharableCTE(ASTSubquery & subquery)
+std::optional<CTEAnalysis> Analysis::tryGetCTEAnalysis(ASTSubquery & subquery)
 {
     auto clone = std::make_shared<ASTSubquery>(subquery);
     clone->alias.clear();
-    if (auto iter = common_table_expressions.find(clone); iter != common_table_expressions.end())
-        return iter->second.ref_count >= 2;
-    return false;
-}
 
-CTEAnalysis & Analysis::getCTEAnalysis(ASTSubquery & subquery)
-{
-    auto clone = std::make_shared<ASTSubquery>(subquery);
-    clone->alias.clear();
-    MAP_GET(common_table_expressions, clone);
+    if (auto it = common_table_expressions.find(clone); it != common_table_expressions.end())
+        return it->second;
+
+    return std::nullopt;
 }
 
 ASTs & Analysis::getSelectExpressions(ASTSelectQuery & select_query)
@@ -323,16 +395,16 @@ std::optional<SubColumnReference> Analysis::tryGetSubColumnReference(const ASTPt
     return std::nullopt;
 }
 
-void Analysis::addUsedSubColumn(const IAST * table_ast, size_t field_index, const SubColumnID & sub_column_id)
+void Analysis::addReadSubColumn(const IAST * table_ast, size_t field_index, const SubColumnID & sub_column_id)
 {
-    auto & vec = used_sub_columns[table_ast];
+    auto & vec = read_sub_columns[table_ast];
     vec.resize(std::max(field_index + 1, vec.size()));
     vec[field_index].insert(sub_column_id);
 }
 
-const std::vector<SubColumnIDSet> & Analysis::getUsedSubColumns(const IAST & table_ast)
+const std::vector<SubColumnIDSet> & Analysis::getReadSubColumns(const IAST & table_ast)
 {
-    return used_sub_columns[&table_ast];
+    return read_sub_columns[&table_ast];
 }
 
 void Analysis::addNonDeterministicFunctions(IAST & ast)
@@ -340,4 +412,18 @@ void Analysis::addNonDeterministicFunctions(IAST & ast)
     non_deterministic_functions.insert(&ast);
 }
 
+ArrayJoinAnalysis & Analysis::getArrayJoinAnalysis(ASTSelectQuery & select_query)
+{
+    return array_join_analysis[&select_query];
+}
+
+void Analysis::addUsedFunctionArgument(const String & func_name, ColumnsWithTypeAndName & processed_arguments)
+{
+    if (func_name == "getSetting" && !processed_arguments.empty())
+    {
+        auto & arg = processed_arguments[0];
+        if (arg.column && !arg.column->empty())
+        function_arguments[func_name].emplace_back((*arg.column)[0].toString());
+    }
+}
 }

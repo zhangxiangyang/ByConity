@@ -22,31 +22,32 @@
 #include <future>
 #include <Poco/Util/Application.h>
 
-#include <Common/Stopwatch.h>
-#include <Common/setThreadName.h>
-#include <Common/formatReadable.h>
-#include <DataTypes/DataTypeAggregateFunction.h>
-#include <DataTypes/DataTypeNullable.h>
-#include <DataTypes/DataTypeLowCardinality.h>
-#include <Columns/ColumnArray.h>
-#include <Columns/ColumnTuple.h>
-#include <DataStreams/NativeBlockOutputStream.h>
-#include <DataStreams/materializeBlock.h>
-#include <IO/WriteBufferFromFile.h>
-#include <Compression/CompressedWriteBuffer.h>
-#include <Interpreters/Aggregator.h>
-#include <Common/MemoryTracker.h>
-#include <Common/CurrentThread.h>
-#include <Common/typeid_cast.h>
-#include <Common/assert_cast.h>
-#include <Common/JSONBuilder.h>
 #include <AggregateFunctions/AggregateFunctionArray.h>
 #include <AggregateFunctions/AggregateFunctionState.h>
+#include <Columns/ColumnArray.h>
+#include <Columns/ColumnTuple.h>
+#include <Compression/CompressedWriteBuffer.h>
+#include <DataStreams/NativeBlockOutputStream.h>
+#include <DataStreams/materializeBlock.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <IO/Operators.h>
-#include <Interpreters/JIT/compileFunction.h>
-#include <Interpreters/JIT/CompiledExpressionCache.h>
+#include <IO/WriteBufferFromFile.h>
+#include <Interpreters/Aggregator.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/JIT/CompiledExpressionCache.h>
+#include <Interpreters/JIT/compileFunction.h>
+#include <Protos/plan_node_utils.pb.h>
 #include <QueryPlan/PlanSerDerHelper.h>
+#include <Common/CurrentThread.h>
+#include <Common/JSONBuilder.h>
+#include <Common/MemoryTracker.h>
+#include <Common/Stopwatch.h>
+#include <Common/assert_cast.h>
+#include <Common/formatReadable.h>
+#include <Common/setThreadName.h>
+#include <Common/typeid_cast.h>
 
 
 namespace ProfileEvents
@@ -237,93 +238,73 @@ void Aggregator::Params::explain(JSONBuilder::JSONMap & map) const
     }
 }
 
-void Aggregator::Params::serialize(WriteBuffer & buf) const
+void Aggregator::Params::toProto(Protos::AggregatorParams & proto) const
 {
-    serializeBlock(src_header, buf);
-    serializeBlock(intermediate_header, buf);
+    serializeHeaderToProto(src_header, *proto.mutable_src_header());
+    serializeHeaderToProto(intermediate_header, *proto.mutable_intermediate_header());
+    for (const auto & element : keys)
+        proto.add_keys(element);
+    for (const auto & element : aggregates)
+        element.toProto(*proto.add_aggregates());
+    proto.set_overflow_row(overflow_row);
+    proto.set_max_rows_to_group_by(max_rows_to_group_by);
+    proto.set_group_by_overflow_mode(OverflowModeConverter::toProto(group_by_overflow_mode));
+    proto.set_group_by_two_level_threshold(group_by_two_level_threshold);
+    proto.set_group_by_two_level_threshold_bytes(group_by_two_level_threshold_bytes);
+    proto.set_max_bytes_before_external_group_by(max_bytes_before_external_group_by);
+    proto.set_empty_result_for_aggregation_by_empty_set(empty_result_for_aggregation_by_empty_set);
 
-    /// keys
-    writeBinary(keys, buf);
-
-    /// aggregates
-    writeBinary(aggregates.size(), buf);
-    for (const auto & aggregate : aggregates)
-        aggregate.serialize(buf);
-
-    writeBinary(overflow_row, buf);
-    writeBinary(max_rows_to_group_by, buf);
-    serializeEnum(group_by_overflow_mode, buf);
-
-    writeBinary(group_by_two_level_threshold, buf);
-    writeBinary(group_by_two_level_threshold_bytes, buf);
-
-    writeBinary(max_bytes_before_external_group_by, buf);
-
-    writeBinary(empty_result_for_aggregation_by_empty_set, buf);
-
-    writeBinary(max_threads, buf);
-    writeBinary(min_free_disk_space, buf);
-
-    writeBinary(compile_aggregate_expressions, buf);
-    writeBinary(min_count_to_compile_aggregate_expression, buf);
+    proto.set_max_threads(max_threads);
+    proto.set_min_free_disk_space(min_free_disk_space);
+    proto.set_compile_aggregate_expressions(compile_aggregate_expressions);
+    proto.set_min_count_to_compile_aggregate_expression(min_count_to_compile_aggregate_expression);
 }
 
-Aggregator::Params Aggregator::Params::deserialize(ReadBuffer & buf, const ContextPtr & context)
+Aggregator::Params Aggregator::Params::fromProto(const Protos::AggregatorParams & proto, ContextPtr context)
 {
-
-    auto src_header = deserializeBlock(buf);
-    auto intermediate_header = deserializeBlock(buf);
-
+    auto src_header = deserializeHeaderFromProto(proto.src_header());
+    auto intermediate_header = deserializeHeaderFromProto(proto.intermediate_header());
     ColumnNumbers keys;
-    readBinary(keys, buf);
-
-    size_t aggregates_size;
-    readBinary(aggregates_size, buf);
+    for (const auto & element : proto.keys())
+        keys.emplace_back(element);
     AggregateDescriptions aggregates;
-    aggregates.resize(aggregates_size);
-    for (size_t i = 0; i < aggregates_size; ++i)
+    for (const auto & proto_element : proto.aggregates())
     {
-        aggregates[i].deserialize(buf);
+        AggregateDescription element;
+        element.fillFromProto(proto_element);
+        aggregates.emplace_back(std::move(element));
     }
+    auto overflow_row = proto.overflow_row();
+    auto max_rows_to_group_by = proto.max_rows_to_group_by();
+    auto group_by_overflow_mode = OverflowModeConverter::fromProto(proto.group_by_overflow_mode());
+    auto group_by_two_level_threshold = proto.group_by_two_level_threshold();
+    auto group_by_two_level_threshold_bytes = proto.group_by_two_level_threshold_bytes();
+    auto max_bytes_before_external_group_by = proto.max_bytes_before_external_group_by();
+    auto empty_result_for_aggregation_by_empty_set = proto.empty_result_for_aggregation_by_empty_set();
+    VolumePtr tmp_volume = context ? context->getTemporaryVolume() : nullptr;
+    auto max_threads = proto.max_threads();
+    auto min_free_disk_space = proto.min_free_disk_space();
+    auto compile_aggregate_expressions = proto.compile_aggregate_expressions();
+    auto min_count_to_compile_aggregate_expression = proto.min_count_to_compile_aggregate_expression();
+    auto step = Aggregator::Params(
+        src_header,
+        keys,
+        aggregates,
+        overflow_row,
+        max_rows_to_group_by,
+        group_by_overflow_mode,
+        group_by_two_level_threshold,
+        group_by_two_level_threshold_bytes,
+        max_bytes_before_external_group_by,
+        empty_result_for_aggregation_by_empty_set,
+        tmp_volume,
+        max_threads,
+        min_free_disk_space,
+        compile_aggregate_expressions,
+        min_count_to_compile_aggregate_expression,
+        intermediate_header);
 
-    bool overflow_row;
-    readBinary(overflow_row, buf);
-    size_t max_rows_to_group_by;
-    readBinary(max_rows_to_group_by, buf);
-    OverflowMode group_by_overflow_mode;
-    deserializeEnum(group_by_overflow_mode, buf);
-
-    size_t group_by_two_level_threshold;
-    readBinary(group_by_two_level_threshold, buf);
-    size_t group_by_two_level_threshold_bytes;
-    readBinary(group_by_two_level_threshold_bytes, buf);
-
-    size_t max_bytes_before_external_group_by;
-    readBinary(max_bytes_before_external_group_by, buf);
-    bool empty_result_for_aggregation_by_empty_set;
-    readBinary(empty_result_for_aggregation_by_empty_set, buf);
-
-    size_t max_threads;
-    readBinary(max_threads, buf);
-    size_t min_free_disk_space;
-    readBinary(min_free_disk_space, buf);
-
-    bool compile_aggregate_expressions;
-    readBinary(compile_aggregate_expressions, buf);
-    size_t min_count_to_compile_aggregate_expression;
-    readBinary(min_count_to_compile_aggregate_expression, buf);
-
-    return Aggregator::Params(src_header, keys, aggregates,
-                              overflow_row, max_rows_to_group_by, group_by_overflow_mode,
-                              group_by_two_level_threshold, group_by_two_level_threshold_bytes,
-                              max_bytes_before_external_group_by,
-                              empty_result_for_aggregation_by_empty_set,
-                              context ? context->getTemporaryVolume() : nullptr,
-                              max_threads,
-                              min_free_disk_space,
-                              compile_aggregate_expressions,
-                              min_count_to_compile_aggregate_expression,
-                              intermediate_header);
+    return step;
 }
 
 #if USE_EMBEDDED_COMPILER
@@ -549,6 +530,8 @@ AggregatedDataVariants::Type Aggregator::chooseAggregationMethod()
         {
             /// Pack if possible all the keys along with information about which key values are nulls
             /// into a fixed 16- or 32-byte blob.
+            if (std::tuple_size<KeysNullMap<UInt64>>::value + keys_bytes <= 8)
+                return AggregatedDataVariants::Type::nullable_keys64;
             if (std::tuple_size<KeysNullMap<UInt128>>::value + keys_bytes <= 16)
                 return AggregatedDataVariants::Type::nullable_keys128;
             if (std::tuple_size<KeysNullMap<UInt256>>::value + keys_bytes <= 32)
@@ -930,7 +913,7 @@ void NO_INLINE Aggregator::executeOnIntervalWithoutKeyImpl(
 
 
 void Aggregator::prepareAggregateInstructions(Columns columns, AggregateColumns & aggregate_columns, Columns & materialized_columns,
-    AggregateFunctionInstructions & aggregate_functions_instructions, NestedColumnsHolder & nested_columns_holder)
+    AggregateFunctionInstructions & aggregate_functions_instructions, NestedColumnsHolder & nested_columns_holder) const
 {
     for (size_t i = 0; i < params.aggregates_size; ++i)
         aggregate_columns[i].resize(params.aggregates[i].arguments.size());
@@ -982,7 +965,7 @@ void Aggregator::prepareAggregateInstructions(Columns columns, AggregateColumns 
 
 
 bool Aggregator::executeOnBlock(const Block & block, AggregatedDataVariants & result,
-                                ColumnRawPtrs & key_columns, AggregateColumns & aggregate_columns, bool & no_more_keys)
+                                ColumnRawPtrs & key_columns, AggregateColumns & aggregate_columns, bool & no_more_keys) const
 {
     UInt64 num_rows = block.rows();
     return executeOnBlock(block.getColumns(), num_rows, result, key_columns, aggregate_columns, no_more_keys);
@@ -990,7 +973,7 @@ bool Aggregator::executeOnBlock(const Block & block, AggregatedDataVariants & re
 
 
 bool Aggregator::executeOnBlock(Columns columns, UInt64 num_rows, AggregatedDataVariants & result,
-    ColumnRawPtrs & key_columns, AggregateColumns & aggregate_columns, bool & no_more_keys)
+    ColumnRawPtrs & key_columns, AggregateColumns & aggregate_columns, bool & no_more_keys) const
 {
     /// `result` will destroy the states of aggregate functions in the destructor
     result.aggregator = this;
@@ -1072,10 +1055,14 @@ bool Aggregator::executeOnBlock(Columns columns, UInt64 num_rows, AggregatedData
         = (params.group_by_two_level_threshold && result_size >= params.group_by_two_level_threshold)
         || (params.group_by_two_level_threshold_bytes && result_size_bytes >= static_cast<Int64>(params.group_by_two_level_threshold_bytes));
 
-    /** Converting to a two-level data structure.
+    /** Converting to a two-level data structure. (Adaptive)
       * It allows you to make, in the subsequent, an effective merge - either economical from memory or parallel.
       */
-    if (result.isConvertibleToTwoLevel() && worth_convert_to_two_level)
+    if (params.two_level_mode == Params::TwoLevelMode::ADAPTIVE && result.isConvertibleToTwoLevel() && worth_convert_to_two_level)
+        result.convertToTwoLevel();
+
+    /** Converting to a two-level data structure. (Enforced) */
+    if (params.two_level_mode == Params::TwoLevelMode::ENFORCE_TWO_LEVEL && result.isConvertibleToTwoLevel())
         result.convertToTwoLevel();
 
     /// Checking the constraints.
@@ -1113,7 +1100,7 @@ bool Aggregator::executeOnBlock(Columns columns, UInt64 num_rows, AggregatedData
 }
 
 
-void Aggregator::writeToTemporaryFile(AggregatedDataVariants & data_variants, const String & tmp_path)
+void Aggregator::writeToTemporaryFile(AggregatedDataVariants & data_variants, const String & tmp_path) const
 {
     Stopwatch watch;
     size_t rows = data_variants.size();
@@ -1185,7 +1172,7 @@ void Aggregator::writeToTemporaryFile(AggregatedDataVariants & data_variants, co
 }
 
 
-void Aggregator::writeToTemporaryFile(AggregatedDataVariants & data_variants)
+void Aggregator::writeToTemporaryFile(AggregatedDataVariants & data_variants) const
 {
     String tmp_path = params.tmp_volume->getDisk()->getPath();
     return writeToTemporaryFile(data_variants, tmp_path);
@@ -1247,7 +1234,7 @@ template <typename Method>
 void Aggregator::writeToTemporaryFileImpl(
     AggregatedDataVariants & data_variants,
     Method & method,
-    IBlockOutputStream & out)
+    IBlockOutputStream & out) const
 {
     size_t max_temporary_block_size_rows = 0;
     size_t max_temporary_block_size_bytes = 0;
@@ -1305,6 +1292,9 @@ bool Aggregator::checkLimits(size_t result_size, bool & no_more_keys) const
         }
     }
 
+    /// Some aggregate functions cannot throw exceptions on allocations (e.g. from C malloc)
+    /// but still tracks memory. Check it here.
+    CurrentMemoryTracker::check();
     return true;
 }
 
@@ -2373,7 +2363,7 @@ void NO_INLINE Aggregator::mergeWithoutKeyStreamsImpl(
     block.clear();
 }
 
-bool Aggregator::mergeBlock(Block block, AggregatedDataVariants & result, bool & no_more_keys)
+bool Aggregator::mergeOnBlock(Block block, AggregatedDataVariants & result, bool & no_more_keys) const
 {
     /// `result` will destroy the states of aggregate functions in the destructor
     result.aggregator = this;
@@ -2412,10 +2402,14 @@ bool Aggregator::mergeBlock(Block block, AggregatedDataVariants & result, bool &
         = (params.group_by_two_level_threshold && result_size >= params.group_by_two_level_threshold)
         || (params.group_by_two_level_threshold_bytes && result_size_bytes >= static_cast<Int64>(params.group_by_two_level_threshold_bytes));
 
-    /** Converting to a two-level data structure.
+    /** Converting to a two-level data structure. (Adaptive)
       * It allows you to make, in the subsequent, an effective merge - either economical from memory or parallel.
       */
-    if (result.isConvertibleToTwoLevel() && worth_convert_to_two_level)
+    if (params.two_level_mode == Params::TwoLevelMode::ADAPTIVE && result.isConvertibleToTwoLevel() && worth_convert_to_two_level)
+        result.convertToTwoLevel();
+
+    /** Converting to a two-level data structure. (Enforced) */
+    if (params.two_level_mode == Params::TwoLevelMode::ENFORCE_TWO_LEVEL && result.isConvertibleToTwoLevel())
         result.convertToTwoLevel();
 
     /// Checking the constraints.
@@ -2723,7 +2717,7 @@ void NO_INLINE Aggregator::convertBlockToTwoLevelImpl(
 }
 
 
-std::vector<Block> Aggregator::convertBlockToTwoLevel(const Block & block)
+std::vector<Block> Aggregator::convertBlockToTwoLevel(const Block & block) const
 {
     if (!block)
         return {};
@@ -2815,7 +2809,7 @@ void Aggregator::destroyWithoutKey(AggregatedDataVariants & result) const
 }
 
 
-void Aggregator::destroyAllAggregateStates(AggregatedDataVariants & result)
+void Aggregator::destroyAllAggregateStates(AggregatedDataVariants & result) const
 {
     if (result.empty())
         return;

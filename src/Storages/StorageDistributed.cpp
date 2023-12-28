@@ -40,10 +40,11 @@
 #include <Common/Macros.h>
 #include <Common/ProfileEvents.h>
 #include <Common/escapeForFileName.h>
-#include <Common/typeid_cast.h>
+#include <Common/formatReadable.h>
 #include <Common/quoteString.h>
 #include <Common/randomSeed.h>
-#include <Common/formatReadable.h>
+#include <Common/typeid_cast.h>
+#include <Storages/UniqueNotEnforcedDescription.h>
 
 #include <Parsers/ASTDropQuery.h>
 #include <Parsers/ASTExpressionList.h>
@@ -426,6 +427,8 @@ StorageDistributed::StorageDistributed(
     const StorageID & id_,
     const ColumnsDescription & columns_,
     const ConstraintsDescription & constraints_,
+    const ForeignKeysDescription & foreign_keys_,
+    const UniqueNotEnforcedDescription & unique_,
     const String & comment,
     const String & remote_database_,
     const String & remote_table_,
@@ -455,6 +458,8 @@ StorageDistributed::StorageDistributed(
     StorageInMemoryMetadata storage_metadata;
     storage_metadata.setColumns(columns_);
     storage_metadata.setConstraints(constraints_);
+    storage_metadata.setForeignKeys(foreign_keys_);
+    storage_metadata.setUniqueNotEnforced(unique_);
     storage_metadata.setComment(comment);
     setInMemoryMetadata(storage_metadata);
 
@@ -491,6 +496,8 @@ StorageDistributed::StorageDistributed(
     const StorageID & id_,
     const ColumnsDescription & columns_,
     const ConstraintsDescription & constraints_,
+    const ForeignKeysDescription & foreign_keys_,
+    const UniqueNotEnforcedDescription & unique_,
     ASTPtr remote_table_function_ptr_,
     const String & cluster_name_,
     ContextPtr context_,
@@ -504,6 +511,8 @@ StorageDistributed::StorageDistributed(
         id_,
         columns_,
         constraints_,
+        foreign_keys_,
+        unique_,
         String{},
         String{},
         String{},
@@ -801,7 +810,11 @@ void StorageDistributed::checkAlterIsPossible(const AlterCommands & commands, Co
             && command.type != AlterCommand::Type::MODIFY_COLUMN
             && command.type != AlterCommand::Type::DROP_COLUMN
             && command.type != AlterCommand::Type::COMMENT_COLUMN
-            && command.type != AlterCommand::Type::RENAME_COLUMN)
+            && command.type != AlterCommand::Type::RENAME_COLUMN
+            && command.type != AlterCommand::Type::ADD_FOREIGN_KEY
+            && command.type != AlterCommand::Type::DROP_FOREIGN_KEY
+            && command.type != AlterCommand::Type::ADD_UNIQUE_NOT_ENFORCED
+            && command.type != AlterCommand::Type::DROP_UNIQUE_NOT_ENFORCED)
 
             throw Exception("Alter of type '" + alterTypeToString(command.type) + "' is not supported by storage " + getName(),
                 ErrorCodes::NOT_IMPLEMENTED);
@@ -826,7 +839,7 @@ void StorageDistributed::alter(const AlterCommands & params, ContextPtr local_co
     checkAlterIsPossible(params, local_context);
     StorageInMemoryMetadata new_metadata = getInMemoryMetadata();
     params.apply(new_metadata, local_context);
-    DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(local_context, table_id, new_metadata);
+    DatabaseCatalog::instance().getDatabase(table_id.database_name, local_context)->alterTable(local_context, table_id, new_metadata);
     setInMemoryMetadata(new_metadata);
 }
 
@@ -1360,7 +1373,7 @@ void registerStorageDistributed(StorageFactory & factory)
             auto type = block.getByPosition(0).type;
 
             if (!type->isValueRepresentedByInteger())
-                throw Exception("Sharding expression has type " + type->getName() +
+                throw Exception("Sharding expression " + block.getNames()[0] + " has type " + type->getName() +
                     ", but should be one of integer type", ErrorCodes::TYPE_MISMATCH);
         }
 
@@ -1386,6 +1399,8 @@ void registerStorageDistributed(StorageFactory & factory)
             args.table_id,
             args.columns,
             args.constraints,
+            args.foreign_keys,
+            args.unique,
             args.comment,
             remote_database,
             remote_table,

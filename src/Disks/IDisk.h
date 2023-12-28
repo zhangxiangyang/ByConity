@@ -48,6 +48,9 @@ extern const Metric DiskSpaceReservedForMerge;
 
 namespace DB
 {
+
+extern std::atomic<UInt64> next_disk_id;
+
 class IDiskDirectoryIterator;
 using DiskDirectoryIteratorPtr = std::unique_ptr<IDiskDirectoryIterator>;
 
@@ -247,6 +250,12 @@ public:
     /// Applies new settings for disk in runtime.
     virtual void applyNewSettings(const Poco::Util::AbstractConfiguration &, ContextPtr) {}
 
+    // return ‘true’ if disk support renameTo.
+    virtual bool supportRenameTo() { return true; }
+
+    // Get table relative_data_path from disk
+    virtual String getTableRelativePathOnDisk(const String & uuid){ return uuid;}
+
 protected:
     friend class DiskDecorator;
 
@@ -277,6 +286,8 @@ public:
 
     /// Name of the file that the iterator currently points to.
     virtual String name() const = 0;
+
+    virtual size_t size() const = 0;
 
     virtual ~IDiskDirectoryIterator() = default;
 };

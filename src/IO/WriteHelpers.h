@@ -231,7 +231,9 @@ inline void writeString(const StringRef & ref, WriteBuffer & buf)
  */
 inline void writeJSONString(const char * begin, const char * end, WriteBuffer & buf, const FormatSettings & settings)
 {
-    writeChar('"', buf);
+    if (settings.json.quota_json_string)
+        writeChar('"', buf);
+
     for (const char * it = begin; it != end; ++it)
     {
         switch (*it)
@@ -303,7 +305,9 @@ inline void writeJSONString(const char * begin, const char * end, WriteBuffer & 
                     writeChar(*it, buf);
         }
     }
-    writeChar('"', buf);
+
+    if (settings.json.quota_json_string)
+        writeChar('"', buf);
 }
 
 
@@ -952,6 +956,12 @@ inline void writeBinary(const std::pair<String, String> & x, WriteBuffer & buf)
     writeBinary(x.first, buf);
     writeBinary(x.second, buf);
 }
+template <typename T>
+inline void writeBinary(const std::pair<T, T> & x, WriteBuffer & buf)
+{
+    writeBinary(x.first, buf);
+    writeBinary(x.second, buf);
+}
 
 /// Methods for outputting the value in text form for a tab-separated format.
 template <typename T>
@@ -1114,6 +1124,9 @@ void writeBinary(const std::vector<T> & x, WriteBuffer & buf)
         writeBinary(x[i], buf);
 }
 
+template<>
+void writeBinary(const std::vector<bool> & x, WriteBuffer & buf);
+
 template <typename T>
 void writeQuoted(const std::vector<T> & x, WriteBuffer & buf)
 {
@@ -1123,6 +1136,21 @@ void writeQuoted(const std::vector<T> & x, WriteBuffer & buf)
         if (i != 0)
             writeChar(',', buf);
         writeQuoted(x[i], buf);
+    }
+    writeChar(']', buf);
+}
+
+template <typename T>
+void writeQuoted(const std::unordered_set<T> & x, WriteBuffer & buf)
+{
+    writeChar('[', buf);
+    size_t i = 0;
+    for (const auto & item : x)
+    {
+        if (i != 0)
+            writeChar(',', buf);
+        writeQuoted(item, buf);
+        ++i;
     }
     writeChar(']', buf);
 }
@@ -1146,6 +1174,11 @@ void writeText(const std::vector<T> & x, WriteBuffer & buf)
     writeQuoted(x, buf);
 }
 
+template <typename T>
+void writeText(const std::unordered_set<T> & x, WriteBuffer & buf)
+{
+    writeQuoted(x, buf);
+}
 
 /// Serialize exception (so that it can be transferred over the network)
 void writeException(const Exception & e, WriteBuffer & buf, bool with_stack_trace);

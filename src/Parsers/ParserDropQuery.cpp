@@ -3,6 +3,7 @@
 
 #include <Parsers/CommonParsers.h>
 #include <Parsers/ParserDropQuery.h>
+#include "Parsers/IAST_fwd.h"
 
 
 namespace DB
@@ -16,7 +17,9 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, cons
     ParserKeyword s_temporary("TEMPORARY");
     ParserKeyword s_table("TABLE");
     ParserKeyword s_dictionary("DICTIONARY");
+    ParserKeyword s_snapshot("SNAPSHOT");
     ParserKeyword s_view("VIEW");
+    ParserKeyword s_catalog("EXTERNAL CATALOG");
     ParserKeyword s_database("DATABASE");
     ParserToken s_dot(TokenType::Dot);
     ParserKeyword s_if_exists("IF EXISTS");
@@ -25,23 +28,35 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, cons
     ParserKeyword s_no_delay("NO DELAY");
     ParserKeyword s_sync("SYNC");
 
+    ASTPtr catalog;
     ASTPtr database;
     ASTPtr table;
     String cluster_str;
     bool if_exists = false;
     bool temporary = false;
     bool is_dictionary = false;
+    bool is_snapshot = false;
     bool is_view = false;
     bool no_delay = false;
     bool permanently = false;
 
-    if (s_database.ignore(pos, expected))
+    if (s_catalog.ignore(pos, expected))
+    {
+        if (s_if_exists.ignore(pos, expected))
+            if_exists = true;
+
+        if (!name_p.parse(pos, catalog, expected))
+            return false;
+        tryRewriteHiveCatalogName(catalog, pos.getContext());
+    }
+    else if (s_database.ignore(pos, expected))
     {
         if (s_if_exists.ignore(pos, expected))
             if_exists = true;
 
         if (!name_p.parse(pos, database, expected))
             return false;
+        tryRewriteCnchDatabaseName(database, pos.getContext());
     }
     else
     {
@@ -49,11 +64,13 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, cons
             is_view = true;
         else if (s_dictionary.ignore(pos, expected))
             is_dictionary = true;
+        else if (s_snapshot.ignore(pos, expected))
+            is_snapshot = true;
         else if (s_temporary.ignore(pos, expected))
             temporary = true;
 
         /// for TRUNCATE queries TABLE keyword is assumed as default and can be skipped
-        if (!is_view && !is_dictionary && (!s_table.ignore(pos, expected) && kind != ASTDropQuery::Kind::Truncate))
+        if (!is_view && !is_dictionary && !is_snapshot && (!s_table.ignore(pos, expected) && kind != ASTDropQuery::Kind::Truncate))
         {
             return false;
         }
@@ -67,13 +84,14 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, cons
         if (s_dot.ignore(pos, expected))
         {
             database = table;
+            tryRewriteCnchDatabaseName(database, pos.getContext());
             if (!name_p.parse(pos, table, expected))
                 return false;
         }
     }
 
     /// common for tables / dictionaries / databases
-    if (ParserKeyword{"ON"}.ignore(pos, expected))
+    if (!is_snapshot && ParserKeyword{"ON"}.ignore(pos, expected))
     {
         if (!ASTQueryWithOnCluster::parse(pos, cluster_str, expected))
             return false;
@@ -93,10 +111,12 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, cons
     query->if_exists = if_exists;
     query->temporary = temporary;
     query->is_dictionary = is_dictionary;
+    query->is_snapshot = is_snapshot;
     query->is_view = is_view;
     query->no_delay = no_delay;
     query->permanently = permanently;
 
+    tryGetIdentifierNameInto(catalog, query->catalog);
     tryGetIdentifierNameInto(database, query->database);
     tryGetIdentifierNameInto(table, query->table);
 

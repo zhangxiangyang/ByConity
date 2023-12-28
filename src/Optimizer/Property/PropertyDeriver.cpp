@@ -18,17 +18,20 @@
 #include <Optimizer/Property/PropertyDeriver.h>
 
 #include <Core/Names.h>
+#include <Interpreters/StorageID.h>
+#include <Optimizer/DomainTranslator.h>
 #include <Optimizer/ExpressionRewriter.h>
 #include <Optimizer/Property/Property.h>
 #include <Optimizer/SymbolsExtractor.h>
 #include <Optimizer/Utils.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/IAST_fwd.h>
 #include <QueryPlan/ExchangeStep.h>
 #include <QueryPlan/FilterStep.h>
 #include <QueryPlan/ProjectionStep.h>
 #include <QueryPlan/UnionStep.h>
 #include <Storages/StorageDistributed.h>
-#include <Parsers/ASTLiteral.h>
-#include <Parsers/IAST_fwd.h>
+#include <Poco/StringTokenizer.h>
 
 namespace DB
 {
@@ -37,81 +40,168 @@ namespace ErrorCodes
     extern const int OPTIMIZER_NONSUPPORT;
 }
 
-Property PropertyDeriver::deriveProperty(ConstQueryPlanStepPtr step, Context & context)
+Property PropertyDeriver::deriveProperty(QueryPlanStepPtr step, ContextMutablePtr & context)
 {
     PropertySet property_set;
     return deriveProperty(step, property_set, context);
 }
 
-Property PropertyDeriver::deriveProperty(ConstQueryPlanStepPtr step, Property & input_property, Context & context)
+Property PropertyDeriver::deriveProperty(QueryPlanStepPtr step, Property & input_property, ContextMutablePtr & context)
 {
     PropertySet input_properties = std::vector<Property>();
     input_properties.emplace_back(input_property);
-    return deriveProperty(step, input_properties, context);
-}
-
-Property PropertyDeriver::deriveProperty(ConstQueryPlanStepPtr step, PropertySet & input_properties, Context & context)
-{
-    DeriverContext deriver_context{input_properties, context};
-    static DeriverVisitor visitor{};
-    auto result = VisitorUtil::accept(step, visitor, deriver_context);
-
-    CTEDescriptions cte_descriptions;
-    for (auto & property : input_properties)
-        for (auto & item : property.getCTEDescriptions())
-            cte_descriptions.emplace(item);
-    if (!cte_descriptions.empty())
-        result.setCTEDescriptions(cte_descriptions);
+    auto result = deriveProperty(step, input_properties, context);
+    if (step->getType() != IQueryPlanStep::Type::Exchange)
+    {
+        if (result.getNodePartitioning().getComponent() == Partitioning::Component::ANY)
+        {
+            result.getNodePartitioningRef().setComponent(input_property.getNodePartitioning().getComponent());
+        }
+    }
 
     return result;
 }
 
-Property PropertyDeriver::deriveStorageProperty(const StoragePtr & storage, Context & context)
+Property PropertyDeriver::deriveProperty(QueryPlanStepPtr step, PropertySet & input_properties, ContextMutablePtr & context)
 {
-    if (storage->getStorageID().getDatabaseName() == "system")
+    DeriverContext deriver_context{input_properties, context};
+    static DeriverVisitor visitor{};
+    auto result = VisitorUtil::accept(step, visitor, deriver_context);
+    if (step->getType() != IQueryPlanStep::Type::Exchange)
     {
-        return Property{Partitioning(Partitioning::Handle::SINGLE), Partitioning(Partitioning::Handle::ARBITRARY)};
-    }
-
-    if (context.getSettingsRef().enable_sharding_optimize)
-    {
-        if (const auto * distribute_table = dynamic_cast<const StorageDistributed *>(storage.get()))
+        if (result.getNodePartitioning().getComponent() == Partitioning::Component::ANY && !input_properties.empty())
         {
-            auto sharding_key = distribute_table->getShardingKey();
-            auto symbols = SymbolsExtractor::extract(sharding_key);
-
-            ConstASTMap expression_map;
-            size_t index = 0;
-            for (auto symbol : symbols)
-            {
-                ASTPtr name = std::make_shared<ASTIdentifier>(symbol);
-                ASTPtr id = std::make_shared<ASTLiteral>(Field(index));
-                expression_map[name] = id;
-                index++;
-            }
-
-            ASTPtr rewritten = ExpressionRewriter::rewrite(sharding_key, expression_map);
-
-            if (!symbols.empty())
-            {
-                Names partition_keys{symbols.begin(), symbols.end()};
-                std::sort(partition_keys.begin(), partition_keys.end());
-                return Property{
-                    Partitioning{
-                        Partitioning::Handle::BUCKET_TABLE,
-                        partition_keys,
-                        true,
-                        distribute_table->getShardCount(),
-                        rewritten},
-                    Partitioning{}};
-            }
+            result.getNodePartitioningRef().setComponent(input_properties[0].getNodePartitioning().getComponent());
         }
     }
 
-    return Property{Partitioning(Partitioning::Handle::UNKNOWN), Partitioning(Partitioning::Handle::UNKNOWN)};
+    return result;
 }
 
+Property PropertyDeriver::deriveStorageProperty(const StoragePtr & storage, ContextMutablePtr & context)
+{
+    if (storage->getDatabaseName() == "system")
+    {
+        auto node = Partitioning(Partitioning::Handle::SINGLE);
+        node.setComponent(Partitioning::Component::COORDINATOR);
+        return Property{node, Partitioning(Partitioning::Handle::ARBITRARY)};
+    }
+    Sorting sorting;
+    for (const auto & col : storage->getInMemoryMetadataPtr()->getSortingKeyColumns())
+    {
+        sorting.emplace_back(SortColumn(col, SortOrder::ASC_NULLS_FIRST));
+    }
+
+    if (auto * merge_tree = dynamic_cast<MergeTreeMetaBase *>(storage.get()))
+    {
+        auto metadata = merge_tree->getInMemoryMetadataPtr();
+        Names clusterBy;
+        UInt64 buckets = 0;
+        if (auto cluster_by_hint = merge_tree->getSettings()->cluster_by_hint.toString(); !cluster_by_hint.empty())
+        {
+            Poco::StringTokenizer tokenizer(cluster_by_hint, ",", 0x11);
+            for (const auto & cluster_by_column : tokenizer)
+                clusterBy.push_back(cluster_by_column);
+            buckets = 0;
+        }
+        else if (storage->isBucketTable())
+        {
+            bool clustered;
+            context->getCnchCatalog()->getTableClusterStatus(merge_tree->getStorageUUID(), clustered);
+            if (clustered)
+            {
+                clusterBy = metadata->cluster_by_key.column_names;
+                buckets = metadata->getBucketNumberFromClusterByKey();
+            }
+        }
+
+        if (!clusterBy.empty())
+        {
+#if 0
+                NameToNameMap translation;
+                auto id_to_table = merge_tree->parseUnderlyingDictionaryTables(merge_tree->settings.underlying_dictionary_tables);
+                Names sec_cols;
+                for (const auto & item : id_to_table)
+                {
+                    sec_cols.emplace_back(item.first);
+                }
+#endif
+            return Property{
+                Partitioning{Partitioning::Handle::BUCKET_TABLE, clusterBy, true, buckets, true, Partitioning::Component::ANY},
+                Partitioning{},
+                sorting};
+        }
+    }
+
+    return Property{Partitioning(Partitioning::Handle::UNKNOWN), Partitioning(Partitioning::Handle::UNKNOWN), sorting};
+}
+
+Property PropertyDeriver::deriveStoragePropertyWhatIfMode(const StoragePtr& storage, ContextMutablePtr & context, const Property & required_property)
+{
+    Property actual_storage_property = deriveStorageProperty(storage, context);
+
+    const auto & table_layout = required_property.getTableLayout();
+
+    if (!table_layout.contains(storage->getStorageID().getQualifiedName()))
+        return actual_storage_property;
+
+    auto what_if_table_partitioning = table_layout.at(storage->getStorageID().getQualifiedName());
+
+    if (what_if_table_partitioning.isStarPartitioned()) // use required property to calculate lower bound
+        return required_property;
+
+    Names clusterBy{what_if_table_partitioning.getPartitionKey().column};
+    // the bucket number is only used for matching, can be set to anything
+    UInt64 buckets = (actual_storage_property.getNodePartitioning().getPartitioningHandle() == Partitioning::Handle::BUCKET_TABLE)
+        ? actual_storage_property.getNodePartitioning().getBuckets() : context->getSettingsRef().memory_catalog_worker_size;
+
+    Partitioning new_partitioning{Partitioning::Handle::BUCKET_TABLE, clusterBy, true, buckets, true, Partitioning::Component::ANY};
+    actual_storage_property.setNodePartitioning(new_partitioning);
+
+    return actual_storage_property;
+}
+
+
 Property DeriverVisitor::visitStep(const IQueryPlanStep &, DeriverContext & context)
+{
+    return context.getInput()[0].clearSorting();
+}
+
+Property  DeriverVisitor::visitFinalSampleStep(const FinalSampleStep &, DeriverContext &)
+{
+    throw Exception("Not impl property deriver", ErrorCodes::NOT_IMPLEMENTED);
+}
+
+Property DeriverVisitor::visitOffsetStep(const OffsetStep &, DeriverContext & context)
+{
+    return Property{
+        context.getInput()[0].getNodePartitioning(), Partitioning(Partitioning::Handle::SINGLE), context.getInput()[0].getSorting()};
+}
+
+Property DeriverVisitor::visitTotalsHavingStep(const TotalsHavingStep &, DeriverContext & context)
+{
+    return context.getInput()[0];
+}
+
+Property DeriverVisitor::visitFinishSortingStep(const FinishSortingStep & step, DeriverContext & context)
+{
+    auto prop = context.getInput()[0];
+    Sorting sorting;
+    for (auto item : step.getResultDescription())
+    {
+        sorting.emplace_back(item);
+    }
+
+    prop.setSorting(sorting);
+    return prop;
+}
+
+Property DeriverVisitor::visitPartitionTopNStep(const PartitionTopNStep &, DeriverContext & context)
+{
+    return context.getInput()[0];
+}
+
+Property DeriverVisitor::visitBufferStep(const BufferStep &, DeriverContext & context)
 {
     return context.getInput()[0];
 }
@@ -119,8 +209,51 @@ Property DeriverVisitor::visitStep(const IQueryPlanStep &, DeriverContext & cont
 Property DeriverVisitor::visitProjectionStep(const ProjectionStep & step, DeriverContext & context)
 {
     auto assignments = step.getAssignments();
+
+    if (!context.getInput()[0].getNodePartitioning().getPartitioningColumns().empty()
+        && context.getContext()->getSettingsRef().enable_injective_in_property)
+    {
+        for (const auto & item : assignments)
+        {
+            if (item.second->as<ASTFunction>())
+            {
+                std::set<String> symbols = SymbolsExtractor::extract(item.second);
+                bool contains_all = true;
+                auto partition_col = context.getInput()[0].getNodePartitioning().getPartitioningColumns();
+                for (const auto & col : partition_col)
+                {
+                    if (!symbols.count(col))
+                    {
+                        contains_all = false;
+                        break;
+                    }
+                }
+                if (contains_all)
+                {
+                    try
+                    {
+                        if (FunctionIsInjective::isInjective(
+                                item.second, context.getContext(), step.getInputStreams()[0].getNamesAndTypes()))
+                        {
+                            auto prop = context.getInput()[0];
+                            prop.getNodePartitioningRef().setPartitioningColumns({item.first});
+                            return prop;
+                        }
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+            }
+        }
+    }
+
     std::unordered_map<String, String> identities = Utils::computeIdentityTranslations(assignments);
     std::unordered_map<String, String> revert_identifies;
+
+    // TODO(gouguilin): check isBitEngineEncodeDecodeFunction in functions
+    // TODO(gouguilin):     when bitengine is ready
+    bool has_bitmap_func = false;
 
     for (auto & item : identities)
     {
@@ -144,10 +277,13 @@ Property DeriverVisitor::visitProjectionStep(const ProjectionStep & step, Derive
     {
         // TODO stream partition
     }
+    if (has_bitmap_func)
+    {
+        translated.getNodePartitioningRef().setComponent(Partitioning::Component::WORKER);
+    }
     return translated;
 }
 
-// TODO derive constants from predicate, e.g (where a = 1, ...)
 Property DeriverVisitor::visitFilterStep(const FilterStep &, DeriverContext & context)
 {
     return context.getInput()[0];
@@ -156,43 +292,104 @@ Property DeriverVisitor::visitFilterStep(const FilterStep &, DeriverContext & co
 Property DeriverVisitor::visitJoinStep(const JoinStep & step, DeriverContext & context)
 {
     std::unordered_map<String, String> identities;
-    for (auto & item : step.getOutputStream().header)
+    for (const auto & item : step.getOutputStream().header)
     {
         identities[item.name] = item.name;
     }
+
     Property translated;
-    if (!context.getInput().empty())
+
+    if (step.getKind() == ASTTableJoin::Kind::Inner || step.getKind() == ASTTableJoin::Kind::Cross)
     {
-        translated = context.getInput()[0].translate(identities);
+        Property left_translated = context.getInput()[0].translate(identities);
+        Property right_translated = context.getInput()[1].translate(identities);
+
+        translated = left_translated;
+
+        // if partition columns are pruned, the output data has no property.
+        if (translated.getNodePartitioning().getPartitioningColumns().size()
+            != context.getInput()[0].getNodePartitioning().getPartitioningColumns().size())
+        {
+            return Property{};
+        }
+        if (translated.getStreamPartitioning().getPartitioningColumns().size()
+            != context.getInput()[0].getStreamPartitioning().getPartitioningColumns().size())
+        {
+            // TODO stream partition
+        }
     }
 
-    // if partition columns are pruned, the output data has no property.
-    if (translated.getNodePartitioning().getPartitioningColumns().size()
-        != context.getInput()[0].getNodePartitioning().getPartitioningColumns().size())
+    if (step.getKind() == ASTTableJoin::Kind::Left)
+    {
+        Property left_translated = context.getInput()[0].translate(identities);
+        translated = left_translated;
+
+        // if partition columns are pruned, the output data has no property.
+        if (translated.getNodePartitioning().getPartitioningColumns().size()
+            != context.getInput()[0].getNodePartitioning().getPartitioningColumns().size())
+        {
+            return Property{};
+        }
+        if (translated.getStreamPartitioning().getPartitioningColumns().size()
+            != context.getInput()[0].getStreamPartitioning().getPartitioningColumns().size())
+        {
+            // TODO stream partition
+        }
+    }
+
+    if (step.getKind() == ASTTableJoin::Kind::Right)
+    {
+        Property right_translated = context.getInput()[1].translate(identities);
+        translated = right_translated;
+
+        // if partition columns are pruned, the output data has no property.
+        if (translated.getNodePartitioning().getPartitioningColumns().size()
+            != context.getInput()[1].getNodePartitioning().getPartitioningColumns().size())
+        {
+            return Property{};
+        }
+        if (translated.getStreamPartitioning().getPartitioningColumns().size()
+            != context.getInput()[1].getStreamPartitioning().getPartitioningColumns().size())
+        {
+            // TODO stream partition
+        }
+    }
+
+    if (step.getKind() == ASTTableJoin::Kind::Full)
     {
         return Property{};
     }
-    if (translated.getStreamPartitioning().getPartitioningColumns().size()
-        != context.getInput()[0].getStreamPartitioning().getPartitioningColumns().size())
+
+    if (step.enforceNestLoopJoin())
     {
-        // TODO stream partition
+        translated = translated.clearSorting();
     }
     return translated;
 }
 
-// TODO partition key inference, translate properties according to group by keys
-Property DeriverVisitor::visitAggregatingStep(const AggregatingStep & step, DeriverContext & context)
+Property DeriverVisitor::visitArrayJoinStep(const ArrayJoinStep &, DeriverContext & context)
 {
-    if (step.getKeys().empty())
+    return context.getInput()[0];
+}
+
+// TODO partition key inference, translate properties according to group by keys
+Property DeriverVisitor::visitAggregatingStep(const AggregatingStep &, DeriverContext & context)
+{
+    return context.getInput()[0].clearSorting();
+}
+
+Property DeriverVisitor::visitMarkDistinctStep(const MarkDistinctStep & step, DeriverContext & context)
+{
+    if (step.getDistinctSymbols().empty())
     {
         return Property{Partitioning{Partitioning::Handle::SINGLE}, Partitioning{Partitioning::Handle::SINGLE}};
     }
-    return context.getInput()[0];
+    return context.getInput()[0].clearSorting();
 }
 
 Property DeriverVisitor::visitMergingAggregatedStep(const MergingAggregatedStep &, DeriverContext & context)
 {
-    return context.getInput()[0];
+    return context.getInput()[0].clearSorting();
 }
 
 Property DeriverVisitor::visitUnionStep(const UnionStep & step, DeriverContext & context)
@@ -200,13 +397,22 @@ Property DeriverVisitor::visitUnionStep(const UnionStep & step, DeriverContext &
     Property first_child_property = context.getInput()[0];
     if (first_child_property.getNodePartitioning().getPartitioningHandle() == Partitioning::Handle::SINGLE)
     {
-        if (step.isLocal())
+        bool all_single = true;
+        for (const auto & input : context.getInput())
         {
-            return Property{Partitioning{Partitioning::Handle::SINGLE}, Partitioning{Partitioning::Handle::SINGLE}};
+            all_single &= input.getNodePartitioning().getPartitioningHandle() == Partitioning::Handle::SINGLE;
         }
-        else
+
+        if (all_single)
         {
-            return Property{Partitioning{Partitioning::Handle::SINGLE}};
+            if (step.isLocal())
+            {
+                return Property{Partitioning{Partitioning::Handle::SINGLE}, Partitioning{Partitioning::Handle::SINGLE}};
+            }
+            else
+            {
+                return Property{Partitioning{Partitioning::Handle::SINGLE}};
+            }
         }
     }
 
@@ -224,14 +430,15 @@ Property DeriverVisitor::visitUnionStep(const UnionStep & step, DeriverContext &
         transformed_children_prop.emplace_back(child_prop.translate(mapping));
     }
 
-    if (first_child_property.getNodePartitioning().getPartitioningHandle() == Partitioning::Handle::FIXED_HASH)
+    if (first_child_property.getNodePartitioning().getPartitioningHandle() == Partitioning::Handle::FIXED_HASH
+        || first_child_property.getNodePartitioning().getPartitioningHandle() == Partitioning::Handle::BUCKET_TABLE)
     {
         const Names & keys = first_child_property.getNodePartitioning().getPartitioningColumns();
         Names output_keys;
         bool match = true;
         for (const auto & transformed : transformed_children_prop)
         {
-            if (transformed != transformed_children_prop[0])
+            if (!(transformed.getNodePartitioning() == transformed_children_prop[0].getNodePartitioning()))
             {
                 match = false;
                 break;
@@ -245,13 +452,24 @@ Property DeriverVisitor::visitUnionStep(const UnionStep & step, DeriverContext &
         if (step.isLocal())
         {
             return Property{
-                Partitioning{Partitioning::Handle::FIXED_HASH, output_keys, true, first_child_property.getNodePartitioning().getBuckets()},
+                Partitioning{
+                    Partitioning::Handle::FIXED_HASH,
+                    output_keys,
+                    true,
+                    first_child_property.getNodePartitioning().getBuckets(),
+                    first_child_property.getNodePartitioning().isEnforceRoundRobin(),
+                    first_child_property.getNodePartitioning().getComponent()},
                 Partitioning{Partitioning::Handle::SINGLE}};
         }
         else
         {
-            return Property{
-                Partitioning{Partitioning::Handle::FIXED_HASH, output_keys, true, first_child_property.getNodePartitioning().getBuckets()}};
+            return Property{Partitioning{
+                Partitioning::Handle::FIXED_HASH,
+                output_keys,
+                true,
+                first_child_property.getNodePartitioning().getBuckets(),
+                first_child_property.getNodePartitioning().isEnforceRoundRobin(),
+                first_child_property.getNodePartitioning().getComponent()}};
         }
     }
     return Property{};
@@ -259,12 +477,17 @@ Property DeriverVisitor::visitUnionStep(const UnionStep & step, DeriverContext &
 
 Property DeriverVisitor::visitExceptStep(const ExceptStep &, DeriverContext & context)
 {
-    return context.getInput()[0];
+    return context.getInput()[0].clearSorting();
 }
 
 Property DeriverVisitor::visitIntersectStep(const IntersectStep &, DeriverContext & context)
 {
-    return context.getInput()[0];
+    return context.getInput()[0].clearSorting();
+}
+
+Property DeriverVisitor::visitIntersectOrExceptStep(const IntersectOrExceptStep &, DeriverContext & context)
+{
+    return context.getInput()[0].clearSorting();
 }
 
 Property DeriverVisitor::visitExchangeStep(const ExchangeStep & step, DeriverContext & context)
@@ -272,32 +495,38 @@ Property DeriverVisitor::visitExchangeStep(const ExchangeStep & step, DeriverCon
     const ExchangeMode & mode = step.getExchangeMode();
     if (mode == ExchangeMode::GATHER)
     {
-        return Property{Partitioning{Partitioning::Handle::SINGLE}};
+        Property output = context.getInput()[0];
+        output.setNodePartitioning(Partitioning{Partitioning::Handle::SINGLE});
+        return output.clearSorting();
     }
 
     if (mode == ExchangeMode::REPARTITION)
     {
-        return Property{step.getSchema()};
+        Property output = context.getInput()[0];
+        output.setNodePartitioning(step.getSchema());
+        return output.clearSorting();
     }
 
     if (mode == ExchangeMode::BROADCAST)
     {
-        return Property{Partitioning{Partitioning::Handle::FIXED_BROADCAST}};
+        Property output = context.getInput()[0];
+        output.setNodePartitioning(Partitioning{Partitioning::Handle::FIXED_BROADCAST});
+        return output.clearSorting();
     }
 
     if (mode == ExchangeMode::LOCAL_NO_NEED_REPARTITION)
     {
         Property output = context.getInput()[0];
         output.setStreamPartitioning(Partitioning{});
-        return output;
+        return output.clearSorting();
     }
 
-    return context.getInput()[0];
+    return context.getInput()[0].clearSorting();
 }
 
 Property DeriverVisitor::visitRemoteExchangeSourceStep(const RemoteExchangeSourceStep &, DeriverContext & context)
 {
-    return context.getInput()[0];
+    return context.getInput()[0].clearSorting();
 }
 
 Property DeriverVisitor::visitTableScanStep(const TableScanStep & step, DeriverContext & context)
@@ -314,6 +543,11 @@ Property DeriverVisitor::visitReadNothingStep(const ReadNothingStep &, DeriverCo
     return Property{Partitioning(Partitioning::Handle::SINGLE), Partitioning(Partitioning::Handle::ARBITRARY)};
 }
 
+Property DeriverVisitor::visitReadStorageRowCountStep(const ReadStorageRowCountStep &, DeriverContext &)
+{
+    return Property{Partitioning(Partitioning::Handle::SINGLE), Partitioning(Partitioning::Handle::ARBITRARY)};
+}
+
 Property DeriverVisitor::visitValuesStep(const ValuesStep &, DeriverContext &)
 {
     return Property{Partitioning(Partitioning::Handle::SINGLE), Partitioning(Partitioning::Handle::ARBITRARY)};
@@ -321,7 +555,8 @@ Property DeriverVisitor::visitValuesStep(const ValuesStep &, DeriverContext &)
 
 Property DeriverVisitor::visitLimitStep(const LimitStep &, DeriverContext & context)
 {
-    return Property{context.getInput()[0].getNodePartitioning(), Partitioning(Partitioning::Handle::SINGLE)};
+    return Property{
+        context.getInput()[0].getNodePartitioning(), Partitioning(Partitioning::Handle::SINGLE), context.getInput()[0].getSorting()};
 }
 
 Property DeriverVisitor::visitLimitByStep(const LimitByStep &, DeriverContext & context)
@@ -329,9 +564,16 @@ Property DeriverVisitor::visitLimitByStep(const LimitByStep &, DeriverContext & 
     return context.getInput()[0];
 }
 
-Property DeriverVisitor::visitSortingStep(const SortingStep &, DeriverContext & context)
+Property DeriverVisitor::visitSortingStep(const SortingStep & step, DeriverContext & context)
 {
-    return context.getInput()[0];
+    auto prop = context.getInput()[0];
+    Sorting sorting;
+    for (auto item : step.getSortDescription())
+    {
+        sorting.emplace_back(item);
+    }
+    prop.setSorting(sorting);
+    return prop;
 }
 
 Property DeriverVisitor::visitMergeSortingStep(const MergeSortingStep &, DeriverContext & context)
@@ -348,39 +590,25 @@ Property DeriverVisitor::visitMergingSortedStep(const MergingSortedStep &, Deriv
 {
     return Property{context.getInput()[0].getNodePartitioning(), Partitioning(Partitioning::Handle::SINGLE)};
 }
-//Property DeriverVisitor::visitMaterializingStep(const MaterializingStep &, DeriverContext & context)
-//{
-//    return context.getInput()[0];
-//}
-//
-//Property DeriverVisitor::visitDecompressionStep(const DecompressionStep &, DeriverContext & context)
-//{
-//    return context.getInput()[0];
-//}
 
 Property DeriverVisitor::visitDistinctStep(const DistinctStep &, DeriverContext & context)
 {
-    return context.getInput()[0];
+    return context.getInput()[0].clearSorting();
 }
 
 Property DeriverVisitor::visitExtremesStep(const ExtremesStep &, DeriverContext & context)
 {
-    return context.getInput()[0];
+    return context.getInput()[0].clearSorting();
 }
-
-//Property DeriverVisitor::visitFinalSamplingStep(const FinalSamplingStep &, DeriverContext & context)
-//{
-//    return context.getInput()[0];
-//}
 
 Property DeriverVisitor::visitWindowStep(const WindowStep &, DeriverContext & context)
 {
-    return context.getInput()[0];
+    return context.getInput()[0].clearSorting();
 }
 
 Property DeriverVisitor::visitApplyStep(const ApplyStep &, DeriverContext & context)
 {
-    return context.getInput()[0];
+    return context.getInput()[0].clearSorting();
 }
 
 Property DeriverVisitor::visitEnforceSingleRowStep(const EnforceSingleRowStep &, DeriverContext & context)
@@ -390,21 +618,42 @@ Property DeriverVisitor::visitEnforceSingleRowStep(const EnforceSingleRowStep &,
 
 Property DeriverVisitor::visitAssignUniqueIdStep(const AssignUniqueIdStep &, DeriverContext & context)
 {
-    return context.getInput()[0];
+    return context.getInput()[0].clearSorting();
 }
 
 Property DeriverVisitor::visitCTERefStep(const CTERefStep &, DeriverContext &)
 {
-    //    // CTERefStep output property can not be determined locally, it has been determined globally,
-    //    //  Described in CTEDescription of property. If They don't match, we just ignore required property.
-    //    // eg, input required property: <Repartition[B], CTE(0)=Repartition[A]> don't match,
-    //    //    we ignore local required property Repartition[B] and prefer global property Repartition[A].
-    //    CTEId cte_id = step.getId();
-    //    Property cte_required_property = context.getRequiredProperty().getCTEDescriptions().at(cte_id).toProperty();
-    //
-    //    auto output_prop = cte_required_property.translate(step.getReverseOutputColumns());
-    //    output_prop.getCTEDescriptions().emplace(cte_id, cte_required_property);
-    //    return output_prop;
     throw Exception("CTERefStep is not supported", ErrorCodes::OPTIMIZER_NONSUPPORT);
+}
+
+Property DeriverVisitor::visitExplainAnalyzeStep(const ExplainAnalyzeStep &, DeriverContext & context)
+{
+    return context.getInput()[0];
+}
+
+Property DeriverVisitor::visitTopNFilteringStep(const TopNFilteringStep &, DeriverContext & context)
+{
+    return context.getInput()[0];
+}
+
+Property DeriverVisitor::visitFillingStep(const FillingStep &, DeriverContext & context)
+{
+    return context.getInput()[0];
+}
+
+Property DeriverVisitor::visitTableWriteStep(const TableWriteStep &, DeriverContext & context)
+{
+    auto prop = context.getInput()[0];
+    prop.getNodePartitioningRef().setComponent(Partitioning::Component::WORKER);
+    if (context.getInput()[0].getNodePartitioning().getPartitioningHandle() == Partitioning::Handle::SINGLE)
+    {
+        prop.getNodePartitioningRef().setComponent(Partitioning::Component::COORDINATOR);
+    }
+    return prop;
+}
+
+Property DeriverVisitor::visitTableFinishStep(const TableFinishStep &, DeriverContext & context)
+{
+    return context.getInput()[0];
 }
 }

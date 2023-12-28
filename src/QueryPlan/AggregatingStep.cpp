@@ -13,45 +13,68 @@
  * limitations under the License.
  */
 
-#include <memory>
+#include <algorithm>
+#include <QueryPlan/AggregatingStep.h>
+
 #include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <Core/ColumnWithTypeAndName.h>
+#include <Core/SettingsEnums.h>
+#include <DataStreams/IBlockInputStream.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Functions/IFunctionAdaptors.h>
 #include <Functions/grouping.h>
-#include <Processors/Merges/AggregatingSortedTransform.h>
-#include <Processors/Merges/FinishAggregatingInOrderTransform.h>
-#include <Processors/QueryPipeline.h>
-#include <Processors/ResizeProcessor.h>
-#include <Processors/Transforms/CopyTransform.h>
-#include <Processors/Transforms/AggregatingInOrderTransform.h>
-#include <Processors/Transforms/AggregatingTransform.h>
-#include <Processors/Transforms/CubeTransform.h>
-#include <Processors/Transforms/ExpressionTransform.h>
-#include <Processors/Transforms/RollupTransform.h>
-#include <Processors/Transforms/RollupWithGroupingTransform.h>
-#include <QueryPlan/AggregatingStep.h>
-#include <QueryPlan/PlanSerDerHelper.h>
-
-#include <Core/ColumnWithTypeAndName.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
+#include <Processors/Merges/AggregatingSortedTransform.h>
+#include <Processors/Merges/FinishAggregatingInOrderTransform.h>
+#include <Processors/QueryPipeline.h>
+#include <Processors/ResizeProcessor.h>
+#include <Processors/Transforms/AggregatingInOrderTransform.h>
+#include <Processors/Transforms/AggregatingTransform.h>
+#include <Processors/Transforms/CopyTransform.h>
+#include <Processors/Transforms/CubeTransform.h>
+#include <Processors/Transforms/ExpressionTransform.h>
+#include <Processors/Transforms/RollupTransform.h>
+#include <Processors/Transforms/RollupWithGroupingTransform.h>
+#include <QueryPlan/PlanSerDerHelper.h>
 #include <common/logger_useful.h>
 #include "Core/SettingsEnums.h"
 #include <DataStreams/IBlockInputStream.h>
+#include <Common/StringUtils/StringUtils.h>
 
 namespace DB
 {
+bool hasNonParallelAggregateFunctions(const AggregateDescriptions & aggregates)
+{
+    for (const auto & agg: aggregates)
+    {
+        auto agg_name = agg.function->getName();
+        if (startsWith(agg_name, "finderFunnel") ||
+            startsWith(agg_name, "finderGroupFunnel") ||
+            startsWith(agg_name, "pathSplit") ||
+            startsWith(agg_name, "pathCount") ||
+            startsWith(agg_name, "retention") ||
+            startsWith(agg_name, "attributionAnalysis") ||
+            startsWith(agg_name, "attributionCorrelation") ||
+            agg_name == "sessionAnalysis" ||
+            agg_name == "vSessionAnalysis")
+            return true;
+    }
+
+    return false;
+}
 
 static ITransformingStep::Traits getTraits(bool should_produce_results_in_order_of_bucket_number)
 {
     return ITransformingStep::Traits{
         {
             .preserves_distinct_columns = false, /// Actually, we may check that distinct names are in aggregation keys
-            .returns_single_stream = should_produce_results_in_order_of_bucket_number, /// Actually, may also return single stream if should_produce_results_in_order_of_bucket_number = false
+            .returns_single_stream
+            = should_produce_results_in_order_of_bucket_number, /// Actually, may also return single stream if should_produce_results_in_order_of_bucket_number = false
             .preserves_number_of_streams = false,
             .preserves_sorting = false,
         },
@@ -60,13 +83,21 @@ static ITransformingStep::Traits getTraits(bool should_produce_results_in_order_
         }};
 }
 
-void computeGroupingFunctions(QueryPipeline & pipeline, const GroupingDescriptions & groupings, const Names & keys,
-                              const GroupingSetsParamsList & grouping_set_params, const BuildQueryPipelineSettings & build_settings)
+void computeGroupingFunctions(
+    QueryPipeline & pipeline,
+    const GroupingDescriptions & groupings,
+    const Names & keys,
+    const GroupingSetsParamsList & grouping_set_params,
+    const BuildQueryPipelineSettings & build_settings)
 {
     if (groupings.empty())
         return;
 
-    const bool ansi_mode = build_settings.context->getSettingsRef().dialect_type == DialectType::ANSI;
+    const bool ansi_mode = build_settings.context->getSettingsRef().dialect_type != DialectType::CLICKHOUSE;
+    bool force_grouping_standard_compatibility = build_settings.context->getSettingsRef().force_grouping_standard_compatibility;
+    if (ansi_mode)
+        force_grouping_standard_compatibility = true;
+
     auto actions = std::make_shared<ActionsDAG>(pipeline.getHeader().getColumnsWithTypeAndName());
     ActionsDAG::NodeRawConstPtrs index = actions->getIndex();
     ActionsDAG::NodeRawConstPtrs children;
@@ -74,44 +105,41 @@ void computeGroupingFunctions(QueryPipeline & pipeline, const GroupingDescriptio
     if (!grouping_set_params.empty())
         children.push_back(&actions->findInIndex("__grouping_set"));
 
-    auto get_key_index = [&] (const String & key)
-    {
-        return std::find(keys.begin(), keys.end(), key) - keys.begin();
-    };
+    auto get_key_index = [&](const String & key) { return std::find(keys.begin(), keys.end(), key) - keys.begin(); };
 
     ColumnNumbersList grouping_sets_indices;
-    for (const auto & param: grouping_set_params)
+    for (const auto & param : grouping_set_params)
     {
         ColumnNumbers indices;
 
         if (!param.used_keys.empty() || !param.missing_keys.empty())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unable to calculate grouping functions by prepared grouping set param");
 
-        for (const auto & key_name: param.used_key_names)
+        for (const auto & key_name : param.used_key_names)
             indices.push_back(get_key_index(key_name));
 
         grouping_sets_indices.emplace_back(std::move(indices));
     }
 
-    for (const auto & grouping: groupings)
+    for (const auto & grouping : groupings)
     {
         ColumnNumbers arguments_indexes;
 
-        for (const auto & arg: grouping.argument_names)
+        for (const auto & arg : grouping.argument_names)
             arguments_indexes.push_back(get_key_index(arg));
 
         if (!grouping_set_params.empty()) // GROUPING SETS, ROLLUP, CUBE
             index.push_back(&actions->addFunction(
                 std::make_shared<FunctionToOverloadResolverAdaptor>(
-                    std::make_shared<FunctionGroupingForGroupingSets>(
-                        std::move(arguments_indexes), grouping_sets_indices, ansi_mode)),
-                children, grouping.output_name));
+                    std::make_shared<FunctionGroupingForGroupingSets>(std::move(arguments_indexes), grouping_sets_indices, force_grouping_standard_compatibility)),
+                children,
+                grouping.output_name));
         else // ORDINARY
             index.push_back(&actions->addFunction(
                 std::make_shared<FunctionToOverloadResolverAdaptor>(
-                    std::make_shared<FunctionGroupingOrdinary>(
-                        std::move(arguments_indexes), ansi_mode)),
-                children, grouping.output_name));
+                    std::make_shared<FunctionGroupingOrdinary>(std::move(arguments_indexes), force_grouping_standard_compatibility)),
+                children,
+                grouping.output_name));
     }
 
     actions->getIndex().swap(index);
@@ -130,7 +158,8 @@ Block appendGroupingSetColumn(Block header)
     return res;
 }
 
-static Block appendGroupingColumns(Block block, const GroupingSetsParamsList & grouping_set_params, const GroupingDescriptions & groupings, bool final)
+static Block
+appendGroupingColumns(Block block, const GroupingSetsParamsList & grouping_set_params, const GroupingDescriptions & groupings, bool final)
 {
     Block res;
 
@@ -147,7 +176,7 @@ static Block appendGroupingColumns(Block block, const GroupingSetsParamsList & g
 
     if (final) /* TODO: @jingpeng remove `rollup` check if rollup can be rewritten to grouping sets */
     {
-        for (const auto & grouping: groupings)
+        for (const auto & grouping : groupings)
         {
             DataTypePtr type;
 
@@ -159,7 +188,8 @@ static Block appendGroupingColumns(Block block, const GroupingSetsParamsList & g
     return res;
 }
 
-Aggregator::Params AggregatingStep::createParams(Block header_before_aggregation, AggregateDescriptions aggregates, Names group_by_keys)
+Aggregator::Params
+AggregatingStep::createParams(Block header_before_aggregation, AggregateDescriptions aggregates, Names group_by_keys, bool overflow_row)
 {
     ColumnNumbers keys;
     for (const auto & key : group_by_keys)
@@ -195,13 +225,14 @@ Aggregator::Params AggregatingStep::createParams(Block header_before_aggregation
 
 
     return Aggregator::Params(
-        header_before_aggregation, keys, aggregates, false, 0, OverflowMode::THROW, 0, 0, 0, false, nullptr, 0, 0, false, 0);
+        header_before_aggregation, keys, aggregates, overflow_row, 0, OverflowMode::THROW, 0, 0, 0, false, nullptr, 0, 0, false, 0);
 }
 
 GroupingSetsParamsList AggregatingStep::prepareGroupingSetsParams() const
 {
-    bool is_prepared = std::any_of(grouping_sets_params.cbegin(), grouping_sets_params.cend(),
-                                   [](const auto & p) { return !p.used_keys.empty() || !p.missing_keys.empty(); });
+    bool is_prepared = std::any_of(grouping_sets_params.cbegin(), grouping_sets_params.cend(), [](const auto & p) {
+        return !p.used_keys.empty() || !p.missing_keys.empty();
+    });
 
     if (is_prepared)
         return grouping_sets_params;
@@ -214,7 +245,7 @@ GroupingSetsParamsList AggregatingStep::prepareGroupingSetsParams() const
 
     GroupingSetsParamsList result;
 
-    for (const auto & param: grouping_sets_params)
+    for (const auto & param : grouping_sets_params)
     {
         ColumnNumbers used_indexes;
         std::unordered_set<size_t> used_indexes_set;
@@ -239,6 +270,7 @@ GroupingSetsParamsList AggregatingStep::prepareGroupingSetsParams() const
 AggregatingStep::AggregatingStep(
     const DataStream & input_stream_,
     Names keys_,
+    const NameSet & keys_not_hashed_,
     Aggregator::Params params_,
     GroupingSetsParamsList grouping_sets_params_,
     bool final_,
@@ -251,8 +283,13 @@ AggregatingStep::AggregatingStep(
     GroupingDescriptions groupings_,
     bool,
     bool should_produce_results_in_order_of_bucket_number_)
-    : ITransformingStep(input_stream_, appendGroupingColumns(params_.getHeader(final_), grouping_sets_params_, groupings_, final_), getTraits(should_produce_results_in_order_of_bucket_number_), false)
+    : ITransformingStep(
+        input_stream_,
+        appendGroupingColumns(params_.getHeader(final_), grouping_sets_params_, groupings_, final_),
+        getTraits(should_produce_results_in_order_of_bucket_number_),
+        false)
     , keys(std::move(keys_))
+    , keys_not_hashed(keys_not_hashed_)
     , params(std::move(params_))
     , grouping_sets_params(std::move(grouping_sets_params_))
     , final(final_)
@@ -280,6 +317,11 @@ void AggregatingStep::transformPipeline(QueryPipeline & pipeline, const BuildQue
 {
     QueryPipelineProcessorsCollector collector(pipeline, this);
     const auto & settings = build_settings.context->getSettingsRef();
+
+    if (isFinal() && hasNonParallelAggregateFunctions(params.aggregates))
+    {
+        pipeline.resize(1);
+    }
 
     auto merge_max_threads = merge_threads == 0 ? settings.max_threads : merge_threads;
     max_block_size = max_block_size == 0 ? settings.max_block_size : max_block_size;
@@ -400,14 +442,12 @@ void AggregatingStep::transformPipeline(QueryPipeline & pipeline, const BuildQue
             });
         }
 
-        pipeline.transform([&](OutputPortRawPtrs ports)
-        {
+        pipeline.transform([&](OutputPortRawPtrs ports) {
             assert(streams * grouping_sets_size == ports.size());
             Processors processors;
             for (size_t i = 0; i < grouping_sets_size; ++i)
             {
-                Aggregator::Params params_for_set
-                {
+                Aggregator::Params params_for_set{
                     transform_params->params.src_header,
                     prepared_sets_params[i].used_keys,
                     transform_params->params.aggregates,
@@ -418,13 +458,15 @@ void AggregatingStep::transformPipeline(QueryPipeline & pipeline, const BuildQue
                     transform_params->params.group_by_two_level_threshold_bytes,
                     transform_params->params.max_bytes_before_external_group_by,
                     /// Return empty result when aggregating without keys on empty set, if ansi
-                    settings.dialect_type == DialectType::ANSI ? true : transform_params->params.empty_result_for_aggregation_by_empty_set,
+                    settings.dialect_type != DialectType::CLICKHOUSE ? true : transform_params->params.empty_result_for_aggregation_by_empty_set,
                     transform_params->params.tmp_volume,
                     transform_params->params.max_threads,
                     transform_params->params.min_free_disk_space,
                     transform_params->params.compile_aggregate_expressions,
-                    transform_params->params.min_count_to_compile_aggregate_expression
-                };
+                    transform_params->params.min_count_to_compile_aggregate_expression};
+                using TwoLevelMode = Aggregator::Params::TwoLevelMode;
+                params_for_set.two_level_mode
+                    = settings.group_by_two_level_for_grouping_set ? TwoLevelMode::ENFORCE_TWO_LEVEL : TwoLevelMode::ENFORCE_SINGLE_LEVEL;
                 auto transform_params_for_set = std::make_shared<AggregatingTransformParams>(std::move(params_for_set), final);
 
                 if (streams > 1)
@@ -432,7 +474,8 @@ void AggregatingStep::transformPipeline(QueryPipeline & pipeline, const BuildQue
                     auto many_data = std::make_shared<ManyAggregatedData>(streams);
                     for (size_t j = 0; j < streams; ++j)
                     {
-                        auto aggregation_for_set = std::make_shared<AggregatingTransform>(input_header, transform_params_for_set, many_data, j, merge_max_threads, temporary_data_merge_threads);
+                        auto aggregation_for_set = std::make_shared<AggregatingTransform>(
+                            input_header, transform_params_for_set, many_data, j, merge_max_threads, temporary_data_merge_threads);
                         // For each input stream we have `grouping_sets_size` copies, so port index
                         // for transform #j should skip ports of first (j-1) streams.
                         connect(*ports[i + grouping_sets_size * j], aggregation_for_set->getInputs().front());
@@ -482,8 +525,8 @@ void AggregatingStep::transformPipeline(QueryPipeline & pipeline, const BuildQue
                 index.reserve(output_header.columns() + 1);
 
                 auto grouping_col = ColumnConst::create(ColumnUInt64::create(1, set_counter), 0);
-                const auto * grouping_node = &dag->addColumn(
-                    {ColumnPtr(std::move(grouping_col)), std::make_shared<DataTypeUInt64>(), "__grouping_set"});
+                const auto * grouping_node
+                    = &dag->addColumn({ColumnPtr(std::move(grouping_col)), std::make_shared<DataTypeUInt64>(), "__grouping_set"});
 
                 grouping_node = &dag->materializeNode(*grouping_node);
                 index.push_back(grouping_node);
@@ -635,107 +678,131 @@ void AggregatingStep::describePipeline(FormatSettings & settings) const
     }
 }
 
-void AggregatingStep::serialize(WriteBuffer & buf) const
+std::shared_ptr<IQueryPlanStep> AggregatingStep::copy(ContextPtr) const
 {
-    IQueryPlanStep::serializeImpl(buf);
-
-    params.serialize(buf);
-    writeBinary(final, buf);
-    writeBinary(max_block_size, buf);
-    writeBinary(merge_threads, buf);
-    writeBinary(temporary_data_merge_threads, buf);
-    writeBinary(storage_has_evenly_distributed_read, buf);
-    writeBinary(should_produce_results_in_order_of_bucket_number, buf);
-
-    if (group_by_info)
-    {
-        writeBinary(true, buf);
-        group_by_info->serialize(buf);
-    }
-    else
-        writeBinary(false, buf);
-
-    serializeSortDescription(group_by_sort_description, buf);
-
-    serializeStrings(keys, buf);
-    writeVarUInt(groupings.size(), buf);
-    for (const auto & item : groupings)
-    {
-        writeBinary(item.argument_names, buf);
-        writeStringBinary(item.output_name, buf);
-    }
-
-    writeVarUInt(grouping_sets_params.size(), buf);
-    for (const auto & grouping_sets_param : grouping_sets_params)
-    {
-        writeBinary(grouping_sets_param.used_key_names, buf);
-        writeBinary(grouping_sets_param.used_keys, buf);
-        writeBinary(grouping_sets_param.missing_keys, buf);
-    }
+    return std::make_shared<AggregatingStep>(
+        input_streams[0],
+        keys,
+        keys_not_hashed,
+        params.aggregates,
+        grouping_sets_params,
+        final,
+        group_by_sort_description,
+        groupings,
+        needOverflowRow(),
+        should_produce_results_in_order_of_bucket_number);
 }
 
-QueryPlanStepPtr AggregatingStep::deserialize(ReadBuffer & buf, ContextPtr context)
+void GroupingSetsParams::toProto(Protos::GroupingSetsParams & proto) const
 {
-    String step_description;
-    readBinary(step_description, buf);
+    for (const auto & element : used_key_names)
+        proto.add_used_key_names(element);
+    for (const auto & element : used_keys)
+        proto.add_used_keys(element);
+    for (const auto & element : missing_keys)
+        proto.add_missing_keys(element);
+}
 
-    DataStream input_stream = deserializeDataStream(buf);
-    Aggregator::Params params = Aggregator::Params::deserialize(buf, context);
-    bool final;
-    readBinary(final, buf);
-    size_t max_block_size;
-    readBinary(max_block_size, buf);
-    size_t merge_threads;
-    readBinary(merge_threads, buf);
-    size_t temporary_data_merge_threads;
-    readBinary(temporary_data_merge_threads, buf);
-    bool storage_has_evenly_distributed_read;
-    readBinary(storage_has_evenly_distributed_read, buf);
-    bool should_produce_results_in_order_of_bucket_number;
-    readBinary(should_produce_results_in_order_of_bucket_number, buf);
+void GroupingSetsParams::fillFromProto(const Protos::GroupingSetsParams & proto)
+{
+    for (const auto & element : proto.used_key_names())
+        used_key_names.emplace_back(element);
+    for (const auto & element : proto.used_keys())
+        used_keys.emplace_back(element);
+    for (const auto & element : proto.missing_keys())
+        missing_keys.emplace_back(element);
+}
 
-    bool has_group_by_info = false;
-    readBinary(has_group_by_info, buf);
+void GroupingDescription::toProto(Protos::GroupingDescription & proto) const
+{
+    for (const auto & element : argument_names)
+        proto.add_argument_names(element);
+    proto.set_output_name(output_name);
+}
+
+void GroupingDescription::fillFromProto(const Protos::GroupingDescription & proto)
+{
+    for (const auto & element : proto.argument_names())
+        argument_names.emplace_back(element);
+    output_name = proto.output_name();
+}
+
+void AggregatingStep::toProto(Protos::AggregatingStep & proto, bool) const
+{
+    ITransformingStep::serializeToProtoBase(*proto.mutable_query_plan_base());
+    for (const auto & element : keys)
+        proto.add_keys(element);
+
+    Names ordered_keys_not_hashed(keys_not_hashed.begin(), keys_not_hashed.end());
+    std::sort(ordered_keys_not_hashed.begin(), ordered_keys_not_hashed.end());
+    for (const auto & element : ordered_keys_not_hashed)
+        proto.add_keys_not_hashed(element);
+
+    params.toProto(*proto.mutable_params());
+    for (const auto & element : grouping_sets_params)
+        element.toProto(*proto.add_grouping_sets_params());
+    proto.set_final(final);
+    proto.set_max_block_size(max_block_size);
+    proto.set_merge_threads(merge_threads);
+    proto.set_temporary_data_merge_threads(temporary_data_merge_threads);
+    proto.set_storage_has_evenly_distributed_read(storage_has_evenly_distributed_read);
+
+    if (group_by_info)
+        group_by_info->toProto(*proto.mutable_group_by_info());
+    for (const auto & element : group_by_sort_description)
+        element.toProto(*proto.add_group_by_sort_description());
+    for (const auto & element : groupings)
+        element.toProto(*proto.add_groupings());
+    proto.set_should_produce_results_in_order_of_bucket_number(should_produce_results_in_order_of_bucket_number);
+}
+
+std::shared_ptr<AggregatingStep> AggregatingStep::fromProto(const Protos::AggregatingStep & proto, ContextPtr context)
+{
+    auto [step_description, base_input_stream] = ITransformingStep::deserializeFromProtoBase(proto.query_plan_base());
+    Names keys;
+    for (const auto & element : proto.keys())
+        keys.emplace_back(element);
+    NameSet keys_not_hashed;
+    for (const auto & element : proto.keys_not_hashed())
+        keys_not_hashed.emplace(element);
+    auto params = Aggregator::Params::fromProto(proto.params(), context);
+    GroupingSetsParamsList grouping_sets_params;
+    for (const auto & proto_element : proto.grouping_sets_params())
+    {
+        GroupingSetsParams element;
+        element.fillFromProto(proto_element);
+        grouping_sets_params.emplace_back(std::move(element));
+    }
+    auto final = proto.final();
+    auto max_block_size = proto.max_block_size();
+    auto merge_threads = proto.merge_threads();
+    auto temporary_data_merge_threads = proto.temporary_data_merge_threads();
+    auto storage_has_evenly_distributed_read = proto.storage_has_evenly_distributed_read();
+
     InputOrderInfoPtr group_by_info = nullptr;
-    if (has_group_by_info)
-    {
-        group_by_info = std::make_shared<InputOrderInfo>();
-        const_cast<InputOrderInfo &>(*group_by_info).deserialize(buf);
-    }
-
+    if (proto.has_group_by_info())
+        group_by_info = InputOrderInfo::fromProto(proto.group_by_info(), context);
     SortDescription group_by_sort_description;
-    deserializeSortDescription(group_by_sort_description, buf);
-
-
-    auto keys = deserializeStrings(buf);
-
-    size_t size;
-    readVarUInt(size, buf);
+    for (const auto & proto_element : proto.group_by_sort_description())
+    {
+        SortColumnDescription element;
+        element.fillFromProto(proto_element);
+        group_by_sort_description.emplace_back(std::move(element));
+    }
     GroupingDescriptions groupings;
-    for (size_t i = 0; i < size; ++i)
+    for (const auto & proto_element : proto.groupings())
     {
-        GroupingDescription item;
-        readBinary(item.argument_names, buf);
-        readStringBinary(item.output_name, buf);
-        groupings.emplace_back(std::move(item));
+        GroupingDescription element;
+        element.fillFromProto(proto_element);
+        groupings.emplace_back(std::move(element));
     }
-
-    readVarUInt(size, buf);
-    GroupingSetsParamsList grouping_sets_params_;
-    for (size_t i = 0; i < size; ++i)
-    {
-        GroupingSetsParams param;
-        readBinary(param.used_key_names, buf);
-        readBinary(param.used_keys, buf);
-        readBinary(param.missing_keys, buf);
-        grouping_sets_params_.emplace_back(param);
-    }
-
-    auto step = std::make_unique<AggregatingStep>(
-        input_stream,
+    auto should_produce_results_in_order_of_bucket_number = proto.should_produce_results_in_order_of_bucket_number();
+    auto step = std::make_shared<AggregatingStep>(
+        base_input_stream,
         keys,
+        keys_not_hashed,
         params,
-        grouping_sets_params_,
+        grouping_sets_params,
         final,
         max_block_size,
         merge_threads,
@@ -746,13 +813,8 @@ QueryPlanStepPtr AggregatingStep::deserialize(ReadBuffer & buf, ContextPtr conte
         groupings,
         false,
         should_produce_results_in_order_of_bucket_number);
-
     step->setStepDescription(step_description);
     return step;
-}
-std::shared_ptr<IQueryPlanStep> AggregatingStep::copy(ContextPtr) const
-{
-    return std::make_shared<AggregatingStep>(input_streams[0], keys, params.aggregates, grouping_sets_params, final, groupings, false, should_produce_results_in_order_of_bucket_number);
 }
 
 }

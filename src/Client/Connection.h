@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include "common/types.h"
 #include <common/logger_useful.h>
 
 #include <Poco/Net/StreamSocket.h>
@@ -45,6 +46,8 @@
 #include <Interpreters/TablesStatus.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/ClientInfo.h>
+
+#include <Parsers/formatTenantDatabaseName.h>
 
 #include <Compression/ICompressionCodec.h>
 
@@ -144,6 +147,8 @@ public:
         if (user.empty())
             user = "default";
 
+        default_database = formatTenantConnectDefaultDatabaseName(default_database_);
+        user = formatTenantConnectUserName(user);
         setDescription();
     }
 
@@ -203,6 +208,7 @@ public:
 
     /// send cnch query
     void sendCnchQuery(
+        UInt64 primary_txn_id,
         UInt64 txn_id,
         const ConnectionTimeouts & timeouts,
         const String & query,

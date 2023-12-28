@@ -14,40 +14,42 @@
  */
 
 #include <Analyzers/function_utils.h>
-#include <QueryPlan/TranslationMap.h>
-#include <QueryPlan/planning_common.h>
-#include <QueryPlan/Void.h>
-#include <Parsers/ASTVisitor.h>
-#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTVisitor.h>
+#include <QueryPlan/TranslationMap.h>
+#include <QueryPlan/Void.h>
+#include <QueryPlan/planning_common.h>
 
 namespace DB
 {
 
-TranslationMap::TranslationMap(TranslationMapPtr outer_context_,
-                               ScopePtr scope_,
-                               FieldSymbolInfos field_symbol_infos_,
-                               Analysis & analysis_,
-                               ContextPtr context_) :
-    analysis(analysis_),
-    context(std::move(context_)),
-    outer_context(std::move(outer_context_)),
-    scope(scope_),
-    field_symbol_infos(std::move(field_symbol_infos_)),
-    expression_symbols(createScopeAwaredASTMap<String>(analysis))
+TranslationMap::TranslationMap(
+    TranslationMapPtr outer_context_, ScopePtr scope_, FieldSymbolInfos field_symbol_infos_, Analysis & analysis_, ContextPtr context_)
+    : analysis(analysis_)
+    , context(std::move(context_))
+    , outer_context(std::move(outer_context_))
+    , scope(scope_)
+    , field_symbol_infos(std::move(field_symbol_infos_))
+    , expression_symbols(createScopeAwaredASTMap<String>(analysis, scope))
 {
     checkSymbols();
 }
 
-TranslationMap & TranslationMap::withScope(ScopePtr scope_, const FieldSymbolInfos & field_symbol_infos_, bool remove_mappings)
+TranslationMap & TranslationMap::withScope(ScopePtr scope_, FieldSymbolInfos field_symbol_infos_, bool remove_mappings)
 {
     scope = scope_;
-    field_symbol_infos = field_symbol_infos_;
+    field_symbol_infos = std::move(field_symbol_infos_);
 
     checkSymbols();
 
     if (remove_mappings)
         expression_symbols.clear();
+
+    auto new_expression_symbols = createScopeAwaredASTMapVariadic<String>(
+        analysis, scope, expression_symbols.begin(), expression_symbols.end(), expression_symbols.bucket_count());
+    new_expression_symbols.swap(expression_symbols);
 
     return *this;
 }
@@ -137,7 +139,9 @@ private:
     {
         const auto & expression_symbols = translation_map.expression_symbols;
 
-        if (expression_symbols.find(node) != expression_symbols.end())
+        // don't translate literals into calculated expressions, a counter example is: SELECT round(100, 0) GROUP BY 0
+        // translating round(100, 0) to round(100, expr#0) will cause exception: Argument at index 1 for function round must be constant
+        if (expression_symbols.find(node) != expression_symbols.end() && !node->as<ASTLiteral>())
             return toSymbolRef(expression_symbols.at(node));
 
         return translate_func(node);
@@ -161,6 +165,10 @@ String TranslationMap::translateToSymbol(const ASTPtr & expression) const
 
         if (auto * iden = translated->as<ASTIdentifier>())
             return iden->name();
+
+        // since literals won't be translated
+        if (auto it = expression_symbols.find(expression); it != expression_symbols.end())
+            return it->second;
     }
 
     throw Exception("Expression " + expression->getColumnName() + " can not be translated to symbol" , ErrorCodes::LOGICAL_ERROR);
@@ -273,7 +281,11 @@ ASTPtr TranslationMapVisitor::visitASTQuantifiedComparison(ASTPtr & node, const 
 ASTPtr TranslationMapVisitor::handleColumnReference(const ResolvedField & column_reference, const ASTPtr & node)
 {
     if (translation_map.scope->isLocalScope(column_reference.scope))
-        return toSymbolRef(translation_map.getFieldSymbol(column_reference.hierarchy_index));
+    {
+        auto field_symbol = translation_map.getFieldSymbol(column_reference.hierarchy_index);
+        assert(!field_symbol.empty());
+        return toSymbolRef(field_symbol);
+    }
     else if (translation_map.outer_context)
         return translation_map.outer_context->translate(node);
     else

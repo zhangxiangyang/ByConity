@@ -153,7 +153,11 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
     ParserKeyword s_ttl{"TTL"};
     ParserKeyword s_remove{"REMOVE"};
     ParserKeyword s_compression{"COMPRESSION"};
+    ParserKeyword s_bloom{"BLOOM"};
+    ParserKeyword s_bitmap_index{"BitmapIndex"};
+    // ParserKeyword s_segment_bitmap_index{"SegmentBitmapIndex"};
     ParserKeyword s_kv{"KV"};
+    ParserKeyword s_bitengine_encode{"BitEngineEncode"};
     ParserTernaryOperatorExpression expr_parser(dt); /* decimal type can use float as default value */
     ParserStringLiteral string_literal_parser;
     ParserCodec codec_parser;
@@ -193,7 +197,22 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
     ASTPtr codec_expression;
     ASTPtr ttl_expression;
 
-    if (!s_default.checkWithoutMoving(pos, expected)
+    auto null_check_without_moving = [&]() -> bool
+    {
+        if (!allow_null_modifiers)
+            return false;
+
+        if (s_null.checkWithoutMoving(pos, expected))
+            return true;
+
+        Pos before_null = pos;
+        bool res = s_not.check(pos, expected) && s_null.checkWithoutMoving(pos, expected);
+        pos = before_null;
+        return res;
+    };
+
+    if (!null_check_without_moving() 
+        && !s_default.checkWithoutMoving(pos, expected)
         && !s_materialized.checkWithoutMoving(pos, expected)
         && !s_alias.checkWithoutMoving(pos, expected)
         && (require_type
@@ -202,6 +221,18 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
     {
         if (!type_parser.parse(pos, type, expected))
             return false;
+    }
+
+    if (allow_null_modifiers)
+    {
+        if (s_not.check(pos, expected))
+        {
+            if (!s_null.check(pos, expected))
+                return false;
+            null_modifier.emplace(false);
+        }
+        else if (s_null.check(pos, expected))
+            null_modifier.emplace(true);
     }
 
     Pos pos_before_specifier = pos;
@@ -217,7 +248,7 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
     if (require_type && !type && !default_expression)
         return false; /// reject column name without type
 
-    if (type && allow_null_modifiers)
+    if ((type || default_expression) && allow_null_modifiers && !null_modifier.has_value())
     {
         if (s_not.ignore(pos, expected))
         {
@@ -245,6 +276,14 @@ bool IParserColumnDeclaration<NameParser>::parseImpl(Pos & pos, ASTPtr & node, E
             inner_flags |= TYPE_MAP_KV_STORE_FLAG;
         if (s_compression.ignore(pos, expected))
             inner_flags |= TYPE_COMPRESSION_FLAG;
+        if (s_bitengine_encode.ignore(pos, expected))
+            inner_flags |= TYPE_BITENGINE_ENCODE_FLAG;
+        if (s_bloom.ignore(pos, expected))
+            inner_flags |= TYPE_BLOOM_FLAG;
+        if (s_bitmap_index.ignore(pos, expected))
+            inner_flags |= TYPE_BITMAP_INDEX_FLAG;
+        // if (s_segment_bitmap_index.ignore(pos, expected))
+        //     inner_flags |= TYPE_SEGMENT_BITMAP_INDEX_FLAG;
 
         if (!inner_flags)
             break;
@@ -335,6 +374,41 @@ public:
     using IParserDialectBase::IParserDialectBase;
 };
 
+class ParserBitEngineConstraintDeclaration : public IParserDialectBase
+{
+protected:
+    const char * getName() const override { return "bitengine constraint declaration"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserForeignKeyDeclaration : public IParserDialectBase
+{
+protected:
+    const char * getName() const override
+    {
+        return "foreign key declaration";
+    }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserUniqueNotEnforcedDeclaration : public IParserDialectBase
+{
+protected:
+    const char * getName() const override
+    {
+        return "unique not enforced declaration";
+    }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
 class ParserProjectionDeclaration : public IParserDialectBase
 {
 protected:
@@ -368,6 +442,41 @@ class ParserConstraintDeclarationList : public IParserDialectBase
 protected:
     const char * getName() const override { return "constraint declaration list"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserBitEngineConstraintDeclarationList : public IParserDialectBase
+{
+protected:
+    const char * getName() const override { return "bitengine constraint declaration list"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserForeignKeyDeclarationList : public IParserDialectBase
+{
+protected:
+    const char * getName() const override
+    {
+        return "foreign key declaration list";
+    }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserUniqueNotEnforcedDeclarationList : public IParserDialectBase
+{
+protected:
+    const char * getName() const override
+    {
+        return "unique not enforced declaration list";
+    }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+
 public:
     using IParserDialectBase::IParserDialectBase;
 };
@@ -440,12 +549,37 @@ public:
     using IParserDialectBase::IParserDialectBase;
 };
 
+class ParserTableOverrideDeclaration : public IParserBase
+{
+protected:
+    const char * getName() const override { return "table override declaration"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+};
+
+class ParserTableOverridesDeclarationList : public IParserBase
+{
+protected:
+    const char * getName() const override { return "table overrides declaration list"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+};
+
 /// CREATE|ATTACH DATABASE db [ENGINE = engine]
 class ParserCreateDatabaseQuery : public IParserDialectBase
 {
 protected:
     const char * getName() const override { return "CREATE DATABASE query"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserCreateCatalogQuery : public IParserDialectBase
+{
+protected:
+    const char * getName() const override { return "CREATE EXTERNAL CATALOG query"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+
 public:
     using IParserDialectBase::IParserDialectBase;
 };
@@ -472,6 +606,17 @@ public:
     using IParserDialectBase::IParserDialectBase;
 };
 
+/// Parses queries like:
+/// CREATE SNAPSHOT [IF NOT EXISTS] [db.]name [TO [db.]table] TTL n DAYS;
+class ParserCreateSnapshotQuery : public IParserDialectBase
+{
+protected:
+    const char * getName() const override { return "CREATE SNAPSHOT query"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
 
 /** Query like this:
   * CREATE|ATTACH TABLE [IF NOT EXISTS] [db.]name

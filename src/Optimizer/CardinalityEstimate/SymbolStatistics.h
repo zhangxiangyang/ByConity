@@ -66,7 +66,7 @@ public:
 
     SymbolStatisticsPtr copy() const
     {
-        return std::make_shared<SymbolStatistics>(ndv, min, max, null_counts, avg_len, histogram, type, db_table_column, unknown);
+        return std::make_shared<SymbolStatistics>(ndv, min, max, null_counts, avg_len, histogram.copy(), type, db_table_column, unknown);
     }
 
     SymbolStatistics & operator+(const SymbolStatistics & other)
@@ -97,7 +97,7 @@ public:
     void setType(const DataTypePtr & type_) { type = type_; }
     void setDbTableColumn(String db_table_column_) { db_table_column = db_table_column_; }
 
-    bool isNullable() const { return type->isNullable(); }
+    bool isNullable() const { return isNullableOrLowCardinalityNullable(type); }
     bool isNumber() const;
     bool isString() const;
 

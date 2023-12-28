@@ -13,6 +13,7 @@
  * limitations under the License.
  */
 
+#include <CloudServices/CnchServerResource.h>
 #include <Interpreters/InterpreterRefreshQuery.h>
 #include <Interpreters/Context.h>
 #include <Parsers/ASTRefreshQuery.h>
@@ -32,17 +33,21 @@ namespace DB
         const auto & refresh = query_ptr->as<ASTRefreshQuery &>();
         if (refresh.settings_ast)
             InterpreterSetQuery(refresh.settings_ast, getContext()).executeForCurrentContext();
-
-        auto * materialized_view = dynamic_cast<StorageMaterializedView *>(DatabaseCatalog::instance().getTable({refresh.database, refresh.table}, getContext()).get());
-        if (!materialized_view)
+        StoragePtr storage_ptr = DatabaseCatalog::instance().getTable({refresh.database, refresh.table}, getContext());
+        if (auto * view = dynamic_cast<StorageMaterializedView *>(storage_ptr.get()))
+        {
+            if (refresh.where_expr)
+                view->refreshWhere(refresh.where_expr, getContext(), refresh.async);
+            else if (refresh.partition)
+                view->refresh(refresh.partition, getContext(), refresh.async);
+        }
+        else
         {
             String db_str = refresh.database.empty() ? "" : backQuoteIfNeed(refresh.database) + ".";
             throw Exception("Table " + db_str + backQuoteIfNeed(refresh.table) +
                             " isn't a materialized view, can't be refreshed.", ErrorCodes::LOGICAL_ERROR);
         }
-
-        materialized_view->refresh(refresh.partition, getContext(), refresh.async);
-
+        getContext()->getCnchServerResource()->skipCleanWorker();
         return {};
     }
 }

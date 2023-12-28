@@ -16,11 +16,10 @@
 #include <Transaction/Actions/DDLAlterAction.h>
 
 #include <Catalog/Catalog.h>
-// #include <Storages/MergeTree/CnchMergeTreeMutationEntry.h>
-// #include <Storages/StorageCnchMergeTree.h>
 #include <Transaction/TransactionCoordinatorRcCnch.h>
 #include <Storages/MergeTree/CnchMergeTreeMutationEntry.h>
 #include <Storages/StorageCnchMergeTree.h>
+#include "Storages/MutationCommands.h"
 
 namespace DB
 {
@@ -53,29 +52,39 @@ void DDLAlterAction::executeV1(TxnTimestamp commit_time)
     /// In DDLAlter, we only update schema.
     LOG_DEBUG(log, "Wait for change schema in Catalog.");
     auto catalog = global_context.getCnchCatalog();
+    bool is_recluster = false;
+    /// only used for materialized mysql
+    if (params.is_database)
+    {
+        // updateTsCache(params.storage_id.uuid, commit_time);
+        catalog->alterDatabase(params.storage_id.database_name, txn_id, commit_time, params.statement, params.engine_name);
+        return;
+    }
     try
     {
         if (!mutation_commands.empty())
         {
-            CnchMergeTreeMutationEntry mutation_entry;
-            mutation_entry.txn_id = txn_id;
-            mutation_entry.commit_time = commit_time;
-            mutation_entry.commands = mutation_commands;
-            mutation_entry.columns_commit_time = mutation_commands.changeSchema() ? commit_time : table->commit_time;
-            catalog->createMutation(table->getStorageID(), mutation_entry.txn_id.toString(), mutation_entry.toString());
-            /// table default cluster status is true. Change to false if current mutation is resluster mutation.
-            if (mutation_entry.isReclusterMutation())
-                catalog->setTableClusterStatus(table->getStorageUUID(), false);
-            LOG_DEBUG(log, "Successfully create mutation for alter query.");
+            final_mutation_entry.emplace();
+            final_mutation_entry->txn_id = txn_id;
+            final_mutation_entry->query_id = query_id;
+            final_mutation_entry->commit_time = commit_time;
+            final_mutation_entry->commands = mutation_commands;
+            final_mutation_entry->columns_commit_time = mutation_commands.changeSchema() ? commit_time : table->commit_time;
+
+            // Don't create mutation task for reclustering. It will manually triggered by user
+            is_recluster = table->isBucketTable() && final_mutation_entry->isReclusterMutation();
+            if (!is_recluster)
+                catalog->createMutation(table->getStorageID(), final_mutation_entry->txn_id.toString(), final_mutation_entry->toString());
+            LOG_DEBUG(log, "Created mutation entry in Catalog: {}", final_mutation_entry->toString());
         }
 
         // auto cache = global_context.getMaskingPolicyCache();
         // table->checkMaskingPolicy(*cache);
 
-        updateTsCache(table->getStorageUUID(), commit_time);
+        // updateTsCache(table->getStorageUUID(), commit_time);
         if (!new_schema.empty())
         {
-            catalog->alterTable(table, new_schema, static_cast<StorageCnchMergeTree &>(*table).commit_time, txn_id, commit_time);
+            catalog->alterTable(global_context, query_settings, table, new_schema, table->commit_time, txn_id, commit_time, is_recluster);
             LOG_DEBUG(log, "Successfully change schema in catalog.");
         }
     }
@@ -92,6 +101,7 @@ void DDLAlterAction::updatePartData(MutableMergeTreeDataPartCNCHPtr part, TxnTim
     part->commit_time = commit_time;
 }
 
+#if 0
 void DDLAlterAction::updateTsCache(const UUID & uuid, const TxnTimestamp & commit_time)
 {
     auto & ts_cache_manager = global_context.getCnchTransactionCoordinator().getTsCacheManager();
@@ -99,5 +109,6 @@ void DDLAlterAction::updateTsCache(const UUID & uuid, const TxnTimestamp & commi
     auto & ts_cache = ts_cache_manager.getTimestampCacheUnlocked(uuid);
     ts_cache->insertOrAssign(UUIDHelpers::UUIDToString(uuid), commit_time);
 }
+#endif
 
 }

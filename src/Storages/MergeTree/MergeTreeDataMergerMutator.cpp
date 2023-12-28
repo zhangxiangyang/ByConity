@@ -61,6 +61,8 @@
 #include <Parsers/queryToString.h>
 #include <Columns/ColumnByteMap.h>
 #include <Common/FieldVisitorToString.h>
+#include "Storages/MergeTree/MergeTreeSuffix.h"
+#include <Storages/MergeTree/GinIndexDataPartHelper.h>
 
 #include <cmath>
 #include <ctime>
@@ -442,7 +444,8 @@ SelectPartsDecision MergeTreeDataMergerMutator::selectPartsToMergeMulti(
     bool merge_with_ttl_allowed,
     String * out_disable_reason,
     MergeScheduler * merge_scheduler,
-    const bool enable_batch_select)
+    const bool enable_batch_select,
+    const bool check_intersection)
 {
     const auto data_settings = data.getSettings();
     auto metadata_snapshot = data.getInMemoryMetadataPtr();
@@ -536,7 +539,7 @@ SelectPartsDecision MergeTreeDataMergerMutator::selectPartsToMergeMulti(
         parts_ranges.back().emplace_back(part_info);
 
         /// Check for consistency of data parts. If assertion is failed, it requires immediate investigation.
-        if (prev_part && part->info.partition_id == (*prev_part)->info.partition_id
+        if (check_intersection && prev_part && part->info.partition_id == (*prev_part)->info.partition_id
             && part->info.min_block <= (*prev_part)->info.max_block)
         {
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Part {} intersects previous part {}", part->name, (*prev_part)->name);
@@ -598,19 +601,37 @@ SelectPartsDecision MergeTreeDataMergerMutator::selectPartsToMergeMulti(
         DanceMergeSelector::Settings merge_settings;
         merge_settings.loadFromConfig(config);
         /// Override value from table settings
-        merge_settings.max_parts_to_merge_base = data_settings->max_parts_to_merge_at_once;
+        /// For CNCH compatibility, we use cnch_merge_max_parts_to_merge and max_parts_to_merge_at_once.
+        merge_settings.max_parts_to_merge_base = std::min(data_settings->cnch_merge_max_parts_to_merge, data_settings->max_parts_to_merge_at_once);
         merge_settings.enable_batch_select = enable_batch_select;
         if (aggressive)
             merge_settings.min_parts_to_merge_base = 1;
+
+        /// make sure rowid could be represented in 4 bytes
+        if (metadata_snapshot->hasUniqueKey())
+        {
+            auto & max_rows = merge_settings.max_total_rows_to_merge;
+            if (!(0 < max_rows && max_rows <= std::numeric_limits<UInt32>::max()))
+                max_rows = std::numeric_limits<UInt32>::max();
+        }
         merge_selector = std::make_unique<DanceMergeSelector>(data, merge_settings);
     }
     else
     {
         SimpleMergeSelector::Settings merge_settings;
         /// Override value from table settings
-        merge_settings.max_parts_to_merge_at_once = data_settings->max_parts_to_merge_at_once;
+        merge_settings.max_parts_to_merge_at_once = std::min(data_settings->cnch_merge_max_parts_to_merge, data_settings->max_parts_to_merge_at_once);
+        merge_settings.enable_batch_select = enable_batch_select;
         if (aggressive)
             merge_settings.base = 1;
+
+        /// make sure rowid could be represented in 4 bytes
+        if (metadata_snapshot->hasUniqueKey())
+        {
+            auto & max_rows = merge_settings.max_total_rows_to_merge;
+            if (!(0 < max_rows && max_rows <= std::numeric_limits<UInt32>::max()))
+                max_rows = std::numeric_limits<UInt32>::max();
+        }
         merge_selector = std::make_unique<SimpleMergeSelector>(merge_settings);
     }
 
@@ -1202,6 +1223,12 @@ MergeTreeData::MutableDataPartPtr MergeTreeDataMergerMutator::mergePartsToTempor
         merged_stream = std::make_shared<MaterializingBlockInputStream>(merged_stream);
     }
 
+    BitmapBuildInfo bitmap_build_info;
+    if (!data.getSettings()->build_bitmap_index_in_merge)
+        bitmap_build_info.build_all_bitmap_index = false;
+    if (!data.getSettings()->build_segment_bitmap_index_in_merge)
+        bitmap_build_info.build_all_segment_bitmap_index = false;
+
     const auto & index_factory = MergeTreeIndexFactory::instance();
     MergedBlockOutputStream to{
         new_data_part,
@@ -1210,7 +1237,8 @@ MergeTreeData::MutableDataPartPtr MergeTreeDataMergerMutator::mergePartsToTempor
         index_factory.getMany(metadata_snapshot->getSecondaryIndices()),
         compression_codec,
         blocks_are_granules_size,
-        context->getSettingsRef().optimize_map_column_serialization};
+        context->getSettingsRef().optimize_map_column_serialization,
+        bitmap_build_info};
 
     merged_stream->readPrefix();
     to.writePrefix();
@@ -1623,7 +1651,6 @@ MergeTreeData::MutableDataPartPtr MergeTreeDataMergerMutator::mutatePartToTempor
         if (in)
             in->setProgressCallback(MergeProgressCallback(merge_entry, watch_prev_elapsed, stage_progress));
         updated_header = interpreter->getUpdatedHeader();
-        updated_delete_bitmap = interpreter->getUpdatedDeleteBitmap();
     }
 
     auto single_disk_volume = std::make_shared<SingleDiskVolume>("volume_" + future_part.name, space_reservation->getDisk(), 0);
@@ -2102,6 +2129,16 @@ NameToNameVector MergeTreeDataMergerMutator::collectFilesForRenames(
             {
                 rename_vector.emplace_back(INDEX_FILE_PREFIX + command.column_name + ".idx", "");
                 rename_vector.emplace_back(INDEX_FILE_PREFIX + command.column_name + mrk_extension, "");
+                
+                // For GIN index
+                if (source_checksums->has(INDEX_FILE_PREFIX + command.column_name + GIN_SEGMENT_ID_FILE_EXTENSION))
+                {
+                    rename_vector.emplace_back(INDEX_FILE_PREFIX + command.column_name + GIN_SEGMENT_ID_FILE_EXTENSION, "");
+                    rename_vector.emplace_back(INDEX_FILE_PREFIX + command.column_name + GIN_SEGMENT_METADATA_FILE_EXTENSION, "");
+                    rename_vector.emplace_back(INDEX_FILE_PREFIX + command.column_name + GIN_DICTIONARY_FILE_EXTENSION, "");
+                    rename_vector.emplace_back(INDEX_FILE_PREFIX + command.column_name + GIN_POSTINGS_FILE_EXTENSION, "");
+                }
+
             }
         }
         else if (command.type == MutationCommand::Type::DROP_PROJECTION)

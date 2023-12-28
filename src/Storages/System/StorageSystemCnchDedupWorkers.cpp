@@ -179,10 +179,12 @@ void StorageSystemCnchDedupWorkers::fillData(MutableColumns & res_columns, Conte
     }
     else if (context->getServerType() == ServerType::cnch_worker)
     {
-        for (const auto & db : DatabaseCatalog::instance().getDatabases())
+        for (const auto & db : DatabaseCatalog::instance().getDatabases(context))
         {
             for (auto it = db.second->getTablesIterator(context); it->isValid(); it->next())
             {
+                if (!it->table())
+                    continue;
                 auto table = dynamic_cast<const StorageCloudMergeTree *>(it->table().get());
                 if (table && table->getInMemoryMetadataPtr()->hasUniqueKey())
                     tables[table->getStorageID().uuid] = it->table();

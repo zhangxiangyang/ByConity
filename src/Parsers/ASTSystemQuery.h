@@ -31,7 +31,6 @@
 
 namespace DB
 {
-
 enum class MetastoreOperation
 {
     UNKNOWN,
@@ -47,13 +46,12 @@ const char * metaOptToString(MetastoreOperation opt);
 struct MetastoreOptions
 {
     MetastoreOperation operation = MetastoreOperation::UNKNOWN;
-    String drop_key {};
+    String drop_key{};
 };
 
 class ASTSystemQuery : public IAST, public ASTQueryWithOnCluster
 {
 public:
-
     enum class Type
     {
         UNKNOWN,
@@ -63,7 +61,9 @@ public:
         DROP_DNS_CACHE,
         DROP_MARK_CACHE,
         DROP_UNCOMPRESSED_CACHE,
+        DROP_NVM_CACHE,
         DROP_MMAP_CACHE,
+        DROP_QUERY_CACHE,
         DROP_CHECKSUMS_CACHE,
         DROP_CNCH_PART_CACHE,
 #if USE_EMBEDDED_COMPILER
@@ -90,6 +90,7 @@ public:
         STOP_MERGES,
         START_MERGES,
         REMOVE_MERGES,
+        GC, // gc db.table [partition partition_expr]
         STOP_GC,
         START_GC,
         FORCE_GC,
@@ -112,7 +113,9 @@ public:
         START_DISTRIBUTED_SENDS,
         START_CONSUME,
         STOP_CONSUME,
+        DROP_CONSUME,
         RESTART_CONSUME,
+        RESET_CONSUME_OFFSET,
         FETCH_PARTS,
         METASTORE,
         CLEAR_BROKEN_TABLES,
@@ -120,7 +123,18 @@ public:
         SYNC_DEDUP_WORKER,
         START_DEDUP_WORKER,
         STOP_DEDUP_WORKER,
+        START_CLUSTER,
+        STOP_CLUSTER,
         DUMP_SERVER_STATUS,
+        CLEAN_TRANSACTION,
+        CLEAN_TRASH_TABLE,
+        CLEAN_FILESYSTEM_LOCK,
+        JEPROF_DUMP,
+        LOCK_MEMORY_LOCK,
+        START_MATERIALIZEDMYSQL,
+        STOP_MATERIALIZEDMYSQL,
+        RESYNC_MATERIALIZEDMYSQL_TABLE,
+        RECALCULATE_METRICS,
         END
     };
 
@@ -131,6 +145,8 @@ public:
     String target_model;
     String database;
     String table;
+    // optional for clean trash table
+    UUID table_uuid = UUIDHelpers::Nil;
     String replica;
     String replica_zk_path;
     bool is_drop_whole_replica{};
@@ -138,6 +154,9 @@ public:
     String volume;
     String disk;
     UInt64 seconds{};
+
+    /// Some parameters may need deeply parsed, such as json parameter string for ResetConsumeOffset
+    String string_data;
 
     // For execute/reload mutation
     String mutation_id;
@@ -149,8 +168,11 @@ public:
 
     ASTPtr target_path;
 
-    // For DEDUP
+    // For GC and DEDUP
     ASTPtr partition; // The value or ID of the partition is stored here.
+
+    /// for CLEAN TRANSACTION txn_id
+    UInt64 txn_id;
 
     String getID(char) const override { return "SYSTEM query"; }
 
@@ -164,7 +186,6 @@ public:
     }
 
 protected:
-
     void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 

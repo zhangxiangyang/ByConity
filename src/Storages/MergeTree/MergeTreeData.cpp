@@ -62,6 +62,8 @@
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergedBlockOutputStream.h>
 #include <Storages/MergeTree/MergedColumnOnlyOutputStream.h>
+#include <Storages/MergeTree/Index/MergeTreeBitmapIndex.h>
+#include <Storages/MergeTree/Index/MergeTreeSegmentBitmapIndex.h>
 #include <Storages/MergeTree/checkDataPart.h>
 #include <Storages/MergeTree/localBackup.h>
 #include <Storages/MergeTree/ChecksumsCache.h>
@@ -74,6 +76,7 @@
 #include <Common/StringUtils/StringUtils.h>
 #include <Common/escapeForFileName.h>
 #include <Common/quoteString.h>
+#include <Common/time.h>
 #include <Common/typeid_cast.h>
 
 #include <boost/range/adaptor/filtered.hpp>
@@ -161,6 +164,7 @@ MergeTreeData::MergeTreeData(
         date_column_name,
         merging_params_,
         std::move(storage_settings_),
+        table_id_.getNameForLogs(),
         require_part_metadata_,
         attach,
         std::move(broken_part_callback_))
@@ -181,7 +185,7 @@ MergeTreeData::MergeTreeData(
         settings->sanityCheck(getContext()->getSettingsRef());
 
     MergeTreeDataFormatVersion min_format_version(0);
-    if (!date_column_name.empty())
+    if (date_column_name.empty())
         min_format_version = MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING;
 
     /// format_file always contained on any data path
@@ -196,6 +200,8 @@ MergeTreeData::MergeTreeData(
         {
             if (!version_file.first.empty())
             {
+                // If version_file.first is not empty, version_file.second is initialized too
+                // coverity[var_deref_model]
                 LOG_ERROR(log, "Duplication of version file {} and {}", fullPath(version_file.second, version_file.first), current_version_file_path);
                 throw Exception("Multiple format_version.txt file", ErrorCodes::CORRUPTED_DATA);
             }
@@ -245,12 +251,17 @@ MergeTreeData::MergeTreeData(
             throw Exception("Bad version file: " + fullPath(version_file.second, version_file.first), ErrorCodes::CORRUPTED_DATA);
     }
 
+    const auto & all_columns = getInMemoryMetadataPtr()->getColumns();
+    MergeTreeBitmapIndex::checkValidBitmapIndexType(all_columns);
+    MergeTreeSegmentBitmapIndex::checkSegmentBitmapStorageGranularity(all_columns, getSettings());
+
     if (format_version < min_format_version)
     {
-        if (min_format_version == MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING.toUnderType())
-            throw Exception(
-                "MergeTree data format version on disk doesn't support custom partitioning",
-                ErrorCodes::METADATA_MISMATCH);
+        LOG_WARNING(
+            log,
+            "data format version on disk {} is too old, keep it for compatibility "
+            "but you'd better re-create the table",
+            format_version.toUnderType());
     }
     String reason;
     if (!canUsePolymorphicParts(*settings, &reason) && !reason.empty())
@@ -282,7 +293,7 @@ std::optional<UInt64> MergeTreeData::totalRowsByPartitionPredicateImpl(
     Block virtual_columns_block = getBlockWithVirtualPartColumns(parts, true /* one_part */);
 
     // Generate valid expressions for filtering
-    bool valid = VirtualColumnUtils::prepareFilterBlockWithQuery(query_info.query, local_context, virtual_columns_block, expression_ast);
+    bool valid = VirtualColumnUtils::prepareFilterBlockWithQuery(query_info.query, local_context, virtual_columns_block, expression_ast, query_info.partition_filter);
 
     PartitionPruner partition_pruner(metadata_snapshot, query_info, local_context, true /* strict */);
     if (partition_pruner.isUseless() && !valid)
@@ -292,7 +303,7 @@ std::optional<UInt64> MergeTreeData::totalRowsByPartitionPredicateImpl(
     if (valid && expression_ast)
     {
         virtual_columns_block = getBlockWithVirtualPartColumns(parts, false /* one_part */);
-        VirtualColumnUtils::filterBlockWithQuery(query_info.query, virtual_columns_block, local_context, expression_ast);
+        VirtualColumnUtils::filterBlockWithQuery(query_info.query, virtual_columns_block, local_context, expression_ast, query_info.partition_filter);
         part_values = VirtualColumnUtils::extractSingleValueFromBlock<String>(virtual_columns_block, "_part");
         if (part_values.empty())
             return 0;
@@ -318,7 +329,7 @@ MergeTreeData::DataPartsVector MergeTreeData::getRequiredPartitions(const Select
     Block virtual_columns_block = getBlockWithVirtualPartColumns(parts, true /* one_part */);
 
     // Generate valid expressions for filtering
-    bool valid = VirtualColumnUtils::prepareFilterBlockWithQuery(query_info.query, local_context, virtual_columns_block, expression_ast);
+    bool valid = VirtualColumnUtils::prepareFilterBlockWithQuery(query_info.query, local_context, virtual_columns_block, expression_ast, query_info.partition_filter);
 
     PartitionPruner partition_pruner(metadata_snapshot, query_info, local_context, true /* strict */);
     if (partition_pruner.isUseless() && !valid)
@@ -328,7 +339,7 @@ MergeTreeData::DataPartsVector MergeTreeData::getRequiredPartitions(const Select
     if (valid && expression_ast)
     {
         virtual_columns_block = getBlockWithVirtualPartColumns(parts, false /* one_part */);
-        VirtualColumnUtils::filterBlockWithQuery(query_info.query, virtual_columns_block, local_context, expression_ast);
+        VirtualColumnUtils::filterBlockWithQuery(query_info.query, virtual_columns_block, local_context, expression_ast, query_info.partition_filter);
         part_values = VirtualColumnUtils::extractSingleValueFromBlock<String>(virtual_columns_block, "_part");
         if (part_values.empty())
             return {};
@@ -341,48 +352,6 @@ MergeTreeData::DataPartsVector MergeTreeData::getRequiredPartitions(const Select
             required_parts.emplace_back(part);
     }
     return required_parts;
-}
-
-void MergeTreeData::checkColumnsValidity(const ColumnsDescription & columns) const
-{
-    NamesAndTypesList func_columns = getInMemoryMetadataPtr()->getFuncColumns();
-
-    for (auto & column: columns.getAll())
-    {
-        /// check func columns
-        for (auto & [name, type]: func_columns)
-        {
-            if (name == column.name)
-                throw Exception("Column " + backQuoteIfNeed(column.name) + " is reserved column", ErrorCodes::ILLEGAL_COLUMN);
-        }
-
-        /// block implicit key name for MergeTree family
-        if (isMapImplicitKey(column.name))
-            throw Exception("Column " + backQuoteIfNeed(column.name) + " contains reserved prefix word", ErrorCodes::ILLEGAL_COLUMN);
-
-        if (column.type && column.type->isMap())
-        {
-            auto escape_name = escapeForFileName(column.name + getMapSeparator());
-            auto pos = escape_name.find(getMapSeparator());
-            /// The name of map column should not contain map separator, which is convenient for extracting map column name from a implicit column name.
-            if (pos + getMapSeparator().size() != escape_name.size())
-                throw Exception(
-                    ErrorCodes::ILLEGAL_COLUMN,
-                    "Map column name {} is invalid because its escaped name {} contains reserved word {}",
-                    backQuoteIfNeed(column.name),
-                    backQuoteIfNeed(escape_name),
-                    getMapSeparator());
-
-            if (storage_settings.get()->enable_compact_map_data)
-            {
-                const auto & type_map = typeid_cast<const DataTypeByteMap &>(*column.type);
-                if (type_map.getValueType()->lowCardinality())
-                {
-                    throw Exception("Column " + backQuoteIfNeed(column.name) + " compact map type not compatible with LowCardinality type, you need remove LowCardinality or disable compact map", ErrorCodes::ILLEGAL_COLUMN);
-                }
-            }
-        }
-    }
 }
 
 Int64 MergeTreeData::getMaxBlockNumber() const
@@ -545,7 +514,9 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks)
 
             for (const auto & [disk_name, disk] : getContext()->getDisksMap())
             {
-                if (defined_disk_names.count(disk_name) == 0 && disk->exists(getRelativeDataPath(IStorage::StorageLocation::MAIN)))
+                // Skip disk for byconity remote storage
+                if (disk->getType() != DiskType::Type::ByteHDFS && disk->getType() != DiskType::Type::ByteS3
+                    && defined_disk_names.count(disk_name) == 0 && disk->exists(getRelativeDataPath(IStorage::StorageLocation::MAIN)))
                 {
                     for (const auto it = disk->iterateDirectory(getRelativeDataPath(IStorage::StorageLocation::MAIN)); it->isValid(); it->next())
                     {
@@ -1679,7 +1650,7 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
 void MergeTreeData::checkMutationIsPossible(const MutationCommands & commands, const Settings & /*settings*/) const
 {
     int num_fast_deletes = 0;
-    for (auto & command : commands)
+    for (const auto & command : commands)
         num_fast_deletes += command.type == MutationCommand::Type::FAST_DELETE;
     if (num_fast_deletes > 1)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "It's not allowed to execute multiple FASTDELETE commands");
@@ -2824,7 +2795,7 @@ void MergeTreeData::movePartitionToVolume(const ASTPtr & partition, const String
     else
         parts = getDataPartsVectorInPartition(MergeTreeDataPartState::Committed, partition_id);
 
-    auto volume = getStoragePolicy(IStorage::StorageLocation::MAIN)->getVolumeByName(name);
+    auto volume = getStoragePolicy(IStorage::StorageLocation::MAIN)->getVolumeByName(name, true);
     if (!volume)
         throw Exception("Volume " + name + " does not exists on policy " + getStoragePolicy(IStorage::StorageLocation::MAIN)->getName(), ErrorCodes::UNKNOWN_DISK);
 
@@ -3460,7 +3431,7 @@ static void selectBestProjection(
         query_info, // TODO syntax_analysis_result set in index
         query_context,
         settings.max_threads,
-        max_added_blocks);
+        max_added_blocks)->marks();
 
     if (normal_parts.empty())
     {
@@ -3478,7 +3449,7 @@ static void selectBestProjection(
             query_info, // TODO syntax_analysis_result set in index
             query_context,
             settings.max_threads,
-            max_added_blocks);
+            max_added_blocks)->marks();
     }
 
     // We choose the projection with least sum_marks to read.
@@ -3736,7 +3707,7 @@ bool MergeTreeData::getQueryProcessingStageWithAggregateProjection(
                 query_info, // TODO syntax_analysis_result set in index
                 query_context,
                 settings.max_threads,
-                max_added_blocks);
+                max_added_blocks)->marks();
 
             // Add 1 to base sum_marks so that we prefer projections even when they have equal number of marks to read.
             // NOTE: It is not clear if we need it. E.g. projections do not support skip index for now.
@@ -4058,17 +4029,6 @@ bool MergeTreeData::canReplacePartition(const DataPartPtr & src_part) const
             return false;
     }
     return true;
-}
-
-inline UInt64 time_in_microseconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::microseconds>(timepoint.time_since_epoch()).count();
-}
-
-
-inline UInt64 time_in_seconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::seconds>(timepoint.time_since_epoch()).count();
 }
 
 void MergeTreeData::writePartLog(

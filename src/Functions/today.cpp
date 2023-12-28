@@ -37,6 +37,8 @@ namespace
 class ExecutableFunctionToday : public IExecutableFunction
 {
 public:
+    // Only called by FunctionBaseToday which passes UInt16
+    // coverity[store_truncates_time_t]
     explicit ExecutableFunctionToday(time_t time_) : day_value(time_) {}
 
     String getName() const override { return "today"; }
@@ -104,10 +106,11 @@ public:
 
 }
 
-void registerFunctionToday(FunctionFactory & factory)
+REGISTER_FUNCTION(Today)
 {
     factory.registerFunction<TodayOverloadResolver>();
     factory.registerAlias("CURRENT_DATE", TodayOverloadResolver::name, FunctionFactory::CaseInsensitive);
+    factory.registerAlias("CURDATE", TodayOverloadResolver::name, FunctionFactory::CaseInsensitive);
 }
 
 }

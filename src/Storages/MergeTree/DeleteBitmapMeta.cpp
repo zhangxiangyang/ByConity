@@ -21,6 +21,8 @@
 #include <Storages/HDFS/WriteBufferFromHDFS.h>
 #include <Common/Coding.h>
 #include <Common/ThreadPool.h>
+#include "IO/ReadBufferFromFileBase.h"
+#include "IO/ReadSettings.h"
 
 namespace DB::ErrorCodes
 {
@@ -29,26 +31,11 @@ extern const int LOGICAL_ERROR;
 
 namespace DB
 {
-static String dataModelName(const DataModelDeleteBitmapPtr & model)
+String dataModelName(const Protos::DataModelDeleteBitmap & model)
 {
     std::stringstream ss;
-    ss << model->partition_id() << "_" << model->part_min_block() << "_" << model->part_max_block() << "_"
-       << model->reserved() << "_" << model->type() << "_" << model->txn_id();
-    return ss.str();
-}
-
-static String deleteBitmapDirRelativePath(const String & partition_id)
-{
-    std::stringstream ss;
-    ss << "DeleteFiles/" << partition_id <<  "/";
-    return ss.str();
-}
-
-static String deleteBitmapFileRelativePath(const Protos::DataModelDeleteBitmap & model)
-{
-    std::stringstream ss;
-    ss << deleteBitmapDirRelativePath(model.partition_id()) << model.part_min_block() << "_" << model.part_max_block() << "_"
-       << model.reserved() << "_" << model.type() << "_" << model.txn_id() << ".bitmap";
+    ss << model.partition_id() << "_" << model.part_min_block() << "_" << model.part_max_block() << "_"
+       << model.reserved() << "_" << model.type() << "_" << model.txn_id();
     return ss.str();
 }
 
@@ -56,12 +43,17 @@ std::shared_ptr<LocalDeleteBitmap> LocalDeleteBitmap::createBaseOrDelta(
     const MergeTreePartInfo & part_info,
     const ImmutableDeleteBitmapPtr & base_bitmap,
     const DeleteBitmapPtr & delta_bitmap,
-    UInt64 txn_id)
+    UInt64 txn_id,
+    bool force_create_base_bitmap)
 {
-    if (!base_bitmap || !delta_bitmap)
+    if (!delta_bitmap)
         throw Exception("base_bitmap and delta_bitmap cannot be null", ErrorCodes::LOGICAL_ERROR);
 
-    if (delta_bitmap->cardinality() <= DeleteBitmapMeta::kInlineBitmapMaxCardinality)
+    /// In repair mode, base delete bitmap may not exists due to some bugs, just return delta bitmap.
+    if (!base_bitmap)
+        return std::make_shared<LocalDeleteBitmap>(part_info, DeleteBitmapMetaType::Base, txn_id, delta_bitmap);
+
+    if (!force_create_base_bitmap && delta_bitmap->cardinality() <= DeleteBitmapMeta::kInlineBitmapMaxCardinality)
     {
         return std::make_shared<LocalDeleteBitmap>(part_info, DeleteBitmapMetaType::Delta, txn_id, delta_bitmap);
     }
@@ -90,9 +82,9 @@ LocalDeleteBitmap::LocalDeleteBitmap(
     model->set_cardinality(bitmap ? bitmap->cardinality() : 0);
 }
 
-UndoResource LocalDeleteBitmap::getUndoResource(const TxnTimestamp & new_txn_id) const
+UndoResource LocalDeleteBitmap::getUndoResource(const TxnTimestamp & new_txn_id, UndoResourceType type) const
 {
-    return UndoResource(new_txn_id, UndoResourceType::DeleteBitmap, dataModelName(model), deleteBitmapFileRelativePath(*model));
+    return UndoResource(new_txn_id, type, dataModelName(*model), DeleteBitmapMeta::deleteBitmapFileRelativePath(*model));
 }
 
 bool LocalDeleteBitmap::canInlineStoreInCatalog() const
@@ -120,19 +112,20 @@ DeleteBitmapMetaPtr LocalDeleteBitmap::dump(const MergeTreeMetaBase & storage) c
             size = bitmap->write(buf.data());
             {
                 DiskPtr disk = storage.getStoragePolicy(IStorage::StorageLocation::MAIN)->getAnyDisk();
-                String dir_rel_path = fs::path(storage.getRelativeDataPath(IStorage::StorageLocation::MAIN)) / deleteBitmapDirRelativePath(model->partition_id());
+                String dir_rel_path = fs::path(storage.getRelativeDataPath(IStorage::StorageLocation::MAIN)) / DeleteBitmapMeta::deleteBitmapDirRelativePath(model->partition_id());
                 disk->createDirectories(dir_rel_path);
 
-                String file_rel_path = fs::path(storage.getRelativeDataPath(IStorage::StorageLocation::MAIN)) / deleteBitmapFileRelativePath(*model);
+                String file_rel_path = fs::path(storage.getRelativeDataPath(IStorage::StorageLocation::MAIN)) / DeleteBitmapMeta::deleteBitmapFileRelativePath(*model);
                 auto out = disk->writeFile(file_rel_path);
-                auto * data_out = dynamic_cast<WriteBufferFromHDFS *>(out.get());
-                if (!data_out)
-                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Writing part to hdfs but write buffer is not hdfs");
 
-                data_out->write(buf.data(), size);
+                out->write(buf.data(), size);
+                /// It's necessary to do next() and sync() here, otherwise it will omit the error in WriteBufferFromHDFS::WriteBufferFromHDFSImpl::~WriteBufferFromHDFSImpl() which case file incomplete.
+                out->next();
+                out->sync();
+                out->finalize();
             }
             model->set_file_size(size);
-            LOG_TRACE(storage.getLogger(), "Dumped delete bitmap {}", dataModelName(model));
+            LOG_TRACE(storage.getLogger(), "Dumped delete bitmap {}", dataModelName(*model));
         }
     }
     return std::make_shared<DeleteBitmapMeta>(storage, model);
@@ -186,17 +179,67 @@ DeleteBitmapMetaPtrVector dumpDeleteBitmaps(const MergeTreeMetaBase & storage, c
     return res;
 }
 
+DeleteBitmapMeta::~DeleteBitmapMeta()
+{
+    DeleteBitmapMetaPtrVector prev_metas;
+    DeleteBitmapMetaPtr current_meta = prev_meta;
+
+    /// Avoid destructor stack overflow with deep nested DeleteBitmapMetaPtr
+    while (current_meta)
+    {
+        prev_metas.push_back(current_meta);
+        current_meta = current_meta->prev_meta;
+        prev_metas.back()->prev_meta.reset();
+    }
+}
+
+UInt64 DeleteBitmapMeta::getEndTime() const
+{
+    return model->has_end_time() ? model->end_time() : 0;
+}
+
+DeleteBitmapMeta & DeleteBitmapMeta::setEndTime(UInt64 end_time)
+{
+    model->set_end_time(end_time);
+    return *this;
+}
+
 String DeleteBitmapMeta::getNameForLogs() const
 {
-    return dataModelName(model);
+    return dataModelName(*model);
+}
+
+String DeleteBitmapMeta::deleteBitmapDirRelativePath(const String & partition_id)
+{
+    std::stringstream ss;
+    ss << delete_files_dir << partition_id <<  "/";
+    return ss.str();
+}
+
+String DeleteBitmapMeta::deleteBitmapFileRelativePath(const Protos::DataModelDeleteBitmap & model)
+{
+    std::stringstream ss;
+    ss << deleteBitmapDirRelativePath(model.partition_id()) << model.part_min_block() << "_" << model.part_max_block() << "_"
+       << model.reserved() << "_" << model.type() << "_" << model.txn_id() << ".bitmap";
+    return ss.str();
+}
+
+std::optional<String> DeleteBitmapMeta::getFullRelativePath() const
+{
+    if (model->has_file_size())
+    {
+        String rel_file_path = fs::path(storage.getRelativeDataPath(IStorage::StorageLocation::MAIN)) / deleteBitmapFileRelativePath(*model);
+        return rel_file_path;
+    }
+    return std::nullopt;
 }
 
 void DeleteBitmapMeta::removeFile()
 {
-    if (model->has_file_size())
+    if (auto path = getFullRelativePath(); path.has_value())
     {
+        String rel_file_path = path.value();
         DiskPtr disk = storage.getStoragePolicy(IStorage::StorageLocation::MAIN)->getAnyDisk();
-        String rel_file_path = fs::path(storage.getRelativeDataPath(IStorage::StorageLocation::MAIN)) / deleteBitmapFileRelativePath(*model);
         if (likely(disk->exists(rel_file_path)))
         {
             disk->removeFile(rel_file_path);
@@ -249,20 +292,13 @@ void deserializeDeleteBitmapInfo(const MergeTreeMetaBase & storage, const DataMo
         Roaring bitmap;
         {
             PODArray<char> buf(meta->file_size());
-            String path
-                = fs::path(storage.getFullPathOnDisk(IStorage::StorageLocation::MAIN, storage.getStoragePolicy(IStorage::StorageLocation::MAIN)->getAnyDisk())) / deleteBitmapFileRelativePath(*meta);
-            ReadBufferFromByteHDFS in(
-                path,
-                /*pread=*/false,
-                storage.getContext()->getHdfsConnectionParams(),
-                /*buf_size=*/meta->file_size(),
-                /*existing_memory=*/buf.data(),
-                /*alignment=*/0,
-                /*read_all_once=*/true);
-            auto is_eof = in.eof(); /// will trigger reading into buf
-            if (is_eof)
-                throw Exception(
-                    "Unexpected EOF when reading " + path + ",  size=" + toString(meta->file_size()), ErrorCodes::LOGICAL_ERROR);
+            DiskPtr disk = storage.getStoragePolicy(IStorage::StorageLocation::MAIN)->getAnyDisk();
+            String rel_path = std::filesystem::path(storage.getRelativeDataPath(IStorage::StorageLocation::MAIN)) / DeleteBitmapMeta::deleteBitmapFileRelativePath(*meta);
+            ReadSettings read_settings = storage.getContext()->getReadSettings();
+            read_settings.buffer_size = meta->file_size();
+            std::unique_ptr<ReadBufferFromFileBase> in = disk->readFile(rel_path, read_settings);
+            in->readStrict(buf.data(), meta->file_size());
+
             bitmap = Roaring::read(buf.data());
             assert(bitmap.cardinality() == cardinality);
         }

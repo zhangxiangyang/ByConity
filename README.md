@@ -1,132 +1,46 @@
-# ByConity
+# Welcome to ByConity
 
 <p align="center">
-    <img src="ByConity-architecture.png" alt="ByConity-architecture" width="800"/>
-</p>
+<img width="717" alt="ByConity Arch 2023" src="https://github.com/ByConity/ByConity/assets/23332032/c266aa89-c1b8-4a35-a47d-ee5718a9443a">
 
-ByConity is a data warehouse designed for changes in modern cloud architecture. It adopts a cloud-native architecture design to meet the requirements of data warehouse users for flexible scaling, separation of reads and writes, resource isolation, and strong data consistency. At the same time, it provides excellent query and write performance.
+Byconity, an advanced database management system, is a derivative of ClickHouse DBMS, building upon the robust codebase from ClickHouse v21.8. However, Byconity's development path has since diverged, thanks in part to insights gained from Snowflake's architecture.
 
-ByConity is using a large number of mature OLAP technologies, such as column storage engine, MPP execution, intelligent query optimization, vectorized execution, Codegen, indexing, and data compression; it also makes special technological innovations for the cloud scenarios and storage-computing separation architecture.
+Our key innovations include the introduction of a compute-storage separation architecture, a state-of-the-art query optimizer, multiple stateless workers, and a shared-storage framework. These enhancements, inspired by both ClickHouse's strength and Snowflake's innovative approach, offer substantial performance and scalability improvements.
 
-ByConity is built on top of [ClickHouse](https://github.com/ClickHouse/ClickHouse). We appreciate the excellent work of the ClickHouse team.
-
-## Try ByConity
-You can quickly bring up a ByConity playground by following this simple [guide](https://github.com/ByConity/byconity-docker).
-
-A minimal ByConity cluster include:
-- A [FoundationDB](https://www.foundationdb.org/) database cluster to store meta data.
-- A [HDFS](https://hadoop.apache.org/docs/r1.2.1/hdfs_design.html) cluster to store data.
-- A ByConity server to receive request from clients.
-- A ByConity read worker to carry execution of read requests forward from server.
-- A ByConity write worker to carry execution of write requests forward from server.
-- A ByConity TSO server to provide timestamp
-- A ByConity daemon manager to manage background jobs that run in server
+We deeply appreciate the profound contributions from the ClickHouse team, with whom we had an early discussion to share our open-source vision and technical implementations. However, given the substantial architectural differences that emerged in our modifications, the ClickHouse team assessed that integrating these changes directly into the original ClickHouse project was not feasible. As a result, we decided to launch Byconity as an independent downstream open-source project. This approach preserves the integrity of both projects while offering distinct solutions for diverse database management needs.
 
 
-## Build ByConity
-The easiest way to build ByConity is built in [docker](https://github.com/ByConity/ByConity/tree/master/docker/builder). ByConity executable file depend on Foundation DB library `libfdb_c.so`. So in order to run it, we need to install the FoundationDB client package. This [link](https://apple.github.io/foundationdb/getting-started-linux.html) tells how to install. We can download client package from FoundationDB GitHub release pages, for example [here](https://github.com/apple/foundationdb/releases/tag/7.1.0). Another way to export the `LD_LIBRARY_PATH` so that the executable can find Foundation DB library `libfdb_c.so`. But this way is not recommended.
-```
-export LD_LIBRARY_PATH="{ByConity_source_path}/contrib/foundationdb/lib/"
-```
+**Query Large Scale Data with Speed and Precision**
+When dealing with large-scale data, performance is crucial. Byconity shines in this aspect by providing powerful querying capabilities that excel in large-scale environments. With Byconity, you can extract valuable insights from vast amounts of data quickly and accurately.
 
-It can also be built the following operating systems:
+**Break Down Data Silos with Byconity**
+Data silos pose significant challenges in data management. With different systems and processes often resulting in isolated islands of data, it hampers data analysis and insights. Byconity addresses this issue by seamlessly ingesting both batch-loaded data and streaming data, thus enabling your systems to break down silos for smoother data flow.
 
-- Linux
+**Designed for the Cloud, Flexible for Your Needs**
+Byconity is designed with a cloud-native approach, optimized to take full advantage of the cloud's scalability, resilience, and ease of deployment. It can work seamlessly on both Kubernetes clusters and physical clusters, offering you the flexibility to deploy in the environment that best meets your requirements. This broad compatibility ensures that you can leverage Byconity's benefits, irrespective of your infrastructure.
 
-### 1. Prepare Prerequisites
+## Benefits
+- **Unified Data Management**: Byconity eliminates the need to maintain separate processes for batch and streaming data, making your systems more efficient.
+- **High-Performance Data Querying** : Byconity's robust querying capabilities allow for quick and accurate data retrieval from large-scale datasets.
+- **Avoid Data Silos** : By handling both batch and streaming data, Byconity ensures all your data can be integrated, promoting better insights.
+- **Cloud-Native Design** : Byconity is built with a cloud-native approach, allowing it to efficiently leverage the advantages of the cloud and work seamlessly on both Kubernetes and physical clusters.
+- **Open Source**: Being an open-source project, Byconity encourages community collaboration. You can contribute, improve, and tailor the platform according to your needs.
 
-The following packages are required:
+## Build and Run ByConity
 
-- Git
-- CMake 3.17 or newer
-- Ninja
-- C++ compiler: clang-11 or clang-12
-- Linker: lld
+The easiest way to build ByConity is built in [docker dev-env](https://github.com/ByConity/ByConity/tree/master/docker/debian/dev-env). If you build on your local machine, the ByConity executable file depends on the Foundation DB library `libfdb_c.so`. So to run it, we need to install the FoundationDB client package. This [link](https://apple.github.io/foundationdb/getting-started-linux.html) tells how to install. We can download the client package from FoundationDB GitHub release pages, for example [here][foundationdb-client-library].
 
-```
-sudo apt-get update
-sudo apt-get install git cmake ccache python3 ninja-build libssl-dev libsnappy-dev apt-transport-https
+In case you want to build ByConity in the metal machine, follow this [guide](https://github.com/ByConity/ByConity/tree/master/doc/build_in_metal_machine.md)
 
-# install llvm 12
-sudo apt install lsb-release wget software-properties-common gnupg # pre-requisites of llvm.sh
-wget https://apt.llvm.org/llvm.sh
-chmod +x llvm.sh
-sudo ./llvm.sh 12
-```
+[foundationdb-client-library]: https://github.com/apple/foundationdb/releases/tag/7.1.3
 
-### 2. Checkout Source Code
+Using [Docker Compose](./docker/docker-compose/README.md) would be convenient for running a ByConity cluster.
 
-```
-git clone --recursive https://github.com/ByConity/ByConity.git
-```
+## Useful Links
 
-### 3. Build
-
-```
-cd ByConity
-mkdir build && cd build
-export CC=clang-12
-export CXX=clang++-12
-cmake ..
-ninja
-```
-
-Then you can find the binary in the programs folder
-
-```
-clickhouse-client    # byconity client
-clickhouse-server    # byconity server
-clickhouse-worker    # byconity worker
-tso_server           # byconity tso
-daemon_manager       # byconity daemon manager
-resource_manager     # byconity resource manager
-```
-
-## Run ByConity Locally
-The most convinience way for local development is to use `docker-compose`. You can use `docker-compose` to quickly create a [byconity cluster](/docker/local-deploy/README.md) from your local build binary. By using this approach, you do not need to worry about the setup of ByConity dependencies (FoundationDB and HDFS), it automatically launches them all. It is recommended to use this approach for ByConity development.
-
-Alternatively, if you don't want to use docker, please follow the belowing guide to run ByConity in non-containerized environments.  It assumes you have [FoundationDB](https://apple.github.io/foundationdb/local-dev.html) and [HDFS](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-common/ClusterSetup.html) set up and running locally:
-1. Modify the template config
-2. Run the local deployment script to run all the components
-
-### Modify the template config
-The config templates can be found in deploy/template. You should replace the following in in `byconity-server.xml` and `byconity-worker.xml`:
-1. `Path_To_FDB` with path to your FoundationDB `fdb.cluster` file path
-2. `HOST:PORT` with the host and port of your name node in your HDFS cluster
-```xml
-    <catalog_service>
-        <type>fdb</type>
-        <fdb>
-            <cluster_file>/Path_To_FDB/fdb.cluster</cluster_file>
-        </fdb>
-    </catalog_service>
-    ...
-    <tso_service>
-        <port>49963</port>
-        <type>fdb</type>
-        <fdb>
-            <cluster_file>/Path_To_FDB/fdb.cluster</cluster_file>
-        </fdb>
-        <tso_window_ms>3000</tso_window_ms>
-        <tso_max_retry_count>3</tso_max_retry_count>
-    </tso_service>
-    ...
-    <hdfs_nnproxy>hdfs://HOST:PORT</hdfs_nnproxy>
-
-```
-
-### Run the local deployment script
-1. Make sure you have `python3.9` and `tmux` installed
-2. Install missing libraries if any. For example:
-   1. `pip3.9 install psutils`
-3. Run tmux in another terminal
-4. Run the deploy script in a separate terminal. `template_paths` and `program_dir` args are compulsory
-   1. `cd ByConity/deploy`
-   2. `python3.9 deploy.py --template_paths template/byconity-server.xml template/byconity-worker.xml --program_dir /home/ByConity/build/programs`
-   3. There are other arguments for the script. For example, you can run 2 servers with argument `-s 2`
-
-
-## Deploy ByConity to physical machines
-There are some way to deploy ByConity to physical machines:
-- Deploy via docker [wrapper](https://github.com/ByConity/ByConity/tree/master/docker/executable_wrapper)
-- Deploy using [package manager](https://github.com/ByConity/ByConity/tree/master/packages)
+- [Official Website](https://byconity.github.io/): has a quick high-level overview of ByConity on the home page.
+- [Documentation](https://byconity.github.io/docs/introduction/main-principle-concepts): introduce basic usage guide and tech deep dive.
+- [Getting started with Kubernetes](https://byconity.github.io/docs/deployment/deploy-k8s): demonstrates how to deploy a ByConity cluster in your Kubernetes clusters.
+- [Getting started with physical machines](https://byconity.github.io/docs/deployment/package-deployment): demonstrates how to deploy ByConity in your physical clusters.
+- [Contribution Guideline](https://github.com/ByConity/ByConity/blob/master/CONTRIBUTING.md): Welcome you to join ByConity developer group and list some tips for fresh joiners to be quickly hands-on.
+- **Contact Us** : you can easily find us in [Discord server](https://discord.gg/V4BvTWGEQJ), [Youtube Channel](https://www.youtube.com/@ByConity/featured) and [Twitter](https://twitter.com/ByConity)

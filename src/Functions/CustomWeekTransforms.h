@@ -21,19 +21,22 @@
 
 #pragma once
 
+#include <iostream>
 #include <Columns/ColumnVector.h>
 #include <Columns/ColumnsNumber.h>
-#include <common/types.h>
 #include <Core/DecimalFunctions.h>
 #include <Functions/DateTimeTransforms.h>
 #include <Functions/FunctionHelpers.h>
-#include <Functions/extractTimeZoneFromFunctionArguments.h>
 #include <Functions/IFunction.h>
+#include <Functions/extractTimeZoneFromFunctionArguments.h>
 #include <Common/Exception.h>
 #include <common/DateLUTImpl.h>
+#include <common/types.h>
 
 /// The default mode value to use for the WEEK() function
 #define DEFAULT_WEEK_MODE 0
+#define DEFAULT_WEEK_MODE_MYSQL 3
+#define DEFAULT_DAY_WEEK_MODE_MYSQL 1
 
 
 namespace DB
@@ -144,6 +147,35 @@ struct ToWeekImpl
     using FactorTransform = ToStartOfYearImpl;
 };
 
+struct ToWeekOfYearImpl
+{
+    static constexpr auto name = "toWeekOfYear";
+
+    static inline UInt8 execute(Int64 t, UInt8 week_mode, const DateLUTImpl & time_zone)
+    {
+        // TODO: ditch conversion to DayNum, since it doesn't support extended range.
+        YearWeek yw = time_zone.toYearWeek(time_zone.toDayNum(t), week_mode);
+        return yw.second;
+    }
+    static inline UInt8 execute(UInt32 t, UInt8 week_mode, const DateLUTImpl & time_zone)
+    {
+        YearWeek yw = time_zone.toYearWeek(time_zone.toDayNum(t), week_mode);
+        return yw.second;
+    }
+    static inline UInt8 execute(Int32 d, UInt8 week_mode, const DateLUTImpl & time_zone)
+    {
+        YearWeek yw = time_zone.toYearWeek(ExtendedDayNum(d), week_mode);
+        return yw.second;
+    }
+    static inline UInt8 execute(UInt16 d, UInt8 week_mode, const DateLUTImpl & time_zone)
+    {
+        YearWeek yw = time_zone.toYearWeek(DayNum(d), week_mode);
+        return yw.second;
+    }
+
+    using FactorTransform = ToStartOfYearImpl;
+};
+
 template <typename FromType, typename ToType, typename Transform, bool is_extended_result = false>
 struct WeekTransformer
 {
@@ -174,11 +206,29 @@ template <typename FromDataType, typename ToDataType, bool is_extended_result = 
 struct CustomWeekTransformImpl
 {
     template <typename Transform>
-    static ColumnPtr execute(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t /*input_rows_count*/, Transform transform = {})
+    static ColumnPtr execute(
+        const ColumnsWithTypeAndName & arguments,
+        const DataTypePtr &,
+        size_t /*input_rows_count*/,
+        Transform transform = {},
+        bool mysql_mode_ = false)
     {
         const auto op = WeekTransformer<typename FromDataType::FieldType, typename ToDataType::FieldType, Transform, is_extended_result>{std::move(transform)};
 
-        UInt8 week_mode = DEFAULT_WEEK_MODE;
+        UInt8 week_mode = mysql_mode_ ? DEFAULT_WEEK_MODE_MYSQL : DEFAULT_WEEK_MODE;
+        if (mysql_mode_)
+        {
+            if constexpr(std::is_same_v<Transform, ToDayOfWeekMySQLImpl>)
+                week_mode = DEFAULT_DAY_WEEK_MODE_MYSQL;
+            else if constexpr(std::is_same_v<Transform, ToWeekImpl> || std::is_same_v<Transform, ToYearWeekImpl>)
+                week_mode = DEFAULT_WEEK_MODE;
+        }
+        
+        if constexpr(std::is_same_v<Transform, ToWeekOfYearImpl>)
+        {
+            week_mode = DEFAULT_WEEK_MODE_MYSQL;
+        }
+
         if (arguments.size() > 1)
         {
             if (const auto * week_mode_column = checkAndGetColumnConst<ColumnUInt8>(arguments[1].column.get()))

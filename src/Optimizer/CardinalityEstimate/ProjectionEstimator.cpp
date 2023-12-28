@@ -19,6 +19,7 @@
 #include <Parsers/ASTVisitor.h>
 #include <Common/FieldVisitorConvertToNumber.h>
 #include <Common/FieldVisitors.h>
+#include <Statistics/StringHash.h>
 
 namespace DB
 {
@@ -34,7 +35,7 @@ PlanNodeStatisticsPtr ProjectionEstimator::estimate(PlanNodeStatisticsPtr & chil
 
     std::unordered_map<String, SymbolStatisticsPtr> & symbol_statistics = project_stats->getSymbolStatistics();
     std::unordered_map<String, SymbolStatisticsPtr> calculated_symbol_statistics;
-    for (auto & assignment : step.getAssignments())
+    for (const auto & assignment : step.getAssignments())
     {
         auto result = ScalarStatsCalculator::estimate(
             assignment.second, name_to_type.at(assignment.first), project_stats->getRowCount(), symbol_statistics);
@@ -48,7 +49,7 @@ PlanNodeStatisticsPtr ProjectionEstimator::estimate(PlanNodeStatisticsPtr & chil
         }
     }
 
-    return std::make_shared<PlanNodeStatistics>(project_stats->getRowCount(), calculated_symbol_statistics);
+    return std::make_shared<PlanNodeStatistics>(project_stats->getRowCount(), std::move(calculated_symbol_statistics));
 }
 
 SymbolStatisticsPtr ScalarStatsCalculator::estimate(
@@ -66,7 +67,7 @@ SymbolStatisticsPtr ScalarStatsCalculator::visitNode(const ConstASTPtr &, std::u
 SymbolStatisticsPtr
 ScalarStatsCalculator::visitASTIdentifier(const ConstASTPtr & node, std::unordered_map<String, SymbolStatisticsPtr> & context)
 {
-    auto & identifier = node->as<ASTIdentifier &>();
+    const auto & identifier = node->as<ASTIdentifier &>();
     return context[identifier.name()];
 }
 
@@ -96,12 +97,10 @@ ScalarStatsCalculator::visitASTFunction(const ConstASTPtr & node, std::unordered
 SymbolStatisticsPtr
 ScalarStatsCalculator::visitASTLiteral(const ConstASTPtr & node, std::unordered_map<String, SymbolStatisticsPtr> & context)
 {
-    auto literal = dynamic_cast<const ASTLiteral *>(node.get());
+    const auto * literal = dynamic_cast<const ASTLiteral *>(node.get());
     if (literal->value.isNull())
         return std::make_shared<SymbolStatistics>(1, 0, 0, 1);
-    DataTypePtr tmp_type = type;
-    if (tmp_type->isNullable())
-        tmp_type = dynamic_cast<const DataTypeNullable *>(type.get())->getNestedType();
+    DataTypePtr tmp_type = removeNullable(recursiveRemoveLowCardinality(type));
     if (tmp_type->isValueRepresentedByNumber())
     {
         double value = applyVisitor(FieldVisitorConvertToNumber<Float64>(), literal->value);
@@ -112,7 +111,7 @@ ScalarStatsCalculator::visitASTLiteral(const ConstASTPtr & node, std::unordered_
     if (tmp_type->getTypeId() == TypeIndex::String || type->getTypeId() == TypeIndex::FixedString)
     {
         String str = literal->value.safeGet<String>();
-        double value = CityHash_v1_0_2::CityHash64(str.data(), str.size());
+        double value = Statistics::stringHash64(str);
         return std::make_shared<SymbolStatistics>(
             1, value, value, 0, 8, Histogram{Buckets{Bucket(value, value, 1, total_rows, true, true)}}, type, "unknown", false);
     }

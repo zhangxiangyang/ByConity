@@ -19,6 +19,9 @@
 #include <type_traits>
 #include <bthread/condition_variable.h>
 #include <bthread/mutex.h>
+#include <fmt/core.h>
+#include <Poco/Logger.h>
+#include "common/logger_useful.h"
 #include <Common/CurrentMetrics.h>
 #include <Common/CurrentThread.h>
 #include <Common/Exception.h>
@@ -34,23 +37,55 @@ namespace ErrorCodes
 template <typename T>
 class BoundedDataQueue
 {
-public:
-    explicit BoundedDataQueue(size_t capacity_ = 20) : full_cv(), empty_cv(), capacity(capacity_) { }
-
-    void push(const T & x)
+private:
+    template <typename E>
+    inline void pushImpl(E && x)
     {
         std::unique_lock<bthread::Mutex> lock(mutex);
-        while (queue.size() == capacity && !is_closed)
+        while (queue.size() >= capacity && !is_closed)
         {
+            LOG_TRACE(&Poco::Logger::get("BoundedDataQueue"), fmt::format("Queue is full and waiting, current size: {}, max size: {}", queue.size(), capacity));
             full_cv.wait(lock);
         }
         if (is_closed)
             throw Exception("Queue is closed", ErrorCodes::STD_EXCEPTION);
-        queue.push(x);
-        empty_cv.notify_all();
+        queue.push(std::forward<E>(x));
+        lock.unlock();
+        empty_cv.notify_one();
     }
 
-    void pop(T & x)
+    template <typename E>
+    inline bool tryPushImpl(E && x, UInt64 milliseconds = 0)
+    {
+        std::unique_lock<bthread::Mutex> lock(mutex);
+        while (queue.size() >= capacity && !is_closed)
+        {
+            if (ETIMEDOUT == full_cv.wait_for(lock, milliseconds * 1000))
+                return false;
+        }
+        if (is_closed)
+            return false;
+        queue.push(std::forward<E>(x));
+        lock.unlock();
+        empty_cv.notify_one();
+        return true;
+    }
+
+public:
+    explicit BoundedDataQueue(size_t capacity_ = 20) : capacity(capacity_)
+    {
+    }
+
+    inline void push(const T & x)
+    {
+        pushImpl(x);
+    }
+    inline void push(T && x)
+    {
+        pushImpl(std::move(x));
+    }
+
+    inline void pop(T & x)
     {
         std::unique_lock<bthread::Mutex> lock(mutex);
         while (queue.empty() && !is_closed)
@@ -61,25 +96,20 @@ public:
             throw Exception("Queue is closed", ErrorCodes::STD_EXCEPTION);
         ::detail::moveOrCopyIfThrow(std::move(queue.front()), x);
         queue.pop();
-        full_cv.notify_all();
+        lock.unlock();
+        full_cv.notify_one();
     }
 
-    bool tryPush(const T & x, UInt64 milliseconds = 0)
+    inline bool tryPush(const T & x, UInt64 timeout_ms = 0)
     {
-        std::unique_lock<bthread::Mutex> lock(mutex);
-        while (queue.size() == capacity && !is_closed)
-        {
-            if (ETIMEDOUT == full_cv.wait_for(lock, milliseconds * 1000))
-                return false;
-        }
-        if (is_closed)
-            return false;
-        queue.push(x);
-        empty_cv.notify_all();
-        return true;
+        return tryPushImpl(x, timeout_ms);
+    }
+    inline bool tryPush(T && x, UInt64 timeout_ms = 0)
+    {
+        return tryPushImpl(std::move(x), timeout_ms);
     }
 
-    bool tryPop(T & x, UInt64 milliseconds = 0)
+    inline bool tryPop(T & x, UInt64 milliseconds = 0)
     {
         std::unique_lock<bthread::Mutex> lock(mutex);
         while (queue.empty() && !is_closed)
@@ -93,15 +123,35 @@ public:
 
         ::detail::moveOrCopyIfThrow(std::move(queue.front()), x);
         queue.pop();
-        full_cv.notify_all();
+        lock.unlock();
+        full_cv.notify_one();
+        return true;
+    }
+
+    bool tryPopUntil(T & x, timespec millis_timestamp)
+    {
+        std::unique_lock<bthread::Mutex> lock(mutex);
+        while (queue.empty() && !is_closed)
+        {
+            if (ETIMEDOUT == empty_cv.wait_until(lock, millis_timestamp))
+                return false;
+        }
+
+        if (is_closed)
+            return false;
+
+        ::detail::moveOrCopyIfThrow(std::move(queue.front()), x);
+        queue.pop();
+        lock.unlock();
+        full_cv.notify_one();
         return true;
     }
 
     template <typename... Args>
-    bool tryEmplace(UInt64 milliseconds, Args &&... args)
+    inline bool tryEmplace(UInt64 milliseconds, Args &&... args)
     {
         std::unique_lock<bthread::Mutex> lock(mutex);
-        while (queue.size() == capacity && !is_closed)
+        while (queue.size() >= capacity && !is_closed)
         {
             if (ETIMEDOUT == full_cv.wait_for(lock, milliseconds * 1000))
                 return false;
@@ -109,23 +159,41 @@ public:
         if (is_closed)
             return false;
         queue.emplace(std::forward<Args>(args)...);
-        empty_cv.notify_all();
+        lock.unlock();
+        empty_cv.notify_one();
         return true;
     }
 
-    size_t size()
+    template <typename... Args>
+    bool tryEmplaceUntil(timespec millis_timestamp, Args &&... args)
+    {
+        std::unique_lock<bthread::Mutex> lock(mutex);
+        while (queue.size() >= capacity && !is_closed)
+        {
+            if (ETIMEDOUT == full_cv.wait_until(lock, millis_timestamp))
+                return false;
+        }
+        if (is_closed)
+            return false;
+        queue.emplace(std::forward<Args>(args)...);
+        lock.unlock();
+        empty_cv.notify_one();
+        return true;
+    }
+
+    inline size_t size()
     {
         std::unique_lock<bthread::Mutex> lock(mutex);
         return queue.size();
     }
 
-    bool empty()
+    inline bool empty()
     {
         std::unique_lock<bthread::Mutex> lock(mutex);
         return queue.empty();
     }
 
-    void clear()
+    inline void clear()
     {
         std::unique_lock<bthread::Mutex> lock(mutex);
         while (!queue.empty())
@@ -136,25 +204,41 @@ public:
         std::swap(empty_queue, queue);
     }
 
-    void setCapacity(size_t queue_capacity)
+    inline void setCapacity(size_t queue_capacity)
     {
         std::unique_lock<bthread::Mutex> lock(mutex);
         capacity = queue_capacity;
     }
 
-    bool close()
+    inline bool close()
     {
         std::unique_lock<bthread::Mutex> lock(mutex);
         if (is_closed)
             return false;
 
         is_closed = true;
+        lock.unlock();
         empty_cv.notify_all();
         full_cv.notify_all();
         return true;
     }
 
-    bool closed() { return is_closed; }
+    inline bool tryWaitUntilEmpty(UInt64 milliseconds = 0)
+    {
+        std::unique_lock<bthread::Mutex> lock(mutex);
+        while (queue.size() > 0 && !is_closed)
+        {
+            if (ETIMEDOUT == full_cv.wait_for(lock, milliseconds * 1000))
+                return false;
+        }
+        return queue.size() == 0;
+    }
+
+    bool closed()
+    {
+        std::unique_lock<bthread::Mutex> lock(mutex);
+        return is_closed;
+    }
 
 private:
     std::queue<T> queue;

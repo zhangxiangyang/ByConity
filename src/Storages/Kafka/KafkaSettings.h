@@ -45,6 +45,7 @@ class ASTStorage;
     M(UInt64, max_block_size, 65536, "Number of row collected by poll(s) for flushing data from Kafka.", 0) \
     /* default is stream_flush_interval_ms */ \
     M(Milliseconds, max_poll_interval_ms, 8000, "Timeout for flushing data from Kafka.", 0) \
+    M(Seconds, max_write_execution_second, 0, "Timeout for writing view table of Kafka task; 0 means no limit", 0) \
     /* those are mapped to format factory settings */ \
     M(String, format, "", "The message format for Kafka engine.", 0) \
     M(Char, row_delimiter, '\0', "The character to be considered as a delimiter in Kafka message.", 0) \
@@ -76,8 +77,8 @@ class ASTStorage;
     M(String, memory_table_read_mode, "ALL", "Memory table read mode valid values: ALL, PART, SKIP", 0) \
     M(UInt64, memory_table_queue_size, 2, "Memory table write block queue size", 0) \
     M(Bool, json_aggregate_function_type_base64_encode, false, "Indicate whether the json data of aggregate function type is encoded by base64.", 0) \
-    M(Bool, protobuf_enable_multiple_message, true, "Same as 'format_protobuf_enable_multiple_message' in settings", 0) \
-    M(Bool, protobuf_default_length_parser, false, "Same as 'format_protobuf_default_length_parser' in settings", 0) \
+    M(Bool, protobuf_enable_multiple_message, true, "Same as 'input_format_protobuf_enable_multiple_message' in settings", 0) \
+    M(Bool, protobuf_default_length_parser, false, "Same as 'input_format_protobuf_default_length_parser' in settings", 0) \
     M(String, api_version_request, "true", "Librdkafka config: request broker's supported API versions to adjust functionality to available protocol features", 0) \
     M(String, broker_version_fallback, "", "Librdkafka config: older broker versions", 0) \
     M(String, auto_offset_reset, "", "Librdkafka config: action to take when there is no initial offset in offset store or the desired offset is out of range", 0) \
@@ -87,6 +88,7 @@ class ASTStorage;
     M(String, cnch_schedule_mode, "random", "Schedule mode for Kafka comsume manager", 0) \
     /** Settings for Unique Table */ \
     M(Bool, enable_unique_partial_update, true, "Whether to use partial column update for INSERT", 0) \
+    M(Bool, enable_check_staging_area_status, false, "Enable check staging area status for unique table, block consume if there has too old part.", 0) \
 
 
 

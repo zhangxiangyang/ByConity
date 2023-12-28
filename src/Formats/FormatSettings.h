@@ -21,13 +21,13 @@
 
 #pragma once
 
-#include <common/types.h>
-#include <unordered_set>
 #include <map>
+#include <unordered_set>
+#include <vector>
+#include <common/types.h>
 
 namespace DB
 {
-
 /**
   * Various tweaks for input/output formats. Text serialization/deserialization
   * of data types also depend on some of these settings. It is different from
@@ -50,11 +50,11 @@ struct FormatSettings
     bool write_statistics = true;
     bool import_nested_json = false;
     bool null_as_default = true;
-
+    bool defaults_for_omitted_fields = true;
     enum class DateTimeInputFormat
     {
-        Basic,      /// Default format for fast parsing: YYYY-MM-DD hh:mm:ss (ISO-8601 without fractional part and timezone) or NNNNNNNNNN unix timestamp.
-        BestEffort  /// Use sophisticated rules to parse whatever possible.
+        Basic, /// Default format for fast parsing: YYYY-MM-DD hh:mm:ss (ISO-8601 without fractional part and timezone) or NNNNNNNNNN unix timestamp.
+        BestEffort /// Use sophisticated rules to parse whatever possible.
     };
 
     DateTimeInputFormat date_time_input_format = DateTimeInputFormat::Basic;
@@ -75,6 +75,7 @@ struct FormatSettings
     {
         UInt64 row_group_size = 1000000;
         bool low_cardinality_as_dictionary = false;
+        bool allow_missing_columns = false;
     } arrow;
 
     struct
@@ -84,6 +85,9 @@ struct FormatSettings
         UInt64 output_sync_interval = 16 * 1024;
         bool allow_missing_fields = false;
     } avro;
+
+    String bool_true_representation = "true";
+    String bool_false_representation = "false";
 
     struct CSV
     {
@@ -116,16 +120,27 @@ struct FormatSettings
         bool escape_forward_slashes = true;
         bool named_tuples_as_objects = false;
         bool serialize_as_strings = false;
+        bool read_bools_as_numbers = true;
+        bool quota_json_string = true;
     } json;
 
     struct
     {
         UInt64 row_group_size = 1000000;
-        std::map<String, String> partition_kv = {};
-        std::unordered_set<Int64> skip_row_groups = {};
-        UInt64 current_row_group = 0;
-        bool read_one_group = false;
+        bool import_nested = false;
+        bool allow_missing_columns = false;
+        std::unordered_set<int> skip_row_groups;
+        bool preserve_order = false;
+        size_t file_size = 0 ;
+        bool case_insensitive_column_matching = false;
+        UInt64 max_block_size = 8192;
     } parquet;
+
+    struct Orc
+    {
+        bool allow_missing_columns = false;
+        std::vector<bool> skip_stripes;
+    } orc;
 
     struct Pretty
     {
@@ -155,6 +170,18 @@ struct FormatSettings
          * because Protobuf without delimiters is not generally useful.
          */
         bool allow_multiple_rows_without_delimiter = false;
+        /**
+         * Some buffers like kafka only has one row each message without length
+         *  delimiter. To be compatible with previous version, add this setting
+         * to force ProtobufReader only consume one row in each buffer.
+         */
+        bool enable_multiple_message = false;
+        /**
+         * Only has meaning when enable_multiple_message is set to true.
+         * When set to true, parse a varint header as message length. Otherwise, a 8 bytes fixed length header
+         * will be read before each message.
+         */
+        bool default_length_parser = false;
     } protobuf;
 
     struct
@@ -202,4 +229,3 @@ struct FormatSettings
 };
 
 }
-

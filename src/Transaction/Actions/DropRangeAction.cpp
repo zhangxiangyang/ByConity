@@ -59,6 +59,11 @@ void DropRangeAction::executeV1(TxnTimestamp commit_time)
 
 void DropRangeAction::executeV2()
 {
+    if (executed)
+        return;
+
+    executed = true;
+    
     auto * cnch_table = dynamic_cast<StorageCnchMergeTree *>(table.get());
     if (!cnch_table)
         throw Exception("Expected StorageCnchMergeTree, but got: " + table->getName(), ErrorCodes::LOGICAL_ERROR);
@@ -79,7 +84,7 @@ void DropRangeAction::postCommit(TxnTimestamp commit_time)
 void DropRangeAction::abort()
 {
     // clear parts in kv
-    global_context.getCnchCatalog()->clearParts(table, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps,  /*staged_parts*/ {}}, true);
+    global_context.getCnchCatalog()->clearParts(table, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps,  /*staged_parts*/ {}});
 
     ServerPartLog::addNewParts(getContext(), ServerPartLogElement::DROP_RANGE, parts, txn_id, true);
 }

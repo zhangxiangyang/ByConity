@@ -20,11 +20,12 @@
 #include <Interpreters/Context_fwd.h>
 #include <ResourceManagement/CommonData.h>
 #include <ResourceManagement/VWScheduleAlgo.h>
+#include <ServiceDiscovery/IServiceDiscovery.h>
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
 #include <boost/noncopyable.hpp>
 
@@ -41,6 +42,8 @@ namespace ErrorCodes
 namespace DB
 {
 class Context;
+class CnchWorkerClient;
+using CnchWorkerClientPtr = std::shared_ptr<CnchWorkerClient>;
 class WorkerGroupHandleImpl;
 using WorkerGroupHandle = std::shared_ptr<WorkerGroupHandleImpl>;
 
@@ -52,11 +55,13 @@ enum class VirtualWarehouseHandleSource
 
 constexpr auto toString(VirtualWarehouseHandleSource s)
 {
-    if (s == VirtualWarehouseHandleSource::RM)
-        return "RM";
-    else if (s == VirtualWarehouseHandleSource::PSM)
-        return "PSM";
-    throw Exception("Unknown VW source", ErrorCodes::LOGICAL_ERROR);
+    switch (s)
+    {
+        case VirtualWarehouseHandleSource::RM:
+            return "RM";
+        case VirtualWarehouseHandleSource::PSM:
+            return "PSM";
+    }
 }
 
 /**
@@ -81,7 +86,7 @@ private:
     VirtualWarehouseHandleImpl(VirtualWarehouseHandleSource source, const VirtualWarehouseData & vw_data, const ContextPtr global_context_);
 
 public:
-    using Container = std::unordered_map<String, WorkerGroupHandle>;
+    using Container = std::map<String, WorkerGroupHandle>;
     using VirtualWarehouseHandle = std::shared_ptr<VirtualWarehouseHandleImpl>;
     using CnchWorkerClientPtr = std::shared_ptr<CnchWorkerClient>;
     using VWScheduleAlgo = ResourceManagement::VWScheduleAlgo;
@@ -106,14 +111,21 @@ public:
     WorkerGroupHandle getWorkerGroup(const String & worker_group_id, UpdateMode mode = TryUpdate);
     WorkerGroupHandle pickWorkerGroup(VWScheduleAlgo query_algo, const Requirement & requirement = {}, UpdateMode mode = TryUpdate);
     WorkerGroupHandle pickLocally(const VWScheduleAlgo & algo, const Requirement & requirement = {});
-    WorkerGroupHandle randomWorkerGroup() const;
+    WorkerGroupHandle randomWorkerGroup(UpdateMode mode = TryUpdate);
     std::optional<HostWithPorts> tryPickWorkerFromRM(VWScheduleAlgo algo, const Requirement & requirement = {});
+    void updateWorkerStatusFromRM(const std::vector<WorkerGroupData> & groups_data);
+    void updateWorkerStatusFromPSM(const IServiceDiscovery::WorkerGroupMap & groups_data, const std::string & vw_name);
 
     bool addWorkerGroup(const WorkerGroupHandle & worker_group);
 
     CnchWorkerClientPtr getWorker();
     CnchWorkerClientPtr getWorkerByHash(const String & key);
     std::vector<CnchWorkerClientPtr> getAllWorkers();
+    /// Caller should already know the worker group id when picking a single worker.
+    /// So VW handle just forward the request to the target WG handle, or forward to a random WG if it's not specified.
+    CnchWorkerClientPtr pickWorker(const String & worker_group_id, bool skip_busy_worker = true);
+
+    std::pair<UInt64, CnchWorkerClientPtr> pickWorker(const String & worker_group_id, UInt64 sequence, bool skip_busy_worker = true);
 
 private:
     bool addWorkerGroupImpl(const WorkerGroupHandle & worker_group, const std::lock_guard<std::mutex> & lock);
@@ -134,6 +146,13 @@ private:
     VirtualWarehouseSettings settings;
     Poco::Logger * log;
 
+    /// In ByteHouse, a VW will be auto recycled (auto-suspend) if no new queries received for a period (5 minutes by default).
+    /// And when user send queries to the VW again, ByteYard will make sure to send out the queries after workers are full ready.
+    /// Even though workers are full ready, the VW handle may still hold the outdated data as the UpdateMode is always TryUpdate.
+    /// This cause some query failures in auto-resume period. https:****
+    /// To fix this issue, we do a ForceUpdate if the data is not updated for a long time (the timeout of auto-suspend).
+    size_t force_update_interval_ns = 5ULL * 60 * 1000 * 1000 * 1000;
+    size_t try_update_interval_ns = 500ULL * 1000 * 1000;
     std::atomic<UInt64> last_update_time_ns{0};
 
     mutable std::mutex state_mutex;

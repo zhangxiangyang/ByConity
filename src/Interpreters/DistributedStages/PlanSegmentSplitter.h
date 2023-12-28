@@ -14,6 +14,7 @@
  */
 
 #pragma once
+#include <optional>
 #include <Optimizer/Property/Property.h>
 #include <Interpreters/DistributedStages/PlanSegment.h>
 #include <Interpreters/Context_fwd.h>
@@ -47,6 +48,7 @@ struct PlanSegmentContext
     size_t shard_number = 0;
     String cluster_name;
     PlanSegmentTree * plan_segment_tree;
+    std::optional<size_t> health_parallel;
     size_t getSegmentId() { return id++; }
 };
 
@@ -54,6 +56,9 @@ struct PlanSegmentVisitorContext
 {
     PlanSegmentInputs inputs;
     std::vector<PlanSegment *> children;
+    size_t & exchange_id;
+    bool is_add_totals = false;
+    bool is_add_extremes = false;
 };
 
 class PlanSegmentVisitor: public NodeVisitor<PlanSegmentResult, PlanSegmentVisitorContext>
@@ -67,8 +72,10 @@ public:
     PlanSegmentResult visitNode(QueryPlan::Node *, PlanSegmentVisitorContext & split_context) override;
     PlanSegmentResult visitExchangeNode(QueryPlan::Node * node, PlanSegmentVisitorContext & split_context) override;
     PlanSegmentResult visitCTERefNode(QueryPlan::Node * node, PlanSegmentVisitorContext & context) override;
+    PlanSegmentResult visitTotalsHavingNode(QueryPlan::Node * node, PlanSegmentVisitorContext & context) override;
+    PlanSegmentResult visitExtremesNode(QueryPlan::Node * node, PlanSegmentVisitorContext & context) override;
 
-    PlanSegment * createPlanSegment(QueryPlan::Node * node);
+    PlanSegment * createPlanSegment(QueryPlan::Node * node, PlanSegmentVisitorContext & split_context);
     PlanSegment * createPlanSegment(QueryPlan::Node * node, size_t segment_id, PlanSegmentVisitorContext & split_context);
 
 private:
@@ -90,6 +97,7 @@ public:
     std::optional<Partitioning::Handle> visitValuesNode(QueryPlan::Node * node, const Context & context) override;
     std::optional<Partitioning::Handle> visitReadNothingNode(QueryPlan::Node *node, const Context & context) override;
     std::optional<Partitioning::Handle> visitTableScanNode(QueryPlan::Node * node, const Context & context) override;
+    std::optional<Partitioning::Handle> visitReadStorageRowCountNode(QueryPlan::Node * node, const Context & context) override;
     std::optional<Partitioning::Handle> visitRemoteExchangeSourceNode(QueryPlan::Node * node, const Context & context) override;
 };
 

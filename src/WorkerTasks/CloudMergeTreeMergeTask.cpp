@@ -15,10 +15,12 @@
 
 #include <WorkerTasks/CloudMergeTreeMergeTask.h>
 
-#include <CloudServices/commitCnchParts.h>
+#include <CloudServices/CnchDataWriter.h>
 #include <Interpreters/Context.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH.h>
 #include <Storages/StorageCloudMergeTree.h>
+#include <Transaction/Actions/MergeMutateAction.h>
+#include <Transaction/ICnchTransaction.h>
 #include <WorkerTasks/MergeTreeDataMerger.h>
 
 namespace DB
@@ -96,7 +98,14 @@ void CloudMergeTreeMergeTask::executeImpl()
         throw Exception("Merge task " + params.task_id + " is cancelled", ErrorCodes::ABORTED);
 
     CnchDataWriter cnch_writer(storage, getContext(), ManipulationType::Merge, params.task_id);
-    cnch_writer.dumpAndCommitCnchParts(temp_parts);
+    DumpedData data = cnch_writer.dumpAndCommitCnchParts(temp_parts);
+    auto commit_time = getContext()->getCurrentTransaction()->commitV2();
+    for (const auto & part : data.parts)
+    {
+        MergeMutateAction::updatePartData(part, commit_time);
+        part->relative_path = part->info.getPartNameWithHintMutation();
+    }
+    cnch_writer.preload(data.parts);
 }
 
 }

@@ -43,8 +43,6 @@ namespace ErrorCodes
 
 void UnifyNullableType::rewrite(QueryPlan & plan, ContextMutablePtr context) const
 {
-    if (!context->getSettingsRef().join_use_nulls)
-        return;
     UnifyNullableVisitor visitor{context, plan.getCTEInfo()};
     Void v;
     auto result = VisitorUtil::accept(plan.getPlanNode(), visitor, v);
@@ -68,7 +66,7 @@ PlanNodePtr UnifyNullableVisitor::visitProjectionNode(ProjectionNode & node, Voi
     }
 
     auto expression_step = std::make_shared<ProjectionStep>(
-        child->getStep()->getOutputStream(), assignments, set_nullable, step.isFinalProject(), step.getDynamicFilters());
+        child->getStep()->getOutputStream(), assignments, set_nullable, step.isFinalProject(), step.isIndexProject());
     return ProjectionNode::createPlanNode(context->nextNodeId(), std::move(expression_step), PlanNodes{child}, node.getStatistics());
 }
 
@@ -142,6 +140,8 @@ PlanNodePtr UnifyNullableVisitor::visitJoinNode(JoinNode & node, Void & v)
         output_stream_set_null,
         join_step.getKind(),
         join_step.getStrictness(),
+        join_step.getMaxStreams(),
+        join_step.getKeepLeftReadInOrder(),
         join_step.getLeftKeys(),
         join_step.getRightKeys(),
         join_step.getFilter(),
@@ -149,7 +149,12 @@ PlanNodePtr UnifyNullableVisitor::visitJoinNode(JoinNode & node, Void & v)
         join_step.getRequireRightKeys(),
         join_step.getAsofInequality(),
         join_step.getDistributionType(),
-        join_step.isMagic());
+        join_step.getJoinAlgorithm(),
+        join_step.isMagic(),
+        join_step.isOrdered(),
+        join_step.isSimpleReordered(),
+        join_step.getRuntimeFilterBuilders(),
+        join_step.getHints());
     return JoinNode::createPlanNode(context->nextNodeId(), std::move(join_step_set_null), children, node.getStatistics());
 }
 
@@ -181,8 +186,17 @@ PlanNodePtr UnifyNullableVisitor::visitAggregatingNode(AggregatingNode & node, V
             }
         }
         String fun_name = fun->getName();
-        AggregateFunctionProperties properties;
-        AggregateFunctionPtr fun_with_null = AggregateFunctionFactory::instance().get(fun_name, types, desc.parameters, properties);
+        AggregateFunctionPtr fun_with_null = desc.function;
+        // tmp fix: For AggregateFunctionNothing, the argument types may diff with
+        // the ones in `descr.function->argument_types`. In this case, reconstructing aggregate description will lead
+        // to a different result.
+        //
+        // see also similar fix in AggregatingStep.cpp
+        if (fun_name != "nothing")
+        {
+            AggregateFunctionProperties properties;
+            fun_with_null = AggregateFunctionFactory::instance().get(fun_name, types, desc.parameters, properties);
+        }
         desc_with_null.function = fun_with_null;
         desc_with_null.parameters = desc.parameters;
         desc_with_null.column_name = desc.column_name;
@@ -197,13 +211,14 @@ PlanNodePtr UnifyNullableVisitor::visitAggregatingNode(AggregatingNode & node, V
     auto agg_step_set_null = std::make_shared<AggregatingStep>(
         child->getStep()->getOutputStream(),
         step.getKeys(),
+        step.getKeysNotHashed(),
         descs_set_nullable,
         step.getGroupingSetsParams(),
         step.isFinal(),
+        step.getGroupBySortDescription(),
         step.getGroupings(),
-        false,
-        step.shouldProduceResultsInOrderOfBucketNumber()
-        );
+        step.needOverflowRow(),
+        step.shouldProduceResultsInOrderOfBucketNumber());
     auto agg_node_set_null
         = AggregatingNode::createPlanNode(context->nextNodeId(), std::move(agg_step_set_null), PlanNodes{child}, node.getStatistics());
 
@@ -246,9 +261,9 @@ PlanNodePtr UnifyNullableVisitor::visitUnionNode(UnionNode & node, Void & v)
                 }
             }
 
-            if (input_type->isNullable() && !output.type->isNullable())
+            if (isNullableOrLowCardinalityNullable(input_type) && !isNullableOrLowCardinalityNullable(output.type))
             {
-                output.type = makeNullable(output.type);
+                output.type = JoinCommon::tryConvertTypeToNullable(output.type);
             }
         }
     };

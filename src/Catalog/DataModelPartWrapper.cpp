@@ -51,6 +51,16 @@ UInt64 ServerDataPart::getMutationCommitTime() const
     return part_model().has_mutation_commit_time() ? part_model().mutation_commit_time() : 0;
 }
 
+UInt64 ServerDataPart::getEndTime() const
+{
+    return part_model_wrapper->part_model->has_end_time() ? part_model_wrapper->part_model->end_time() : 0;
+}
+
+void ServerDataPart::setEndTime(UInt64 end_time) const
+{
+    const_cast<ServerDataPart *>(this)->part_model_wrapper->part_model->set_end_time(end_time);
+}
+
 bool ServerDataPart::containsExactly(const ServerDataPart & other) const
 {
     const auto & this_info = *part_model_wrapper->info;
@@ -138,6 +148,11 @@ const String & ServerDataPart::name() const { return part_model_wrapper->name; }
 const MergeTreePartition & ServerDataPart::partition() const { return part_model_wrapper->partition; }
 const std::shared_ptr<IMergeTreeDataPart::MinMaxIndex> & ServerDataPart::minmax_idx() const { return part_model_wrapper->minmax_idx; }
 
+UInt64 ServerDataPart::txnID() const
+{
+    return part_model_wrapper->txnID();
+}
+
 MutableMergeTreeDataPartCNCHPtr ServerDataPart::toCNCHDataPart(
     const MergeTreeMetaBase & storage,
     /*const std::unordered_map<UInt32, String> & id_full_paths,*/
@@ -174,9 +189,11 @@ const ImmutableDeleteBitmapPtr & ServerDataPart::getDeleteBitmap(const MergeTree
                 return delete_bitmap;
             throw Exception("No metadata for delete bitmap of part " + name(), ErrorCodes::LOGICAL_ERROR);
         }
+        
         Stopwatch watch;
         auto cache = storage.getContext()->getDeleteBitmapCache();
-        String cache_key = DeleteBitmapCache::buildKey(storage.getStorageUUID(), info().partition_id, info().min_block, info().max_block);
+        /// TODO (zuochuang.zema): how to get the value of _row_exists.
+        String cache_key = DeleteBitmapCache::buildKey(storage.getStorageUUID(), info().partition_id, info().min_block, info().max_block, 0);
         ImmutableDeleteBitmapPtr cached_bitmap;
         UInt64 cached_version = 0; /// 0 is an invalid value and acts as a sentinel
         bool hit_cache = cache->lookup(cache_key, cached_version, cached_bitmap);

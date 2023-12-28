@@ -16,6 +16,9 @@
 #include <MergeTreeCommon/MergeTreeMetaBase.h>
 
 #include <Catalog/Catalog.h>
+#include <Common/escapeForFileName.h>
+#include <Common/quoteString.h>
+#include <Common/RowExistsColumnInfo.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime.h>
@@ -34,9 +37,11 @@
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTNameTypePair.h>
 #include <Parsers/ASTPartition.h>
+#include <Parsers/ExpressionElementParsers.h>
 #include <Formats/FormatFactory.h>
 #include <Processors/Formats/InputStreamFromInputFormat.h>
 #include <Storages/AlterCommands.h>
+#include <Storages/BitEngine/BitEngineDictionaryManager.h>
 #include <Storages/MergeTree/CnchMergeTreeMutationEntry.h>
 #include <Storages/MergeTree/MergeTreeDataPartCompact.h>
 #include <Storages/MergeTree/MergeTreeDataPartInMemory.h>
@@ -49,6 +54,7 @@
 #include <Functions/IFunction.h>
 #include <QueryPlan/QueryIdHolder.h>
 #include <Parsers/queryToString.h>
+#include <Parsers/parseQuery.h>
 
 
 namespace
@@ -69,6 +75,8 @@ namespace ErrorCodes
     extern const int DIRECTORY_ALREADY_EXISTS;
     extern const int ILLEGAL_COLUMN;
     extern const int BAD_TTL_EXPRESSION;
+    extern const int CANNOT_PARSE_TEXT;
+    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
 
 void MergeTreeMetaBase::checkSampleExpression(const StorageInMemoryMetadata & metadata, bool allow_sampling_expression_not_in_primary_key)
@@ -86,6 +94,7 @@ MergeTreeMetaBase::MergeTreeMetaBase(
     const String & date_column_name,
     const MergingParams & merging_params_,
     std::unique_ptr<MergeTreeSettings> storage_settings_,
+    const String & logger_name_,
     bool require_part_metadata_,
     bool attach_,
     BrokenPartCallback broken_part_callback_)
@@ -95,15 +104,13 @@ MergeTreeMetaBase::MergeTreeMetaBase(
     , merging_params(merging_params_)
     , require_part_metadata(require_part_metadata_)
     , broken_part_callback(broken_part_callback_)
-    , log_name(table_id_.getNameForLogs())
+    , log_name(logger_name_)
     , log(&Poco::Logger::get(log_name))
     , storage_settings(std::move(storage_settings_))
     , pinned_part_uuids(std::make_shared<PinnedPartUUIDs>())
     , data_parts_by_info(data_parts_indexes.get<TagByInfo>())
     , data_parts_by_state_and_info(data_parts_indexes.get<TagByStateAndInfo>())
     , relative_data_path(relative_data_path_)
-    /// FIXME: add after supporting primary key index cache
-    // , primary_index_cache(context_->getDiskPrimaryKeyIndexCache())
 {
     const auto & settings = getSettings();
     allow_nullable_key = attach_ || settings->allow_nullable_key || settings->enable_nullable_sorting_key;
@@ -147,6 +154,11 @@ MergeTreeMetaBase::MergeTreeMetaBase(
             throw Exception("Partition key has type " + partition_key_type->getName() + ", can't be used as version", ErrorCodes::BAD_ARGUMENTS);
     }
 
+    if (metadata_.hasUniqueKey() && !attach_)
+        checkVersionColumnConstraint();
+
+    parseAndCheckForBitEngine();
+
     if (metadata_.sampling_key.definition_ast != nullptr)
     {
         /// This is for backward compatibility.
@@ -156,6 +168,8 @@ MergeTreeMetaBase::MergeTreeMetaBase(
     checkTTLExpressions(metadata_, metadata_);
 
     storage_address = fmt::format("{}", fmt::ptr(this));
+
+    setServerVwName(getSettings()->cnch_server_vw);
 }
 
 StoragePolicyPtr MergeTreeMetaBase::getStoragePolicy(StorageLocation location) const
@@ -247,8 +261,9 @@ void MergeTreeMetaBase::checkProperties(
                     + toString(i) + " is " + sorting_key_column +", not " + pk_column,
                     ErrorCodes::BAD_ARGUMENTS);
 
-            if (!primary_key_columns_set.emplace(pk_column).second)
-                throw Exception("Primary key contains duplicate columns", ErrorCodes::BAD_ARGUMENTS);
+            // for compatibility with cnch-1.4, which allows dup key in `order by`
+ //           if (!primary_key_columns_set.emplace(pk_column).second)
+ //               throw Exception("Primary key contains duplicate columns", ErrorCodes::BAD_ARGUMENTS);
 
         }
     }
@@ -568,6 +583,31 @@ MergeTreeMetaBase::AlterConversions MergeTreeMetaBase::getAlterConversionsForPar
     return result;
 }
 
+void MergeTreeMetaBase::addMutationEntry(const CnchMergeTreeMutationEntry & entry)
+{
+    std::lock_guard lock(mutations_by_version_mutex);
+    mutations_by_version.try_emplace(entry.commit_time, entry);
+}
+
+void MergeTreeMetaBase::removeMutationEntry(TxnTimestamp create_time)
+{
+    std::lock_guard lock(mutations_by_version_mutex);
+    /// Maybe erase all entries <= create_time?
+    mutations_by_version.erase(create_time);
+}
+
+Strings MergeTreeMetaBase::getPlainMutationEntries()
+{
+    Strings res;
+    std::lock_guard lock(mutations_by_version_mutex);
+    res.reserve(mutations_by_version.size());
+    for (auto const & [_, entry] : mutations_by_version)
+    {
+        res.push_back(entry.toString());
+    }
+    return res;
+}
+
 MergeTreeMetaBase::MutableDataPartPtr MergeTreeMetaBase::cloneAndLoadDataPartOnSameDisk(
     const MergeTreeMetaBase::DataPartPtr & src_part,
     const String & tmp_part_prefix,
@@ -644,7 +684,54 @@ NamesAndTypesList MergeTreeMetaBase::getVirtuals() const
         NameAndTypePair("_partition_value", getPartitionValueType()),
         NameAndTypePair("_sample_factor", std::make_shared<DataTypeFloat64>()),
         NameAndTypePair("_part_row_number", std::make_shared<DataTypeUInt64>()),
+        RowExistsColumn::ROW_EXISTS_COLUMN,
     };
+}
+
+void MergeTreeMetaBase::checkColumnsValidity(const ColumnsDescription & columns) const
+{
+    NamesAndTypesList func_columns = getInMemoryMetadataPtr()->getFuncColumns();
+
+    for (auto & column: columns.getAll())
+    {
+        /// check func columns
+        for (auto & [name, type]: func_columns)
+        {
+            if (name == column.name)
+                throw Exception("Column " + backQuoteIfNeed(column.name) + " is reserved column", ErrorCodes::ILLEGAL_COLUMN);
+        }
+
+        /// block implicit key name for MergeTree family
+        if (isMapImplicitKey(column.name))
+            throw Exception("Column " + backQuoteIfNeed(column.name) + " contains reserved prefix word", ErrorCodes::ILLEGAL_COLUMN);
+
+        if (column.type && column.type->isMap())
+        {
+            auto escape_name = escapeForFileName(column.name + getMapSeparator());
+            auto pos = escape_name.find(getMapSeparator());
+            /// The name of map column should not contain map separator, which is convenient for extracting map column name from a implicit column name.
+            if (pos + getMapSeparator().size() != escape_name.size())
+                throw Exception(
+                    ErrorCodes::ILLEGAL_COLUMN,
+                    "Map column name {} is invalid because its escaped name {} contains reserved word {}",
+                    backQuoteIfNeed(column.name),
+                    backQuoteIfNeed(escape_name),
+                    getMapSeparator());
+
+            if (storage_settings.get()->enable_compact_map_data)
+            {
+                const auto & type_map = typeid_cast<const DataTypeByteMap &>(*column.type);
+                if (type_map.getValueType()->lowCardinality())
+                {
+                    throw Exception("Column " + backQuoteIfNeed(column.name) + " compact map type not compatible with LowCardinality type, you need remove LowCardinality or disable compact map", ErrorCodes::ILLEGAL_COLUMN);
+                }
+            }
+        }
+
+        // _row_exists is reserved for DELETE mutation.
+        if (column.name == RowExistsColumn::ROW_EXISTS_COLUMN.name)
+            throw Exception("Column name " + backQuoteIfNeed(column.name) + " is reserved for DELETE mutation.", ErrorCodes::ILLEGAL_COLUMN);
+    }
 }
 
 void MergeTreeMetaBase::insertQueryIdOrThrow(const String & query_id, size_t max_queries) const
@@ -682,6 +769,25 @@ DataTypePtr MergeTreeMetaBase::getPartitionValueType() const
     return partition_value_type;
 }
 
+ASTs MergeTreeMetaBase::getPartVirtualExpr() const
+{
+    return {
+        std::make_shared<ASTIdentifier>("_part"),
+        std::make_shared<ASTIdentifier>("_partition_id"),
+        std::make_shared<ASTIdentifier>("_part_uuid"),
+        std::make_shared<ASTIdentifier>("_partition_value")};
+}
+
+Block MergeTreeMetaBase::getSampleBlockWithVirtualColumns() const
+{
+    DataTypePtr partition_value_type = getPartitionValueType();
+    return {
+        ColumnWithTypeAndName(ColumnString::create(), std::make_shared<DataTypeString>(), "_part"),
+        ColumnWithTypeAndName(ColumnString::create(), std::make_shared<DataTypeString>(), "_partition_id"),
+        ColumnWithTypeAndName(ColumnUUID::create(), std::make_shared<DataTypeUUID>(), "_part_uuid"),
+        ColumnWithTypeAndName(partition_value_type->createColumn(), partition_value_type, "_partition_value")};
+}
+
 Block MergeTreeMetaBase::getBlockWithVirtualPartColumns(const DataPartsVector & parts, bool one_part) const
 {
     DataTypePtr partition_value_type = getPartitionValueType();
@@ -705,6 +811,7 @@ Block MergeTreeMetaBase::getBlockWithVirtualPartColumns(const DataPartsVector & 
         part_column->insert(part->name);
         partition_id_column->insert(part->info.partition_id);
         part_uuid_column->insert(part->uuid);
+        // coverity[mismatched_iterator]
         Tuple tuple(part->partition.value.begin(), part->partition.value.end());
         if (has_partition_value)
             partition_value_column->insert(tuple);
@@ -784,7 +891,7 @@ MergeTreeMetaBase::MutableDataPartPtr MergeTreeMetaBase::createPart(
                 throw Exception("Create CNCH part in auxility storage is forbidden",
                     ErrorCodes::LOGICAL_ERROR);
             }
-            return std::make_shared<MergeTreeDataPartCNCH>(*this, name, part_info, volume, relative_path);
+            return std::make_shared<MergeTreeDataPartCNCH>(*this, name, part_info, volume, relative_path, parent_part);
         case MergeTreeDataPartType::UNKNOWN:
             throw Exception("Unknown type of part " + relative_path, ErrorCodes::UNKNOWN_PART_TYPE);
     }
@@ -1151,7 +1258,7 @@ SpacePtr MergeTreeMetaBase::getDestinationForMoveTTL(const TTLDescription & move
     auto policy = getStoragePolicy(location);
     if (move_ttl.destination_type == DataDestinationType::VOLUME)
     {
-        auto volume = policy->getVolumeByName(move_ttl.destination_name);
+        auto volume = policy->getVolumeByName(move_ttl.destination_name, true);
 
         if (!volume)
             return {};
@@ -1185,7 +1292,7 @@ bool MergeTreeMetaBase::isPartInTTLDestination(const TTLDescription & ttl, const
     auto policy = getStoragePolicy(IStorage::StorageLocation::MAIN);
     if (ttl.destination_type == DataDestinationType::VOLUME)
     {
-        for (const auto & disk : policy->getVolumeByName(ttl.destination_name)->getDisks())
+        for (const auto & disk : policy->getVolumeByName(ttl.destination_name, true)->getDisks())
             if (disk->getName() == part.volume->getDisk()->getName())
                 return true;
     }
@@ -1231,6 +1338,20 @@ MergeTreeMetaBase::DataPartPtr MergeTreeMetaBase::getAnyPartInPartition(
     //     return *it;
 
     return nullptr;
+}
+
+void MergeTreeMetaBase::checkVersionColumnConstraint()
+{
+    if (merging_params.partitionValueAsVersion())
+    {
+        auto partition_types = getInMemoryMetadataPtr()->partition_key.sample_block.getDataTypes();
+        if (partition_types.size() >= 1)
+        {
+            auto & type = partition_types[0];
+            if (TypeIndex::UInt64 < type->getTypeId() && type->getTypeId() <= TypeIndex::Int256)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "The type of version column is {}, it is not compatible with UInt64", type->getName());
+        }
+    }
 }
 
 void MergeTreeMetaBase::MergingParams::check(const StorageInMemoryMetadata & metadata, bool has_unique_key) const
@@ -1379,12 +1500,49 @@ String MergeTreeMetaBase::getStorageUniqueID() const
 
 void MergeTreeMetaBase::calculateColumnSizesImpl()
 {
+    Stopwatch stopwatch;
+
     column_sizes.clear();
 
     /// Take into account only committed parts
     auto committed_parts_range = getDataPartsStateRange(DataPartState::Committed);
-    for (const auto & part : committed_parts_range)
+    DataPartsVector committed_parts{committed_parts_range.begin(), committed_parts_range.end()};
+    DataPartsVector calculated_parts;
+
+    double ratio = 1.0;
+    size_t sample_number = getContext()->getSettingsRef().merge_tree_calculate_columns_size_sample;
+    if (getSettings()->enable_calculate_columns_size_with_sample == 1 && committed_parts.size() > sample_number*2)
+    {
+        calculated_parts.reserve(sample_number);
+        std::sample(committed_parts.begin(), committed_parts.end(),
+                    std::back_inserter(calculated_parts), sample_number,
+                    std::mt19937{std::random_device{}()});
+        size_t m = committed_parts.size() / sample_number;
+        ratio = m + static_cast<double>(committed_parts.size() - m * sample_number) / sample_number;
+    }
+    else
+    {
+        calculated_parts = committed_parts;
+    }
+
+    for (const auto & part : calculated_parts)
         addPartContributionToColumnSizes(part);
+
+    if (ratio > 1.0)
+    {
+        ColumnSizeByName new_column_sizes = column_sizes;
+        /// Adjust size according to the sample ratio
+        for (auto & pair : new_column_sizes)
+        {
+            pair.second.marks = pair.second.marks * ratio;
+            pair.second.data_compressed = pair.second.data_compressed * ratio;
+            pair.second.data_uncompressed = pair.second.data_uncompressed * ratio;
+        }
+
+        column_sizes = std::move(new_column_sizes);
+    }
+
+    LOG_TRACE(log, "Calculate columns size elapsed: {} ms.", stopwatch.elapsedMilliseconds());
 }
 
 
@@ -1502,6 +1660,194 @@ UInt64 MergeTreeMetaBase::getTableHashForClusterBy() const
 
     return cluster_definition_hash;
 
+}
+
+bool MergeTreeMetaBase::isBitEngineEncodeColumn(const String & name) const
+{
+    auto column = getInMemoryMetadataPtr()->getColumns().tryGetPhysical(name);
+    return column.has_value() && column->type->isBitEngineEncode();
+}
+
+ BitEngineDictionaryTableMapping MergeTreeMetaBase::parseUnderlyingDictionaryDependency(const String & mapping_str) const
+ {
+    BitEngineDictionaryTableMapping dict_dependencies;
+
+    try
+    {
+        auto parsed_map = BitEngineHelper::parseUnderlyingDictionarySetting(mapping_str);
+
+        /// turn 'db.tbl' str in parsed map into {db, tbl} string pairs
+        for (auto & entry : parsed_map)
+        {
+            String db_and_table = entry.second;
+            ParserCompoundIdentifier parser(/*table_name_with_optional_uuid*/ true);
+            ASTPtr ast = parseQuery(parser, db_and_table.data(), db_and_table.data() + db_and_table.size(), "", 0, 0);
+            auto storage_id = ast->as<ASTTableIdentifier>()->getTableId();
+
+            String db_name = storage_id.database_name.empty() ? getDatabaseName() : storage_id.getDatabaseName();
+            String table_name = storage_id.getTableName();
+            dict_dependencies[entry.first] = std::make_pair(db_name, table_name);
+        }
+    }
+    catch (Exception & e)
+    {
+        throw Exception("Parsing bitengine and underlying dictionary table mapping JSON string failed. reason: "
+            + e.message(), ErrorCodes::CANNOT_PARSE_TEXT);
+    }
+    catch (...)
+    {
+        throw Exception("Parsing bitengine and underlying dictionary table mapping JSON string failed."
+            , ErrorCodes::CANNOT_PARSE_TEXT);
+    }
+
+    return dict_dependencies;
+ }
+
+void MergeTreeMetaBase::parseAndCheckForBitEngine()
+{
+    auto metadata_snapshot = getInMemoryMetadataPtr();
+    const auto & all_columns = metadata_snapshot->getColumns();
+    auto all_physical_columns = all_columns.getAllPhysical();
+    std::for_each(all_physical_columns.begin(), all_physical_columns.end(),
+        [this](const auto & item) {
+            if (isBitEngineDataType(item.type))
+                bitengine_columns.push_back(item);
+         } );
+
+    /// Not a bitengine table, just return
+    if (bitengine_columns.empty())
+        return;
+
+    /// Now do some syntax check for a bitengine table
+    /// 1. Unique keys are not allowed for BitEngine
+    if (metadata_snapshot->hasUniqueKey())
+        throw Exception("Unique table doesn't support BitEngine!", ErrorCodes::LOGICAL_ERROR);
+
+    //// BitEngine table has two constraints:
+    /// 1. only one field in `CLUSTE BY` clause, like `CLUSTER BY slice_id`
+    /// 2. a table setting `underlying_dictionary_tables` in a format of JSON map. It's a must.
+
+    /// Now, check the 1st constraint
+    if (!metadata_snapshot->hasClusterByKey())
+        throw Exception("A BitEngine table should have `CLUSTER BY` clause, table: " + getStorageID().getFullTableName(), ErrorCodes::LOGICAL_ERROR);
+    else if (metadata_snapshot->getClusterByKey().column_names.size() != 1U)
+        throw Exception("Only 1 field is allowed in cluster by for a BitEngine table: " + getStorageID().getFullTableName(),
+            ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+
+    /// Now, parse and check the 2nd constraint:
+    /// the mapping info of bitengine table and underlying dictionary table
+    bitengine_dictionary_tables_mapping = parseUnderlyingDictionaryDependency(storage_settings.get()->underlying_dictionary_tables);
+    if (bitengine_dictionary_tables_mapping.empty())
+        throw Exception("Table has BitEngine fields but no valid dictionary table mapping settings, "\
+            "BitEngine cannot work without any dictionary table", ErrorCodes::LOGICAL_ERROR);
+
+    for (const auto & entry : bitengine_dictionary_tables_mapping)
+    {
+        if (!bitengine_columns.contains(entry.first))
+                throw Exception("In underlying_dictionary_tables setting, no column in " + entry.first + " table",
+                    ErrorCodes::NO_SUCH_COLUMN_IN_TABLE);
+    }
+}
+
+void MergeTreeMetaBase::checkSchemaForBitEngineTableImpl(const BitEngineDictionaryTableMapping  & dict_dependencies, const ContextPtr & context_) const
+{
+    auto metadata_snapshot = getInMemoryMetadataPtr();
+    if (!metadata_snapshot->hasClusterByKey())
+        throw Exception("A BitEngine table must specify CLUSTER BY clause, table: " + getStorageID().getFullTableName(), ErrorCodes::BAD_ARGUMENTS);
+
+    auto this_cluster_by_hash = metadata_snapshot->getClusterByKeyAST()->getTreeHash();
+
+    for (const auto & entry : dict_dependencies)
+    {
+        const auto & db_name = entry.second.first;
+        const auto & table_name = entry.second.second;
+        StoragePtr dict_storage = DatabaseCatalog::instance().getTable(StorageID{db_name, table_name}, context_);
+
+        if (!dict_storage)
+            throw Exception(fmt::format("Cannot get dict table {}.{}", db_name, table_name), ErrorCodes::LOGICAL_ERROR);
+
+        auto dict_cluster_by = dict_storage->getInMemoryMetadataPtr()->getClusterByKeyAST();
+        if (!dict_cluster_by)
+        {
+            throw Exception(fmt::format("dictionary table ({}.{}) has no CLUSTER BY clause",
+                db_name, table_name), ErrorCodes::LOGICAL_ERROR);
+        }
+
+        if (dict_cluster_by->getTreeHash() != this_cluster_by_hash)
+        {
+            throw Exception(fmt::format("The CLUSTER BY clause of dictionary table specified ({}.{}) is "\
+                "not same as the BitEngine table, check and keep them same", db_name, table_name),
+                ErrorCodes::LOGICAL_ERROR);
+        }
+
+        auto *dict_storage_table = dynamic_cast<MergeTreeMetaBase *>(dict_storage.get());
+        dict_storage_table->checkBitEngineConstraints();
+    }
+}
+
+void MergeTreeMetaBase::checkSchemaForBitEngineTable(const ContextPtr & context_) const
+{
+    checkSchemaForBitEngineTableImpl(bitengine_dictionary_tables_mapping, context_);
+}
+
+ConstraintsDescription MergeTreeMetaBase::getBitEngineConstraints() const
+{
+    ConstraintsDescription res_constraints;
+    auto constraints = getInMemoryMetadataPtr()->getConstraints().constraints;
+
+    std::copy_if(constraints.begin(), constraints.end(),
+        std::back_inserter(res_constraints.constraints),
+        [](const auto & cons) { return cons->getType() == ASTType::ASTBitEngineConstraintDeclaration; });
+
+    return res_constraints;
+}
+
+void MergeTreeMetaBase::checkBitEngineConstraints() const
+{
+    auto dict_table_constraints = getBitEngineConstraints();
+    if (dict_table_constraints.constraints.empty())
+        throw Exception(fmt::format("There is no BITENGINE_CONSTRAINT in dictionary table ({}.{})", getDatabaseName(), getTableName()), ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+    else if (dict_table_constraints.constraints.size() > 1)
+        throw Exception(fmt::format("There are more than one BITENGINE_CONSTRAINT in the dictionary table ({}.{})", getDatabaseName(), getTableName()), ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+}
+
+void MergeTreeMetaBase::registerBitEngineDictionaries()
+{
+    /// Not a bitengine table, just return
+    if (bitengine_columns.empty())
+        return;
+
+    auto context_v = getContext();
+    auto metadata_snapshot = getInMemoryMetadataPtr();
+
+    if (!bitengine_dictionary_manager)
+    {
+        String db_tbl = getDatabaseName() + "." + getTableName();
+        bitengine_dictionary_manager = std::make_shared<BitEngineDictionaryManager>(
+            db_tbl, context_v, metadata_snapshot->getClusterByKey().expression);
+        LOG_TRACE(log, "Successfully initilized the BitEngineDictionaryManager, now begin registering BitEngine columns");
+    }
+
+    const auto & all_columns = metadata_snapshot->getColumns();
+    for (const auto & item : bitengine_columns)
+    {
+        auto it = bitengine_dictionary_tables_mapping.find(item.name);
+        if (it == bitengine_dictionary_tables_mapping.end())
+            throw Exception("You shoud specify a dictionary table for the bitengine field: " + item.name
+                + " in settings `underlying_dictionary_tables` but there is none.", ErrorCodes::LOGICAL_ERROR);
+
+        /// There're two ways to tell the engine the BitEngine column may use String UID
+        /// - set bitengine_use_key_string = 1 in table settings, but it's for all bitengine columns
+        /// - set '+BITENGINE_KEY_STRING' in comment of table schema, like `id_map` BitMap64 BitEngine COMMENT '+BITENGINE_KEY_STRING'
+        /// Comment priority < settings
+        KeyType key_type = all_columns.isBitEngineKeyStringColumn(item.name) ? KeyType::KEY_STRING
+            : ( getSettings()->bitengine_use_key_string ? KeyType::KEY_STRING : KeyType::KEY_INTEGER);
+
+        BitEngineHelper::DictionaryDatabaseAndTable dict_table(it->second.first, it->second.second, key_type);
+        if (context_v->getServerType() == ServerType::cnch_server)
+            checkUnderlyingDictionaryTable(dict_table);
+        bitengine_dictionary_manager->addBitEngineDictionary(item.name, dict_table);
+    }
 }
 
 }

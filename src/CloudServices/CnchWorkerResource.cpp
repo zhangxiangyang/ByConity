@@ -22,7 +22,12 @@
 #include <Parsers/ParserQueryWithOutput.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/parseQuery.h>
+#include <Parsers/formatTenantDatabaseName.h>
+#include <Parsers/ASTForeignKeyDeclaration.h>
+#include <Parsers/ASTUniqueNotEnforcedDeclaration.h>
 #include <Poco/Logger.h>
+#include <Storages/ForeignKeysDescription.h>
+#include <Storages/UniqueNotEnforcedDescription.h>
 #include <Storages/IStorage.h>
 #include <Databases/DatabaseMemory.h>
 #include <Storages/StorageFactory.h>
@@ -40,12 +45,12 @@ namespace ErrorCodes
 
 void CnchWorkerResource::executeCreateQuery(ContextMutablePtr context, const String & create_query, bool skip_if_exists)
 {
+    LOG_DEBUG(&Poco::Logger::get("WorkerResource"), "start create cloud table {}", create_query);
     const char * begin = create_query.data();
     const char * end = create_query.data() + create_query.size();
     ParserQueryWithOutput parser{end};
     const auto & settings = context->getSettingsRef();
     ASTPtr ast_query = parseQuery(parser, begin, end, "CreateCloudTable", settings.max_query_size, settings.max_parser_depth);
-
     auto & ast_create_query = ast_query->as<ASTCreateQuery &>();
 
     /// set query settings
@@ -54,21 +59,23 @@ void CnchWorkerResource::executeCreateQuery(ContextMutablePtr context, const Str
 
     const auto & database_name = ast_create_query.database; // not empty.
     const auto & table_name = ast_create_query.table;
-
+    String tenant_db = formatTenantDatabaseName(database_name);
     {
         auto lock = getLock();
-        if (cloud_tables.find({database_name, table_name}) != cloud_tables.end())
+        if (cloud_tables.find({tenant_db, table_name}) != cloud_tables.end())
         {
             if (ast_create_query.if_not_exists || skip_if_exists)
                 return;
             else
-                throw Exception("Table " + database_name + "." + table_name + " already exists.", ErrorCodes::TABLE_ALREADY_EXISTS);
+                throw Exception("Table " + tenant_db + "." + table_name + " already exists.", ErrorCodes::TABLE_ALREADY_EXISTS);
         }
     }
 
     ColumnsDescription columns;
     IndicesDescription indices;
     ConstraintsDescription constraints;
+    ForeignKeysDescription foreign_keys;
+    UniqueNotEnforcedDescription unique_not_enforced;
 
     if (ast_create_query.columns_list)
     {
@@ -86,6 +93,14 @@ void CnchWorkerResource::executeCreateQuery(ContextMutablePtr context, const Str
         if (ast_create_query.columns_list->constraints)
             for (const auto & constraint : ast_create_query.columns_list->constraints->children)
                 constraints.constraints.push_back(std::dynamic_pointer_cast<ASTConstraintDeclaration>(constraint->clone()));
+
+        if (ast_create_query.columns_list->foreign_keys)
+            for (const auto & foreign_key : ast_create_query.columns_list->foreign_keys->children)
+                foreign_keys.foreign_keys.push_back(std::dynamic_pointer_cast<ASTForeignKeyDeclaration>(foreign_key->clone()));
+
+        if (ast_create_query.columns_list->unique)
+            for (const auto & unique : ast_create_query.columns_list->unique->children)
+                unique_not_enforced.unique.push_back(std::dynamic_pointer_cast<ASTUniqueNotEnforcedDeclaration>(unique->clone()));
     }
     else
         throw Exception("Incorrect CREATE query: required list of column descriptions or AS section or SELECT.", ErrorCodes::INCORRECT_QUERY);
@@ -94,6 +109,8 @@ void CnchWorkerResource::executeCreateQuery(ContextMutablePtr context, const Str
     ASTPtr new_columns = InterpreterCreateQuery::formatColumns(columns);
     ASTPtr new_indices = InterpreterCreateQuery::formatIndices(indices);
     ASTPtr new_constraints = InterpreterCreateQuery::formatConstraints(constraints);
+    ASTPtr new_foreign_keys = InterpreterCreateQuery::formatForeignKeys(foreign_keys);
+    ASTPtr new_unique_not_enforced = InterpreterCreateQuery::formatUnique(unique_not_enforced);
 
     if (ast_create_query.columns_list->columns)
         ast_create_query.columns_list->replace(ast_create_query.columns_list->columns, new_columns);
@@ -104,6 +121,12 @@ void CnchWorkerResource::executeCreateQuery(ContextMutablePtr context, const Str
     if (ast_create_query.columns_list->constraints)
         ast_create_query.columns_list->replace(ast_create_query.columns_list->constraints, new_constraints);
 
+    if (ast_create_query.columns_list->foreign_keys)
+        ast_create_query.columns_list->replace(ast_create_query.columns_list->foreign_keys, new_foreign_keys);
+
+    if (ast_create_query.columns_list->unique)
+        ast_create_query.columns_list->replace(ast_create_query.columns_list->unique, new_unique_not_enforced);
+
     /// Check for duplicates
     std::set<String> all_columns;
     for (const auto & column : columns)
@@ -113,17 +136,17 @@ void CnchWorkerResource::executeCreateQuery(ContextMutablePtr context, const Str
     }
 
     /// Table constructing
-    StoragePtr res = StorageFactory::instance().get(ast_create_query, "", context, context->getGlobalContext(), columns, constraints, false);
+    StoragePtr res = StorageFactory::instance().get(ast_create_query, "", context, context->getGlobalContext(), columns, constraints, foreign_keys, unique_not_enforced, false);
     res->startup();
 
     {
         auto lock = getLock();
-        cloud_tables.emplace(std::make_pair(database_name, table_name), res);
-        auto it = memory_databases.find(database_name);
+        cloud_tables.emplace(std::make_pair(tenant_db, table_name), res);
+        auto it = memory_databases.find(tenant_db);
         if (it == memory_databases.end())
         {
-            DatabasePtr database = std::make_shared<DatabaseMemory>(database_name, context->getGlobalContext());
-            memory_databases.insert(std::make_pair(database_name, std::move(database)));
+            DatabasePtr database = std::make_shared<DatabaseMemory>(tenant_db, context->getGlobalContext());
+            memory_databases.insert(std::make_pair(tenant_db, std::move(database)));
         }
     }
 
@@ -132,9 +155,10 @@ void CnchWorkerResource::executeCreateQuery(ContextMutablePtr context, const Str
 
 StoragePtr CnchWorkerResource::getTable(const StorageID & table_id) const
 {
+    String tenant_db = formatTenantDatabaseName(table_id.getDatabaseName());
     auto lock = getLock();
 
-    auto it = cloud_tables.find({table_id.getDatabaseName(), table_id.getTableName()});
+    auto it = cloud_tables.find({tenant_db, table_id.getTableName()});
     if (it != cloud_tables.end())
     {
         return it->second;
@@ -145,9 +169,10 @@ StoragePtr CnchWorkerResource::getTable(const StorageID & table_id) const
 
 DatabasePtr CnchWorkerResource::getDatabase(const String & database_name) const
 {
+    String tenant_db = formatTenantDatabaseName(database_name);
     auto lock = getLock();
 
-    auto it = memory_databases.find(database_name);
+    auto it = memory_databases.find(tenant_db);
     if (it != memory_databases.end())
         return it->second;
 
@@ -156,13 +181,16 @@ DatabasePtr CnchWorkerResource::getDatabase(const String & database_name) const
 
 bool CnchWorkerResource::isCnchTableInWorker(const StorageID & table_id) const
 {
+    String tenant_db = formatTenantDatabaseName(table_id.getDatabaseName());
     auto lock = getLock();
-    return cnch_tables.find({table_id.getDatabaseName(), table_id.getTableName()}) != cnch_tables.end();
+    return cnch_tables.find({tenant_db, table_id.getTableName()}) != cnch_tables.end();
 }
 
 void CnchWorkerResource::clearResource()
 {
     auto lock = getLock();
+    for (const auto & table : cloud_tables)
+        table.second->shutdown();
     cloud_tables.clear();
     memory_databases.clear();
     cnch_tables.clear();

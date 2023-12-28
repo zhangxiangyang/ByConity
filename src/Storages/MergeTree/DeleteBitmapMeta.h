@@ -15,8 +15,9 @@
 
 #pragma once
 
-#include <memory>
 #include <assert.h>
+#include <memory>
+#include <optional>
 #include <Protos/data_models.pb.h>
 #include <Storages/MergeTree/IMergeTreeDataPart_fwd.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
@@ -59,7 +60,8 @@ public:
         const MergeTreePartInfo & part_info,
         const ImmutableDeleteBitmapPtr & base_bitmap,
         const DeleteBitmapPtr & delta_bitmap,
-        UInt64 txn_id);
+        UInt64 txn_id,
+        bool force_create_base_bitmap);
 
     static std::shared_ptr<LocalDeleteBitmap> createTombstone(const MergeTreePartInfo & part_info, UInt64 txn_id)
     {
@@ -72,12 +74,12 @@ public:
             partition_id, 0, max_block, DeleteBitmapMetaType::RangeTombstone, txn_id, /*bitmap=*/nullptr);
     }
 
-    /// Clients should perfer the createXxx static factory method above
+    /// Clients should prefer the createXxx static factory method above
     LocalDeleteBitmap(const MergeTreePartInfo & part_info, DeleteBitmapMetaType type, UInt64 txn_id, DeleteBitmapPtr bitmap);
     LocalDeleteBitmap(
         const String & partition_id, Int64 min_block, Int64 max_block, DeleteBitmapMetaType type, UInt64 txn_id, DeleteBitmapPtr bitmap);
 
-    UndoResource getUndoResource(const TxnTimestamp & txn_id) const;
+    UndoResource getUndoResource(const TxnTimestamp & txn_id, UndoResourceType type = UndoResourceType::DeleteBitmap) const;
 
     bool canInlineStoreInCatalog() const;
 
@@ -85,6 +87,8 @@ public:
 
     /// only for merge task to pre-set commit ts for merged part's base bitmap
     void setCommitTs(UInt64 commit_ts) { model->set_commit_time(commit_ts); }
+
+    const DataModelDeleteBitmapPtr & getModel() const { return model; }
 
 private:
     DataModelDeleteBitmapPtr model;
@@ -100,24 +104,39 @@ class DeleteBitmapMeta
 {
 public:
     static constexpr auto kInlineBitmapMaxCardinality = 16;
+    static constexpr auto delete_files_dir = "DeleteFiles/";
+    static constexpr UInt8 delete_file_meta_format_version = 1;
+
+    static String deleteBitmapDirRelativePath(const String & partition_id);
+
+    static String deleteBitmapFileRelativePath(const Protos::DataModelDeleteBitmap & model);
 
     DeleteBitmapMeta(const MergeTreeMetaBase & storage_, const DataModelDeleteBitmapPtr & model_) : storage(storage_), model(model_) { }
+
+    ~DeleteBitmapMeta();
 
     const DataModelDeleteBitmapPtr & getModel() const { return model; }
 
     void updateCommitTime(const TxnTimestamp & commit_time)
     {
         /// do not update commit time if it has been set.
-        /// this deals with the special case for merged part, whose delta bitmaps may be committed before the base bitmap,
+        /// this deals with the special case for merged part, whose delta bitmaps PImay be committed before the base bitmap,
         /// and we explicit set the base bitmap's commit time to be smaller than all delta bitmaps
         if (model->commit_time() == 0)
             model->set_commit_time(commit_time);
     }
 
+    /**
+     * @return If it's stored on remote storage, return the relative path to the file. nullopt otherwise (inline).
+     */
+    std::optional<String> getFullRelativePath() const;
+
     void removeFile();
 
     /// PartitionID_MinBlock_MaxBlock
     String getBlockName() const;
+
+    const String & getPartitionID() const { return model->partition_id(); }
 
     bool sameBlock(const DeleteBitmapMeta & rhs) const
     {
@@ -163,6 +182,9 @@ public:
 
     UInt64 getTxnId() const { return model->txn_id(); }
 
+    UInt64 getEndTime() const;
+    DeleteBitmapMeta & setEndTime(UInt64 end_time);
+
     String getNameForLogs() const;
 
 private:
@@ -183,4 +205,5 @@ struct LessDeleteBitmapMeta
 
 void deserializeDeleteBitmapInfo(const MergeTreeMetaBase & storage, const DataModelDeleteBitmapPtr & meta, DeleteBitmapPtr & to_bitmap);
 
+String dataModelName(const Protos::DataModelDeleteBitmap & model);
 }

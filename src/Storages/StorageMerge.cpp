@@ -565,7 +565,7 @@ StorageMerge::StorageListWithLocks StorageMerge::getSelectedTables(
 
 DatabaseTablesIteratorPtr StorageMerge::getDatabaseIterator(const String & database_name, ContextPtr local_context) const
 {
-    auto database = DatabaseCatalog::instance().getDatabase(database_name);
+    auto database = DatabaseCatalog::instance().getDatabase(database_name, local_context);
 
     auto table_name_match = [this, &database_name](const String & table_name_) -> bool {
         if (source_databases_and_tables)
@@ -601,7 +601,7 @@ StorageMerge::DatabaseTablesIterators StorageMerge::getDatabaseIterators(Context
     /// database_name argument is a regexp
     else
     {
-        auto databases = DatabaseCatalog::instance().getDatabases();
+        auto databases = DatabaseCatalog::instance().getDatabases(local_context);
 
         for (const auto & db : databases)
         {
@@ -645,7 +645,7 @@ void StorageMerge::alter(
 
     StorageInMemoryMetadata storage_metadata = getInMemoryMetadata();
     params.apply(storage_metadata, local_context);
-    DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(local_context, table_id, storage_metadata);
+    DatabaseCatalog::instance().getDatabase(table_id.database_name, local_context)->alterTable(local_context, table_id, storage_metadata);
     setInMemoryMetadata(storage_metadata);
 }
 
@@ -668,7 +668,7 @@ void StorageMerge::convertingSourceStream(
         pipe_columns.emplace_back(NameAndTypePair(alias.name, alias.type));
         ASTPtr expr = std::move(alias.expression);
         auto syntax_result = TreeRewriter(local_context).analyze(expr, pipe_columns);
-        auto expression_analyzer = ExpressionAnalyzer{alias.expression, syntax_result, local_context};
+        auto expression_analyzer = ExpressionAnalyzer{expr, syntax_result, local_context};
 
         auto dag = std::make_shared<ActionsDAG>(pipe_columns);
         auto actions_dag = expression_analyzer.getActionsDAG(true, false);

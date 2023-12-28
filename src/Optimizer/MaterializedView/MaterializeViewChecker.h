@@ -31,7 +31,7 @@ namespace DB
 class MaterializedViewStepChecker : public StepVisitor<bool, ContextMutablePtr>
 {
 public:
-    static bool isSupported(const ConstQueryPlanStepPtr & step, ContextMutablePtr context)
+    static bool isSupported(const QueryPlanStepPtr & step, ContextMutablePtr context)
     {
         static MaterializedViewStepChecker visitor;
         return VisitorUtil::accept(step, visitor, context);
@@ -100,6 +100,11 @@ protected:
             if (!VisitorUtil::accept(*child, *this, context))
                 return false;
         return true;
+    }
+
+    bool visitSortingNode(SortingNode & node, ContextMutablePtr & context) override
+    {
+        return dynamic_cast<const SortingStep *>(node.getStep().get())->getLimit() == 0 && visitChildren(node, context);
     }
 
 private:

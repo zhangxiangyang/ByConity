@@ -23,6 +23,7 @@
 #include <DaemonManager/BackgroudJobExecutor.h>
 #include <DaemonManager/TargetServerCalculator.h>
 #include <DaemonManager/BGJobStatusInCatalog.h>
+#include <CloudServices/CnchCreateQueryHelper.h>
 #include <CloudServices/CnchBGThreadCommon.h>
 #include <CloudServices/CnchServerClient.h>
 #include <Protos/RPCHelpers.h>
@@ -33,7 +34,47 @@ namespace DB::DaemonManager
 {
 
 using CnchServerClientPtrs = std::vector<CnchServerClientPtr>;
-using StorageCache = LRUCache<String, IStorage>;
+struct StorageTrait
+{
+public:
+    struct Param
+    {
+        bool is_cnch_merge_tree;
+        bool is_cnch_kafka;
+        bool is_cnch_unique;
+    };
+
+    StorageTrait(Param param);
+    StorageTrait() = default;
+    bool isCnchMergeTree() const
+    {
+        return data[IS_CNCH_MERGE_TREE_FLAG];
+    }
+
+    bool isCnchKafka() const
+    {
+        return data[IS_CNCH_KAFKA_FLAG];
+    }
+
+    bool isCnchUniqueAndNeedDedup() const
+    {
+        return data[IS_CNCH_MERGE_TREE_UNIQUE_FLAG];
+    }
+
+    const std::bitset<3> & getData() const /// for testing
+    {
+        return data;
+    }
+private:
+    std::bitset<3> data;
+    static constexpr int IS_CNCH_MERGE_TREE_FLAG = 0;
+    static constexpr int IS_CNCH_KAFKA_FLAG = 1;
+    static constexpr int IS_CNCH_MERGE_TREE_UNIQUE_FLAG = 2;
+};
+
+bool operator == (const StorageTrait & lhs, const StorageTrait & rhs);
+
+using StorageTraitCache = LRUCache<String, StorageTrait>;
 using BGJobStatusInCatalog::IBGJobStatusPersistentStoreProxy;
 
 struct BGJobInfoFromServer
@@ -41,6 +82,12 @@ struct BGJobInfoFromServer
     StorageID storage_id;
     CnchBGThreadStatus status;
     String host_port;
+    bool operator == (const BGJobInfoFromServer & other) const
+    {
+        return (other.storage_id == storage_id) &&
+                (other.status == status) &&
+                (other.host_port == host_port);
+    }
 };
 
 using BGJobsFromServersFetcher = std::function<std::optional<std::unordered_multimap<UUID, BGJobInfoFromServer>>(
@@ -56,13 +103,14 @@ public:
     using DaemonJob::DaemonJob;
     void init() override;
     CnchServerClientPtr getTargetServer(const StorageID &, UInt64) const;
-    void setStorageCache(StorageCache * cache_) { cache = cache_; }
-    StorageCache * getStorageCache() { return cache; }
+    void setStorageTraitCache(StorageTraitCache * cache_) { cache = cache_; }
+    StorageTraitCache * getStorageTraitCache() { return cache; }
     void setLivenessCheckInterval(size_t interval) { liveness_check_interval = interval; }
     BackgroundJobPtr getBackgroundJob(const UUID & uuid) const;
     BGJobInfos getBGJobInfos() const;
     Result executeJobAction(const StorageID & storage_id, CnchBGThreadAction action);
-    virtual bool isTargetTable(const StoragePtr &) const { return false; }
+    /// StoragePtr for table level DaemonJobServerBGThread, StorageID for database level DaemonJobServerBGThread
+    virtual bool ifNeedDaemonJob(const StorageTrait &, const StorageID &) { return false; }
     IBackgroundJobExecutor & getBgJobExecutor() const { return *bg_job_executor; }
 
     /// for unit test
@@ -85,7 +133,7 @@ protected:
     size_t counter_for_liveness_check = 1;
     size_t liveness_check_interval = LIVENESS_CHECK_INTERVAL;
 private:
-    StorageCache * cache = nullptr;
+    StorageTraitCache * cache = nullptr;
     std::unique_ptr<IBGJobStatusPersistentStoreProxy> status_persistent_store{};
     std::unique_ptr<IBackgroundJobExecutor> bg_job_executor;
     std::unique_ptr<ITargetServerCalculator> target_server_calculator;
@@ -109,7 +157,6 @@ UpdateResult getUpdateBGJobs(
 
 bool checkIfServerDied(const std::vector<String> & alive_host_port, const String & host_port);
 std::vector<String> findAliveServers(const std::map<String, UInt64> &);
-std::set<UUID> getUUIDsFromBackgroundJobs(const BackgroundJobs & background_jobs);
 std::unordered_map<UUID, String> getAllTargetServerForBGJob(
     const BackgroundJobs & bg_jobs,
     UInt64 ts,
@@ -121,6 +168,7 @@ size_t checkLivenessIfNeed(
     Context & context,
     DaemonJobServerBGThread & daemon_job,
     BackgroundJobs & check_bg_jobs,
+    const std::set<UUID> & new_bg_jobs_uuids,
     const std::vector<String> & servers,
     BGJobsFromServersFetcher fetch_bg_jobs_from_server
 );
@@ -130,19 +178,28 @@ void runMissingAndRemoveDuplicateJob(
     BackgroundJobs &,
     const std::unordered_multimap<UUID, BGJobInfoFromServer> &);
 
-template <CnchBGThreadType T, bool (*isTargetTableF)(const StoragePtr &)>
+template <CnchBGThreadType T, bool (*ifNeedDaemonJobF)(const StorageTrait &, const StorageID &, const ContextPtr & context)>
 struct DaemonJobForCnch : public DaemonJobServerBGThread
 {
-    DaemonJobForCnch(ContextMutablePtr global_context_) : DaemonJobServerBGThread(global_context_, T) { }
-    bool isTargetTable(const StoragePtr & storage) const override { return isTargetTableF(storage); }
+    DaemonJobForCnch(ContextMutablePtr global_context_) : DaemonJobServerBGThread(std::move(global_context_), T) { }
+    bool ifNeedDaemonJob(const StorageTrait & storage_trait, const StorageID & storage_id) override { return ifNeedDaemonJobF(storage_trait, storage_id, getContext()); }
 };
 
-bool isCnchMergeTree(const StoragePtr & storage);
+bool isCnchMergeTree(const StorageTrait & , const StorageID & storage_id, const ContextPtr & context);
 
 struct DaemonJobForMergeMutate : public DaemonJobForCnch<CnchBGThreadType::MergeMutate, isCnchMergeTree>
 {
     using DaemonJobForCnch<CnchBGThreadType::MergeMutate, isCnchMergeTree>::DaemonJobForCnch;
     void executeOptimize(const StorageID & storage_id, const String & partition_id, bool enable_try, bool mutations_sync, UInt64 timeout_ms) const;
 };
+
+std::vector<BGJobInfoFromServer> findZombieJobsInServer(
+    const std::set<UUID> & new_bg_jobs_uuids,
+    BackgroundJobs & managed_job_exclude_new_job,
+    const std::unordered_multimap<UUID, BGJobInfoFromServer> & jobs_from_server);
+
+StorageTrait constructStorageTrait(ContextMutablePtr context, const String & db, const String & table, const String & create_query);
+
+bool isCnchMergeTreeOrKafka(const std::string & engine_name);
 
 } /// end namespace DB::DaemonManager

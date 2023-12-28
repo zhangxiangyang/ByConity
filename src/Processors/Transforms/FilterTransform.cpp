@@ -48,7 +48,8 @@ FilterTransform::FilterTransform(
     ExpressionActionsPtr expression_,
     String filter_column_name_,
     bool remove_filter_column_,
-    bool on_totals_)
+    bool on_totals_,
+    bool dynamic_)
     : ISimpleTransform(
             header_,
             transformHeader(header_, expression_->getActionsDAG(), filter_column_name_, remove_filter_column_),
@@ -57,6 +58,7 @@ FilterTransform::FilterTransform(
     , filter_column_name(std::move(filter_column_name_))
     , remove_filter_column(remove_filter_column_)
     , on_totals(on_totals_)
+    , dynamic(dynamic_)
 {
     transformed_header = getInputPort().getHeader();
     expression->execute(transformed_header);
@@ -106,12 +108,12 @@ void FilterTransform::transform(Chunk & chunk)
         Block block = getInputPort().getHeader().cloneWithColumns(columns);
         columns.clear();
 
-        expression->execute(block, num_rows_before_filtration);
+        expression->execute(block, chunk.getSideBlock(), num_rows_before_filtration);
 
         columns = block.getColumns();
     }
 
-    if (constant_filter_description.always_true || on_totals)
+    if ((!dynamic && constant_filter_description.always_true) || on_totals)
     {
         chunk.setColumns(std::move(columns), num_rows_before_filtration);
         removeFilterIfNeed(chunk);
@@ -208,6 +210,16 @@ void FilterTransform::transform(Chunk & chunk)
             current_column = current_column->cut(0, num_filtered_rows);
         else
             current_column = current_column->filter(*filter_and_holder.data, num_filtered_rows);
+    }
+
+    if (auto * block = chunk.getSideBlock(); block != nullptr)
+    {
+        auto side_columns = block->getColumns();
+        for (auto & col : side_columns)
+        {
+            col = col->filter(*filter_and_holder.data, num_filtered_rows);
+        }
+        block->setColumns(side_columns);
     }
 
     chunk.setColumns(std::move(columns), num_filtered_rows);

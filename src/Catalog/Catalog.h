@@ -17,24 +17,29 @@
 
 #include <map>
 #include <set>
-#include <Catalog/CatalogConfig.h>
 #include <Catalog/CatalogUtils.h>
-#include <Catalog/MetastoreProxy.h>
 #include <Catalog/DataModelPartWrapper.h>
+#include <Catalog/MetastoreProxy.h>
 #include <Core/Types.h>
-#include <CloudServices/Checkpoint.h>
+#include <Databases/Snapshot.h>
 #include <Protos/DataModelHelpers.h>
+#include <Protos/cnch_common.pb.h>
 #include <Protos/cnch_server_rpc.pb.h>
-#include <Statistics/StatisticsBase.h>
 #include <Statistics/ExportSymbols.h>
+#include <Statistics/StatisticsBase.h>
 // #include <Transaction/ICnchTransaction.h>
+#include <ResourceManagement/CommonData.h>
+#include <Storages/MergeTree/CnchMergeTreeMutationEntry.h>
+#include <Storages/MergeTree/MergeTreeDataPartCNCH_fwd.h>
+#include <Transaction/TransactionCommon.h>
 #include <Transaction/TxnTimestamp.h>
 #include <cppkafka/cppkafka.h>
+#include <Common/Configurations.h>
 #include <Common/DNSResolver.h>
 #include <Common/HostWithPorts.h>
+#include <Common/Config/MetastoreConfig.h>
 #include <common/getFQDNOrHostName.h>
-#include <Transaction/TransactionCommon.h>
-#include <ResourceManagement/CommonData.h>
+#include "Catalog/IMetastore.h"
 // #include <Access/MaskingPolicyDataModel.h>
 
 namespace DB::ErrorCodes
@@ -42,8 +47,25 @@ namespace DB::ErrorCodes
     extern const int TIMEOUT_EXCEEDED;
 } // namespace DB::ErrorCodes
 
+namespace DB
+{
+class AttachFilter;
+struct PrunedPartitions;
+}
+
 namespace DB::Catalog
 {
+
+enum class VisibilityLevel
+{
+    // all items visible to xid (commit_ts <= xid && end_ts > xid)
+    Visible,
+    // all items committed before xid, including unvisible items (end_ts <= xid)
+    Committed,
+    // all items written before xid, including intermediate uncommitted items
+    All
+};
+
 class Catalog
 {
 public:
@@ -57,9 +79,11 @@ public:
 
     using MetastoreProxyPtr = std::shared_ptr<MetastoreProxy>;
 
-    Catalog(Context & _context, CatalogConfig & config, String _name_space = "default");
+    Catalog(Context & _context, const MetastoreConfig & config, String _name_space = "default");
 
     ~Catalog() = default;
+
+    MetastoreProxy::MetastorePtr getMetastore();
 
     /// update optimizer stats
     void updateTableStatistics(const String & uuid, const std::unordered_map<StatisticsTag, StatisticsBasePtr> & data);
@@ -90,8 +114,22 @@ public:
     void removeColumnStatistics(const String & uuid, const String & column, const std::unordered_set<StatisticsTag> & tags);
     //////////////
 
-    ///database related interface
-    void createDatabase(const String & database, const UUID & uuid, const TxnTimestamp & txnID, const TxnTimestamp & ts);
+    void updateSQLBinding(const SQLBindingItemPtr data);
+
+    SQLBindings getSQLBindings();
+
+    SQLBindings getReSQLBindings(const bool & is_re_expression);
+
+    SQLBindingItemPtr getSQLBinding(const String & uuid, const bool & is_re_expression);
+
+    void removeSQLBinding(const String & uuid, const bool & is_re_expression);
+
+    /////////////////////////////
+    /// Database related API
+    /////////////////////////////
+
+    void createDatabase(const String & database, const UUID & uuid, const TxnTimestamp & txnID, const TxnTimestamp & ts,
+                        const String & create_query = "", const String & engine_name = "");
 
     DatabasePtr getDatabase(const String & database, const ContextPtr & context, const TxnTimestamp & ts = 0);
 
@@ -99,10 +137,40 @@ public:
 
     void dropDatabase(const String & database, const TxnTimestamp & previous_version, const TxnTimestamp & txnID, const TxnTimestamp & ts);
 
-    void renameDatabase(const String & from_database, const String & to_database, const TxnTimestamp & txnID, const TxnTimestamp & ts);
+    void renameDatabase(const UUID & uuid, const String & from_database, const String & to_database, const TxnTimestamp & txnID, const TxnTimestamp & ts);
 
-    ///table related interface
+    ///currently only used for materialized mysql
+    void alterDatabase(const String & alter_database, const TxnTimestamp & txnID, const TxnTimestamp & ts,
+                       const String & create_query = "", const String & engine_name = "");
+
+    /////////////////////////////
+    /// Snapshots related API
+    /////////////////////////////
+
+    /// Create snapshot in `db`, with the specified name, ts, etc.
+    /// Throws if name already exists.
+    void createSnapshot(
+        const UUID & db,
+        const String & snapshot_name,
+        const TxnTimestamp & ts,
+        int ttl_in_days,
+        UUID bind_table);
+
+    void removeSnapshot(const UUID & db, const String & snapshot_name);
+
+    /// Return snapshot if exist, nullptr otherwise.
+    SnapshotPtr tryGetSnapshot(const UUID & db, const String & snapshot_name);
+
+    /// Return all snapshots in `db`, in ascending order of snapshot time.
+    /// If `table_filter` is not null, exclude snapshot that binds to other table from the result.
+    Snapshots getAllSnapshots(const UUID & db, UUID * table_filter = nullptr);
+
+    /////////////////////////////
+    /// Table related API
+    /////////////////////////////
+
     void createTable(
+        const UUID & db_uuid,
         const StorageID & storage_id,
         const String & create_query,
         const String & virtual_warehouse,
@@ -110,7 +178,11 @@ public:
         const TxnTimestamp & ts);
 
     void dropTable(
-        const StoragePtr & storage, const TxnTimestamp & previous_version, const TxnTimestamp & txnID, const TxnTimestamp & ts);
+        const UUID & db_uuid,
+        const StoragePtr & storage,
+        const TxnTimestamp & previous_version,
+        const TxnTimestamp & txnID,
+        const TxnTimestamp & ts);
 
     void createUDF(const String & db, const String & name, const String & create_query);
 
@@ -123,18 +195,23 @@ public:
     bool isTableExists(const String & db, const String & name, const TxnTimestamp & ts = 0);
 
     void alterTable(
+        const Context & query_context,
+        const Settings & query_settings,
         const StoragePtr & storage,
         const String & new_create,
         const TxnTimestamp & previous_version,
         const TxnTimestamp & txnID,
-        const TxnTimestamp & ts);
+        const TxnTimestamp & ts,
+        const bool is_recluster);
 
 
     void renameTable(
+        const Settings & query_settings,
         const String & from_database,
         const String & from_table,
         const String & to_database,
         const String & to_table,
+        const UUID & to_db_uuid,
         const TxnTimestamp & txnID,
         const TxnTimestamp & ts);
 
@@ -156,23 +233,34 @@ public:
     /// return true if table is active, false otherwise
     bool getTableActiveness(const StoragePtr & storage, const TxnTimestamp & ts);
 
-    ///data parts related interface
-    ServerDataPartsVector getServerDataPartsInPartitions(const ConstStoragePtr & storage, const Strings & partitions, const TxnTimestamp & ts, const Context * session_context);
+    /////////////////////////////
+    /// Data parts API
+    /////////////////////////////
 
-    ServerDataPartsVector getAllServerDataParts(const ConstStoragePtr & storage, const TxnTimestamp & ts, const Context * session_context);
+    ServerDataPartsVector getServerDataPartsInPartitions(const ConstStoragePtr & storage, const Strings & partitions, const TxnTimestamp & ts, const Context * session_context, VisibilityLevel visibility = VisibilityLevel::Visible);
+
+    ServerDataPartsVector getTrashedPartsInPartitions(const ConstStoragePtr & storage, const Strings & partitions, const TxnTimestamp & ts);
+
+    ServerDataPartsVector getAllServerDataParts(const ConstStoragePtr & storage, const TxnTimestamp & ts, const Context * session_context, VisibilityLevel visibility = VisibilityLevel::Visible);
     DataPartsVector getDataPartsByNames(const NameSet & names, const StoragePtr & table, const TxnTimestamp & ts);
     DataPartsVector getStagedDataPartsByNames(const NameSet & names, const StoragePtr & table, const TxnTimestamp & ts);
-    DeleteBitmapMetaPtrVector getAllDeleteBitmaps(const StoragePtr & table, const TxnTimestamp & ts);
+    DeleteBitmapMetaPtrVector getAllDeleteBitmaps(const MergeTreeMetaBase & storage);
 
     // return table's committed staged parts. if partitions != null, ignore staged parts not belong to `partitions`.
     DataPartsVector getStagedParts(const StoragePtr & table, const TxnTimestamp & ts, const NameSet * partitions = nullptr);
+    ServerDataPartsVector getStagedServerDataParts(const StoragePtr & table, const TxnTimestamp & ts, const NameSet * partitions = nullptr);
 
-    /// (UNIQUE KEY) fetch all delete bitmaps <= ts in the given partitions
-    DeleteBitmapMetaPtrVector
-    getDeleteBitmapsInPartitions(const ConstStoragePtr & storage, const Strings & partitions, const TxnTimestamp & ts = 0);
-    /// (UNIQUE KEY) get bitmaps by keys
+    /////////////////////////////
+    /// Delete bitmaps API (UNIQUE KEY)
+    /////////////////////////////
+
+    /// fetch all delete bitmaps <= ts in the given partitions
+    DeleteBitmapMetaPtrVector getDeleteBitmapsInPartitions(const ConstStoragePtr & storage, const Strings & partitions, const TxnTimestamp & ts = 0);
+    DeleteBitmapMetaPtrVector getTrashedDeleteBitmapsInPartitions(const ConstStoragePtr & storage, const Strings & partitions, const TxnTimestamp & ts);
+
+    /// get bitmaps by keys
     DeleteBitmapMetaPtrVector getDeleteBitmapByKeys(const StoragePtr & storage, const NameSet & keys);
-    /// (UNIQUE KEY) remove bitmaps meta from KV, used by GC
+    /// remove bitmaps meta from KV, used by GC
     void removeDeleteBitmaps(const StoragePtr & storage, const DeleteBitmapMetaPtrVector & bitmaps);
 
     // V1 part commit API
@@ -185,18 +273,24 @@ public:
         const bool is_merged_parts = false,
         const bool preallocate_mode = false);
 
+    /// APIs for CncnKafka
     void getKafkaOffsets(const String & consumer_group, cppkafka::TopicPartitionList & tpl);
     cppkafka::TopicPartitionList getKafkaOffsets(const String & consumer_group, const String & kafka_topic);
     void clearOffsetsForWholeTopic(const String & topic, const String & consumer_group);
+    void setTransactionForKafkaConsumer(const UUID & uuid, const TxnTimestamp & txn_id, size_t consumer_index);
+    TxnTimestamp getTransactionForKafkaConsumer(const UUID & uuid, size_t consumer_index);
+    void clearKafkaTransactions(const UUID & uuid);
 
     void dropAllPart(const StoragePtr & storage, const TxnTimestamp & txnID, const TxnTimestamp & ts);
 
     std::vector<std::shared_ptr<MergeTreePartition>> getPartitionList(const ConstStoragePtr & table, const Context * session_context);
 
-    void getPartitionsFromMetastore(const MergeTreeMetaBase & table, PartitionMap & partition_list);
+    template<typename Map>
+    void getPartitionsFromMetastore(const MergeTreeMetaBase & table, Map & partition_list);
 
     Strings getPartitionIDs(const ConstStoragePtr & storage, const Context * session_context);
 
+    PrunedPartitions getPartitionsByPredicate(ContextPtr session_context, const ConstStoragePtr & storage, const SelectQueryInfo & query_info, const Names & column_names_to_return);
     /// dictionary related APIs
 
     void createDictionary(const StorageID & storage_id, const String & create_query);
@@ -246,6 +340,12 @@ public:
         TransactionRecord & record,
         const String & consumer_group,
         const cppkafka::TopicPartitionList & tpl);
+
+    bool setTransactionRecordStatusWithBinlog(
+        const TransactionRecord & expected_record,
+        TransactionRecord & record,
+        const String & binlog_name,
+        const std::shared_ptr<Protos::MaterializedMySQLBinlogMetadata> & binlog);
 
     /// just set transaction status to aborted
     void rollbackTransaction(TransactionRecord record);
@@ -309,6 +409,25 @@ public:
     /// return txn_id -> undo resources
     std::unordered_map<UInt64, UndoResources> getAllUndoBuffer();
 
+    class UndoBufferIterator
+    {
+    public:
+        UndoBufferIterator(IMetaStore::IteratorPtr metastore_iter, Poco::Logger * log);
+        const UndoResource & getUndoResource() const;
+        bool next();
+        bool is_valid() const /// for testing
+        {
+            return valid;
+        }
+    private:
+        IMetaStore::IteratorPtr metastore_iter;
+        std::optional<UndoResource> cur_undo_resource;
+        bool valid = false;
+        Poco::Logger * log;
+    };
+
+    UndoBufferIterator getUndoBufferIterator() const;
+
     /// get transaction records, if the records exists, we can check with the transaction coordinator to detect zombie record.
     /// the transaction record will be cleared only after all intents have been cleared and set commit time for all parts.
     /// For zombie record, the intents to be clear can be scanned from intents space with txnid. The parts can be get from undo buffer.
@@ -326,7 +445,7 @@ public:
     /// (that will eventualy fail). **NOTES: it DOES NOT belong to general cnch lock system, don't confuse.
 
     /// write a directory lock
-    bool writeFilesysLock(TxnTimestamp txn_id, const String & dir, const String & db, const String & table);
+    TxnTimestamp writeFilesysLock(TxnTimestamp txn_id, const String & dir, const String & db, const String & table);
     /// check if a directory is lock
     std::optional<FilesysLock> getFilesysLock(const String & dir);
     /// clean a directory lock
@@ -356,21 +475,33 @@ public:
     /// system tables related interface
 
     std::optional<DB::Protos::DataModelTable> getTableByID(const Protos::TableIdentifier & identifier);
-    DataModelTables getTablesByID(std::vector<std::shared_ptr<Protos::TableIdentifier>> & identifiers);
+    DataModelTables getTablesByIDs(const std::vector<std::shared_ptr<Protos::TableIdentifier>> & identifiers);
 
     DataModelDBs getAllDataBases();
 
-    DataModelTables getAllTables();
+    DataModelTables getAllTables(const String & database_name = "");
+
+    DataModelUDFs getAllUDFs(const String & prefix_name, const String & function_name);
+
+    DataModelUDFs getUDFByName(const std::unordered_set<String> & function_names);
+
+    /////////////////////////////
+    /// Trash API
+    /////////////////////////////
 
     IMetaStore::IteratorPtr getTrashTableIDIterator(uint32_t iterator_internal_batch_size);
-
-    DataModelUDFs getAllUDFs(const String &database_name, const String &function_name);
-
-    DataModelUDFs getUDFByName(const std::unordered_set<String> &function_names);
 
     std::vector<std::shared_ptr<Protos::TableIdentifier>> getTrashTableID();
 
     DataModelTables getTablesInTrash();
+
+    /// Get all versions of metadata (in commit ts order) for the given table.
+    DataModelTables getTableHistories(const String & table_uuid);
+
+    /**
+     * @return ts -> table id of trash table
+     */
+    std::map<UInt64, std::shared_ptr<Protos::TableIdentifier>> getTrashTableVersions(const String & database, const String & table);
 
     DataModelDBs getDatabaseInTrash();
 
@@ -386,9 +517,33 @@ public:
     void clearDatabaseMeta(const String & database, const UInt64 & ts);
 
     void clearTableMetaForGC(const String & database, const String & name, const UInt64 & ts);
-    void clearDataPartsMeta(const StoragePtr & table, const DataPartsVector & parts, const bool skip_part_cache = false);
-    void clearStagePartsMeta(const StoragePtr & table, const DataPartsVector & parts);
+    void clearDataPartsMeta(const StoragePtr & storage, const DataPartsVector & parts, const bool skip_part_cache = false);
+    void clearStagePartsMeta(const StoragePtr & storage, const ServerDataPartsVector & parts);
     void clearDataPartsMetaForTable(const StoragePtr & table);
+    void clearDeleteBitmapsMetaForTable(const StoragePtr & table);
+
+    /**
+     * @brief Move specified items into trash.
+     *
+     * @param skip_part_cache Evict parts caches if set to `false`.
+     */
+    void moveDataItemsToTrash(const StoragePtr & table, const TrashItems & items, bool skip_part_cache = false);
+
+    /**
+     * @brief Delete specified trashed items from catalog.
+     */
+    void clearTrashItems(const StoragePtr & table, const TrashItems & items);
+
+    /**
+     * @brief Get all trashed parts in given table.
+     *
+     * Trashed items including data parts, staged parts, and deleted bitmaps.
+     *
+     * @param limit Limit the result retured. Disabled with value `0`.
+     * @return Trashed parts.
+     */
+    TrashItems getDataItemsInTrash(const StoragePtr & storage, const size_t & limit = 0);
+
 
     /// APIs to sync data parts for preallocate mode
     std::vector<TxnTimestamp> getSyncList(const StoragePtr & table);
@@ -405,18 +560,9 @@ public:
     void removeMutation(const StorageID & storage_id, const String & mutation_name);
     Strings getAllMutations(const StorageID & storage_id);
     std::multimap<String, String> getAllMutations();
+    void fillMutationsByStorage(const StorageID & storage_id, std::map<TxnTimestamp, CnchMergeTreeMutationEntry> & out_mutations);
 
-
-    /// TODO:
-    // void addCheckpoint(const StoragePtr &, Checkpoint) { }
-    // void markCheckpoint(const StoragePtr &, Checkpoint) { }
-    // void removeCheckpoint(const StoragePtr &, Checkpoint) { }
-    Checkpoints getCheckpoints() { return {}; }
-
-    /// TODO:
-    DataPartsVector getAllDataPartsBetween(const StoragePtr &, const TxnTimestamp &, const TxnTimestamp &) { return {}; }
-
-    void setTableClusterStatus(const UUID & table_uuid, const bool clustered);
+    void setTableClusterStatus(const UUID & table_uuid, const bool clustered, const UInt64 & table_definition_hash);
     void getTableClusterStatus(const UUID & table_uuid, bool & clustered);
     bool isTableClustered(const UUID & table_uuid);
 
@@ -429,12 +575,58 @@ public:
     void setTablePreallocateVW(const UUID & table_uuid, const String vw);
     void getTablePreallocateVW(const UUID & table_uuid, String & vw);
 
+    /// APIs for MaterializedMySQL
+    std::shared_ptr<Protos::MaterializedMySQLManagerMetadata> getOrSetMaterializedMySQLManagerMetadata(const StorageID & storage_id);
+    void updateMaterializedMySQLManagerMetadata(const StorageID & storage_id, const Protos::MaterializedMySQLManagerMetadata & metadata);
+    void removeMaterializedMySQLManagerMetadata(const UUID & uuid);
+    void setMaterializedMySQLBinlogMetadata(const String & binlog_name, const Protos::MaterializedMySQLBinlogMetadata & binlog_data);
+    std::shared_ptr<Protos::MaterializedMySQLBinlogMetadata> getMaterializedMySQLBinlogMetadata(const String & binlog_name);
+    void removeMaterializedMySQLBinlogMetadata(const String & binlog_name);
+    // This API would be used for some DDL actions which need to update both manager metadata as well as binlog metadata
+    void updateMaterializedMySQLMetadataInBatch(const Strings & keys, const Strings & values, const Strings & delete_keys);
+
     /***
      * API to collect all metrics about a table
      */
-    std::unordered_map<String, PartitionFullPtr> getTablePartitionMetrics(const DB::Protos::DataModelTable & table, bool & is_ready);
-
-    std::unordered_map<String, PartitionMetricsPtr> getTablePartitionMetricsFromMetastore(const String & table_uuid);
+    /**
+     * @brief Get parts metrics (partition level) of a table.
+     */
+    std::unordered_map<String, PartitionFullPtr> getPartsInfoMetrics(const DB::Protos::DataModelTable & table, bool & is_ready);
+    /**
+     * @brief Load parts metrics (partition level) snapshots of the table from metastore.
+     * It's designed to initialize parts metrics.
+     */
+    std::unordered_map<String, std::shared_ptr<PartitionMetrics>> loadPartitionMetricsSnapshotFromMetastore(const String & table_uuid);
+    /**
+     * @brief Persistent a parts metrics (partition level) snapshot to metastore.
+     */
+    void savePartitionMetricsSnapshotToMetastore(
+        const String & table_uuid, const String & partition_id, const Protos::PartitionPartsMetricsSnapshot & snapshot);
+    /**
+     * @brief Get partition level metrics for a partition by the time `max_commit_time`.
+     * This is designed to be called when recalculation happens.
+     *
+     * @param table_uuid Target table.
+     * @param partition_id Target partition id of the table.
+     * @param max_commit_time Only the parts that committed before `max_commit_time` will take into account.
+     * @param need_abort A lambda function that quickly decide if the callee need to abort ASAP.
+     */
+    PartitionMetrics::PartitionMetricsStore getPartitionMetricsStoreFromMetastore(
+        const String & table_uuid, const String & partition_id, size_t max_commit_time, std::function<bool()> need_abort);
+    /**
+     * @brief Recalculate the trash items metrics (table level) data of a table from metastore.
+     * This is designed to be called when recalculation happens.
+     */
+    TableMetrics::TableMetricsData getTableTrashItemsMetricsDataFromMetastore(const String & table_uuid, TxnTimestamp ts);
+    /**
+     * @brief load a trash items (table level) snapshot from metastore.
+     * It's designed to initialize trash items metrics.
+     */
+    Protos::TableTrashItemsMetricsSnapshot loadTableTrashItemsMetricsSnapshotFromMetastore(const String & table_uuid);
+    /**
+     * @brief Persistent the trash items metrics (table level) snapshot of a table to metastore.
+     */
+    void saveTableTrashItemsMetricsToMetastore(const String & table_uuid, const Protos::TableTrashItemsMetricsSnapshot & snapshot);
 
     /// this is periodically called by leader server only
     void updateTopologies(const std::list<CnchServerTopology> & topologies);
@@ -445,7 +637,6 @@ public:
     std::vector<UInt64> getTrashDBVersions(const String & database);
     void undropDatabase(const String & database, const UInt64 & ts);
 
-    std::unordered_map<String, UInt64> getTrashTableVersions(const String & database, const String & table);
     void undropTable(const String & database, const String & table, const UInt64 & ts);
 
     /// Get the key of a insertion label with the KV namespace
@@ -495,17 +686,76 @@ public:
     // Strings getAllMaskingPolicyAppliedTables();
     // void dropMaskingPolicies(const Strings & masking_policy_names);
 
-    bool isHostServer(const StoragePtr & storage) const;
+    bool isHostServer(const ConstStoragePtr & storage) const;
+
+    std::pair<bool, HostWithPorts> checkIfHostServer(const StoragePtr & storage) const;
 
     void setMergeMutateThreadStartTime(const StorageID & storage_id, const UInt64 & startup_time) const;
 
     UInt64 getMergeMutateThreadStartTime(const StorageID & storage_id) const;
+
+    void setAsyncQueryStatus(const String & id, const Protos::AsyncQueryStatus & status) const;
+
+    void markBatchAsyncQueryStatusFailed(std::vector<Protos::AsyncQueryStatus> & statuses, const String & reason) const;
+
+    /// TODO(WangTao): consider add some scan/delete interfaces for ops.
+    bool tryGetAsyncQueryStatus(const String & id, Protos::AsyncQueryStatus & status) const;
+
+    std::vector<Protos::AsyncQueryStatus> getIntermidiateAsyncQueryStatuses() const;
+
+    // Interfaces to support s3 storage
+    // Delete detached parts and detached bitmaps from 'from_tbl' with `detached_part_names`.
+    // Write to `to_tbl` attached parts with `parts` and `staged_parts`
+    // Write to `to_tbl` attached bitmaps with `bitmaps`
+    void attachDetachedParts(
+        const StoragePtr & from_tbl,
+        const StoragePtr & to_tbl,
+        const Strings & detached_part_names,
+        const IMergeTreeDataPartsVector & parts,
+        const IMergeTreeDataPartsVector & staged_parts,
+        const DeleteBitmapMetaPtrVector & detached_bitmaps,
+        const DeleteBitmapMetaPtrVector & bitmaps);
+    // Delete parts from `from_tbl` with `attached_parts` and `attached_staged_parts`, write detached part meta to `to_tbl` with parts, if parts is nullptr, skip this write
+    // Delete bitmaps from `from_tbl` with `attached_bitmaps`, write detached bitmaps to `to_tbl` with `bitmaps`
+    void detachAttachedParts(
+        const StoragePtr & from_tbl,
+        const StoragePtr & to_tbl,
+        const IMergeTreeDataPartsVector & attached_parts,
+        const IMergeTreeDataPartsVector & attached_staged_parts,
+        const IMergeTreeDataPartsVector & parts,
+        const DeleteBitmapMetaPtrVector & attached_bitmaps,
+        const DeleteBitmapMetaPtrVector & bitmaps);
+    // Rename part's meta for `tbl`, from detached to active
+    // Rename delete bitmap's meta for `tbl`, from detached to active
+    void attachDetachedPartsRaw(const StoragePtr & tbl, const std::vector<String> & part_names, const std::vector<String> & bitmap_names);
+    // Rename part's meta from `from_tbl` with attached_part_names, and write to `to_uuid`'s detached parts,
+    // first element of `detached_part_metas` is detached part name, second element of `detached_part_metas` is detached part meta
+    // Rename bitmap's meta from `from_tbl` with attached_bitmap_names, and write to `to_uuid`'s detached bitmaps,
+    // first element of `detached_bitmap_metas` is detached bitmap name, second element of `detached_bitmap_metas` is detached bitmap meta
+    void detachAttachedPartsRaw(
+        const StoragePtr & from_tbl,
+        const String & to_uuid,
+        const std::vector<String> & attached_part_names,
+        const std::vector<std::pair<String, String>> & detached_part_metas,
+        const std::vector<String> & attached_bitmap_names,
+        const std::vector<std::pair<String, String>> & detached_bitmap_metas);
+    ServerDataPartsVector listDetachedParts(const MergeTreeMetaBase & storage, const AttachFilter & filter);
+
+    DeleteBitmapMetaPtrVector listDetachedDeleteBitmaps(const MergeTreeMetaBase & storage, const AttachFilter & filter);
+
+    // Access Entities
+    std::optional<AccessEntityModel> tryGetAccessEntity(EntityType type, const String & name);
+    std::vector<AccessEntityModel> getAllAccessEntities(EntityType type);
+    std::optional<String> tryGetAccessEntityName(const UUID & uuid);
+    void dropAccessEntity(EntityType type, const UUID & uuid, const String & name);
+    void putAccessEntity(EntityType type, AccessEntityModel & new_access_entity, AccessEntityModel & old_access_entity, bool replace_if_exists = true);
 
 private:
     Poco::Logger * log = &Poco::Logger::get("Catalog");
     Context & context;
     MetastoreProxyPtr meta_proxy;
     const String name_space;
+    String topology_key;
 
     UInt32 max_commit_size_one_batch {2000};
     std::unordered_map<UUID, std::shared_ptr<std::mutex>> nhut_mutex;
@@ -520,7 +770,9 @@ private:
     StoragePtr createTableFromDataModel(const Context & session_context, const Protos::DataModelTable & data_model);
     void detachOrAttachTable(const String & db, const String & name, const TxnTimestamp & ts, bool is_detach);
     DataModelPartPtrVector getDataPartsMetaFromMetastore(
-        const ConstStoragePtr & storage, const Strings & required_partitions, const Strings & full_partitions, const TxnTimestamp & ts);
+        const ConstStoragePtr & storage, const Strings & required_partitions, const Strings & full_partitions, const TxnTimestamp & ts, bool from_trash = false);
+    DeleteBitmapMetaPtrVector getDeleteBitmapsInPartitionsImpl(
+        const ConstStoragePtr & storage, const Strings & partitions, const TxnTimestamp & ts, bool from_trash = false);
     void detachOrAttachDictionary(const String & db, const String & name, bool is_detach);
     void moveTableIntoTrash(
         Protos::DataModelTable & table,
@@ -575,7 +827,7 @@ private:
         const ConstStoragePtr & storage,
         const String & meta_prefix,
         const Strings & partitions,
-        const Strings & full_partitions,
+        const Strings & full_partitions_,
         const std::function<T(const String &)> & create_func,
         const TxnTimestamp & ts,
         UInt32 time_out_ms = 0)
@@ -586,11 +838,12 @@ private:
         String table_uuid = UUIDHelpers::UUIDToString(storage->getStorageID().uuid);
         UInt64 timestamp = ts.toUInt64();
 
-        std::vector<String> request_partitions;
+        std::set<String, partition_comparator> request_partitions;
+        std::set<String, partition_comparator> full_partitions;
         for (const auto & partition : partitions)
-            request_partitions.emplace_back(partition);
-
-        std::sort(request_partitions.begin(), request_partitions.end(), partition_comparator{});
+            request_partitions.insert(partition);
+        for (const auto & partition : full_partitions_)
+            full_partitions.insert(partition);
 
         auto plist_start = full_partitions.begin();
         auto plist_end = full_partitions.end();
@@ -676,5 +929,6 @@ void remove_not_exist_items(std::vector<T> & items_to_write, std::vector<size_t>
 }
 
 using CatalogPtr = std::shared_ptr<Catalog>;
+void notifyOtherServersOnAccessEntityChange(const Context & context, EntityType type, const String & tenanted_name, const UUID & uuid, Poco::Logger * log);
 void fillUUIDForDictionary(DB::Protos::DataModelDictionary &);
 }

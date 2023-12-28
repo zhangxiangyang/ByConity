@@ -23,7 +23,20 @@ inline bool functionIsInOrGlobalInOperator(const std::string & name)
 
 inline bool functionIsLikeOperator(const std::string & name)
 {
-    return name == "like" || name == "ilike" || name == "notLike" || name == "notILike";
+    if (name.size() < 4)
+        return false;
+    if (name.substr(name.size() - 3) != "ike")
+        return false;
+    return name == "like" || name == "ilike" || name == "notLike" || name == "notILike" || name == "rlike";
+}
+
+inline bool functionIsEscapeLikeOperator(const std::string & name)
+{
+    if (name.size() < 10)
+        return false;
+    if (name.substr(name.size() - 4) != "Like")
+        return false;
+    return name == "escapeLike" || name == "escapeILike" || name == "escapeNotLike" || name == "escapeNotILike";
 }
 
 inline bool functionIsJoinGet(const std::string & name)

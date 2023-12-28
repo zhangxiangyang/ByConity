@@ -15,22 +15,24 @@
 
 #pragma once
 
+#include <Catalog/DataModelPartWrapper_fwd.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/WorkerGroupHandle.h>
+#include <Storages/DataPart_fwd.h>
 #include <Storages/IStorage.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH_fwd.h>
-#include <Storages/Hive/HiveDataPart_fwd.h>
-#include <Catalog/DataModelPartWrapper_fwd.h>
 #include <Common/ConsistentHashUtils/ConsistentHashRing.h>
+#include "Storages/Hive/HiveFile/IHiveFile_fwd.h"
 
 namespace DB
 {
-
 using WorkerList = std::vector<String>;
 using ServerAssignmentMap = std::unordered_map<String, ServerDataPartsVector>;
-using HivePartsAssignMap = std::unordered_map<String, HiveDataPartsCNCHVector>;
+using FilePartsAssignMap = std::unordered_map<String, FileDataPartsCNCHVector>;
 using AssignmentMap = std::unordered_map<String, MergeTreeDataPartsCNCHVector>;
 using BucketNumbersAssignmentMap = std::unordered_map<String, std::set<Int64>>;
+
+using HivePartsAssignMap = std::unordered_map<String, HiveFiles>;
 
 struct BucketNumberAndServerPartsAssignment
 {
@@ -39,12 +41,20 @@ struct BucketNumberAndServerPartsAssignment
 };
 
 // the hive has different allocate logic, thus separate it.
-HivePartsAssignMap assignCnchHiveParts(const WorkerGroupHandle & worker_group, const HiveDataPartsCNCHVector & parts);
+FilePartsAssignMap assignCnchFileParts(const WorkerGroupHandle & worker_group, const FileDataPartsCNCHVector & parts);
+HivePartsAssignMap assignCnchHiveParts(const WorkerGroupHandle & worker_group, const HiveFiles & parts);
 
 template <typename DataPartsCnchVector>
 std::unordered_map<String, DataPartsCnchVector> assignCnchParts(const WorkerGroupHandle & worker_group, const DataPartsCnchVector & parts);
 
-bool isCnchBucketTable(const ContextPtr & context, const IStorage & storage, const ServerDataPartsVector & parts);
+/**
+ * splitCnchParts will split server parts into bucketed parts and leftover server parts.
+ * This is useful for partially clustered tables so that parts are assigned to their corresponding
+ * workers for multiple queries in order to prevent frequent cache misses.
+ */
+std::pair<ServerDataPartsVector, ServerDataPartsVector>
+splitCnchParts(const ContextPtr & context, const IStorage & storage, const ServerDataPartsVector & parts);
+void moveBucketTablePartsToAssignedParts(std::unordered_map<String, ServerDataPartsVector> & assigned_map, ServerDataPartsVector & bucket_parts, const WorkerList & workers, std::set<Int64> required_bucket_numbers = {});
 BucketNumberAndServerPartsAssignment assignCnchPartsForBucketTable(const ServerDataPartsVector & parts, WorkerList workers, std::set<Int64> required_bucket_numbers = {});
 
 }

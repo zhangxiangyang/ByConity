@@ -16,6 +16,7 @@
 #pragma once
 
 #include <Parsers/IAST.h>
+#include <QueryPlan/TableScanStep.h>
 #include <Storages/IStorage_fwd.h>
 
 namespace DB
@@ -25,10 +26,13 @@ namespace DB
 class ASTTableColumnReference : public IAST
 {
 public:
-    StoragePtr storage;
+    const IStorage * storage;
+    // the node id of the TableScanStep, used to identify different occurrence of a same table in self-join cases.
+    UInt32 unique_id;
     String column_name;
 
-    ASTTableColumnReference(StoragePtr storage_, String column_name_) : storage(std::move(storage_)), column_name(std::move(column_name_))
+    ASTTableColumnReference(const IStorage * storage_, UInt32 unique_id_, String column_name_)
+        : storage(storage_), unique_id(unique_id_), column_name(std::move(column_name_))
     {
     }
 
@@ -38,6 +42,8 @@ public:
 
     ASTType getType() const override { return ASTType::ASTTableColumnReference; }
 
-    ASTPtr clone() const override { return std::make_shared<ASTTableColumnReference>(storage, column_name); }
+    ASTPtr clone() const override { return std::make_shared<ASTTableColumnReference>(storage, unique_id, column_name); }
+
+    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 }

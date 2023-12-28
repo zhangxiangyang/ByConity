@@ -74,9 +74,12 @@ void StorageCnchKafka::drop()
     auto cnch_catalog = getContext()->getCnchCatalog();
     const String & group = getGroupForBytekv();
 
-    LOG_INFO(log, "Clear offsets for group '{}' before drop table: {}", group, getStorageID().getFullTableName());
+    LOG_INFO(log, "Clear all offsets in catalog for group '{}' before dropping table: {}", group, getStorageID().getFullTableName());
     for (const auto & topic : getTopics())
         cnch_catalog->clearOffsetsForWholeTopic(topic, group);
+
+    LOG_INFO(log, "Clear active transactions of consumers in catalog before dropping table {}", getStorageID().getFullTableName());
+    cnch_catalog->clearKafkaTransactions(getStorageUUID());
 }
 
 void StorageCnchKafka::checkAlterIsPossible(const AlterCommands & commands, ContextPtr) const
@@ -111,7 +114,7 @@ void StorageCnchKafka::alter(const AlterCommands & commands, ContextPtr local_co
     if (kafka_table_is_active)
     {
         LOG_TRACE(log, "Stop consumption before altering table {}", full_name);
-        daemon_manager->controlDaemonJob(getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Stop);
+        daemon_manager->controlDaemonJob(getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Stop, local_context->getCurrentQueryId());
     }
 
     SCOPE_EXIT({
@@ -120,7 +123,7 @@ void StorageCnchKafka::alter(const AlterCommands & commands, ContextPtr local_co
             LOG_TRACE(log, "Restart consumption no matter if ALTER succ for table {}", full_name);
             try
             {
-                daemon_manager->controlDaemonJob(getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Start);
+                daemon_manager->controlDaemonJob(getStorageID(), CnchBGThreadType::Consumer, CnchBGThreadAction::Start, local_context->getCurrentQueryId());
             }
             catch (...)
             {
@@ -136,7 +139,7 @@ void StorageCnchKafka::alter(const AlterCommands & commands, ContextPtr local_co
     StorageInMemoryMetadata old_metadata = getInMemoryMetadata();
 
     TransactionCnchPtr txn = local_context->getCurrentTransaction();
-    auto action = txn->createAction<DDLAlterAction>(shared_from_this());
+    auto action = txn->createAction<DDLAlterAction>(shared_from_this(), local_context->getSettingsRef(), local_context->getCurrentQueryId());
     auto & alter_act = action->as<DDLAlterAction &>();
     alter_act.setMutationCommands(commands.getMutationCommands(
         old_metadata, false, local_context));

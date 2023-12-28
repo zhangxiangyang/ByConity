@@ -15,6 +15,7 @@
 
 #include <Core/Types.h>
 #include <Optimizer/CardinalityEstimate/JoinEstimator.h>
+#include <Optimizer/PredicateUtils.h>
 
 namespace DB
 {
@@ -22,9 +23,10 @@ PlanNodeStatisticsPtr JoinEstimator::estimate(
     PlanNodeStatisticsPtr & opt_left_stats,
     PlanNodeStatisticsPtr & opt_right_stats,
     const JoinStep & join_step,
-    bool enable_pk_fk,
+    Context & context,
     bool is_left_base_table,
-    bool is_right_base_table)
+    bool is_right_base_table,
+    const InclusionDependency & inclusion_dependency)
 {
     if (!opt_left_stats || !opt_right_stats)
     {
@@ -39,7 +41,7 @@ PlanNodeStatisticsPtr JoinEstimator::estimate(
 
     ASTTableJoin::Kind kind = join_step.getKind();
 
-    return computeCardinality(left_stats, right_stats, left_keys, right_keys, kind, enable_pk_fk, is_left_base_table, is_right_base_table);
+    return computeCardinality(left_stats, right_stats, left_keys, right_keys, kind, context, is_left_base_table, is_right_base_table, join_step.getFilter(), inclusion_dependency);
 }
 
 PlanNodeStatisticsPtr JoinEstimator::computeCardinality(
@@ -48,9 +50,11 @@ PlanNodeStatisticsPtr JoinEstimator::computeCardinality(
     const Names & left_keys,
     const Names & right_keys,
     ASTTableJoin::Kind kind,
-    bool enable_pk_fk,
+    Context & context,
     bool is_left_base_table,
-    bool is_right_base_table)
+    bool is_right_base_table,
+    ConstASTPtr filter,
+    const InclusionDependency & inclusion_dependency)
 {
     UInt64 left_rows = left_stats.getRowCount();
     UInt64 right_rows = right_stats.getRowCount();
@@ -80,7 +84,7 @@ PlanNodeStatisticsPtr JoinEstimator::computeCardinality(
             join_output_statistics[item.first] = item.second->applySelectivity(left_rows, 1);
         }
 
-        return std::make_shared<PlanNodeStatistics>(join_card, join_output_statistics);
+        return std::make_shared<PlanNodeStatistics>(join_card, std::move(join_output_statistics));
     }
 
     // inner/left/right/full join
@@ -108,6 +112,28 @@ PlanNodeStatisticsPtr JoinEstimator::computeCardinality(
         // join output cardinality and join output column statistics for every join key
         UInt64 pre_key_join_card;
         std::unordered_map<String, SymbolStatisticsPtr> pre_key_join_output_statistics;
+        bool enable_pk_fk = context.getSettingsRef().enable_pk_fk;
+        bool enable_real_pk_fk = context.getSettingsRef().enable_real_pk_fk;
+
+        auto match_real_pk_fk = [&](const String & pk_name, const String & fk_name) -> bool
+        {
+            if (inclusion_dependency.empty())
+                return false;
+
+            auto pk_iter= inclusion_dependency.find(pk_name);
+            auto fk_iter = inclusion_dependency.find(fk_name);
+            if (pk_iter == inclusion_dependency.end() || fk_iter == inclusion_dependency.end())
+                return false;
+            if (fk_iter->second.first && !pk_iter->second.first) // check type of fk/pk.
+            {
+                if (fk_iter->second.second == pk_iter->second.second) // check ref_original_pk_name with original_pk_name.
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+
 
         // case 1 : left join key equals to right join key. (self-join)
         if (left_db_table_column == right_db_table_column)
@@ -117,12 +143,13 @@ PlanNodeStatisticsPtr JoinEstimator::computeCardinality(
         }
 
         // case 2 : PK join FK
-        else if (enable_pk_fk && matchPKFK(left_rows, right_rows, left_ndv, right_ndv))
+        else if ((enable_pk_fk && matchPKFK(left_rows, right_rows, left_ndv, right_ndv)) || (enable_real_pk_fk && match_real_pk_fk(left_key, right_key)))
         {
             pre_key_join_card = computeCardinalityByFKPK(
                 right_rows,
                 right_ndv,
                 left_ndv,
+                context.getSettingsRef().pk_selectivity,
                 right_stats,
                 left_stats,
                 right_key_stats,
@@ -135,12 +162,13 @@ PlanNodeStatisticsPtr JoinEstimator::computeCardinality(
         }
 
         // case 3 : FK join PK
-        else if (enable_pk_fk && matchFKPK(left_rows, right_rows, left_ndv, right_ndv))
+        else if ((enable_pk_fk && matchFKPK(left_rows, right_rows, left_ndv, right_ndv)) || (enable_real_pk_fk && match_real_pk_fk(right_key, left_key)))
         {
             pre_key_join_card = computeCardinalityByFKPK(
                 left_rows,
                 left_ndv,
                 right_ndv,
+                context.getSettingsRef().pk_selectivity,
                 left_stats,
                 right_stats,
                 left_key_stats,
@@ -169,11 +197,12 @@ PlanNodeStatisticsPtr JoinEstimator::computeCardinality(
         if (pre_key_join_card <= join_card)
         {
             join_card = pre_key_join_card;
-            join_output_statistics = pre_key_join_output_statistics;
+            join_output_statistics.swap(pre_key_join_output_statistics);
         }
     }
 
-    if (all_unknown_stat)
+    // not cross join and can't estimate
+    if (all_unknown_stat && !left_keys.empty())
         return nullptr;
 
     // Adjust the number of output rows by join kind.
@@ -204,6 +233,14 @@ PlanNodeStatisticsPtr JoinEstimator::computeCardinality(
     }
 
     // TODO@lichengxian update statistics for join filters.
+    if (context.getSettingsRef().stats_estimator_join_filter_selectivity != 1 && filter && !PredicateUtils::isTruePredicate(filter))
+    {
+        join_card *= context.getSettingsRef().stats_estimator_join_filter_selectivity;
+        for (auto & col : join_output_statistics)
+        {
+            col.second = col.second->applySelectivity(context.getSettingsRef().stats_estimator_join_filter_selectivity);
+        }
+    }
 
     return std::make_shared<PlanNodeStatistics>(join_card, join_output_statistics);
 }
@@ -268,6 +305,7 @@ UInt64 JoinEstimator::computeCardinalityByFKPK(
     UInt64 fk_rows,
     UInt64 fk_ndv,
     UInt64 pk_ndv,
+    double pk_selectivity,
     PlanNodeStatistics & fk_stats,
     PlanNodeStatistics & pk_stats,
     SymbolStatistics & fk_key_stats,
@@ -287,13 +325,6 @@ UInt64 JoinEstimator::computeCardinalityByFKPK(
     {
         join_card = fk_rows;
     }
-
-    if (is_fk_base_table && !is_pk_base_table)
-    {
-        join_card = join_card * 0.5;
-    }
-
-    // update output statistics
 
     // FK side all match;
     if (fk_ndv <= pk_ndv)
@@ -368,6 +399,11 @@ UInt64 JoinEstimator::computeCardinalityByFKPK(
         }
     }
 
+    if (is_fk_base_table && !is_pk_base_table)
+    {
+        join_card = join_card * pk_selectivity;
+    }
+    
     return join_card;
 }
 

@@ -267,7 +267,7 @@ CREATE TABLE [IF NOT EXISTS] [db.]table_name [ON CLUSTER cluster]
 ) ENGINE = MergeTree()
 ORDER BY expr
 [PARTITION BY expr]
-[CLUSTER BY expr INTO <TOTAL_BUCKET_NUMBER> BUCKETS [SPLIT_NUMBER <SPLIT_NUMBER_VALUE>] [WITH_RANGE] ]
+[CLUSTER BY [EXPRESSION <expr>] expr INTO <TOTAL_BUCKET_NUMBER> BUCKETS [SPLIT_NUMBER <SPLIT_NUMBER_VALUE>] [WITH_RANGE] ]
 [PRIMARY KEY expr]
 [SAMPLE BY expr]
 [TTL expr [DELETE|TO DISK 'xxx'|TO VOLUME 'xxx'], ...]
@@ -554,7 +554,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         /// Allow implicit {uuid} macros only for zookeeper_path in ON CLUSTER queries
         bool is_on_cluster = args.getLocalContext()->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
         bool is_replicated_database = args.getLocalContext()->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY &&
-                                      DatabaseCatalog::instance().getDatabase(args.table_id.database_name)->getEngineName() == "Replicated";
+                                      DatabaseCatalog::instance().getDatabase(args.table_id.database_name, args.getLocalContext())->getEngineName() == "Replicated";
         bool allow_uuid_macro = is_on_cluster || is_replicated_database || args.query.attach;
 
         /// Unfold {database} and {table} macro on table creation, so table can be renamed.
@@ -613,7 +613,6 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         cnch_table_name = engine_args[arg_num + 1]->as<ASTIdentifier &>().name();
 
         arg_num += 2;
-        engine_args.erase(engine_args.begin(), engine_args.begin() + 2);
     }
 
     /// This merging param maybe used as part of sorting key
@@ -775,6 +774,14 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             for (auto & constraint : args.query.columns_list->constraints->children)
                 metadata.constraints.constraints.push_back(constraint);
 
+        if (args.query.columns_list && args.query.columns_list->foreign_keys)
+            for (auto & foreign_key : args.query.columns_list->foreign_keys->children)
+                metadata.foreign_keys.foreign_keys.push_back(foreign_key);
+
+        if (args.query.columns_list && args.query.columns_list->unique)
+            for (auto & unique_key : args.query.columns_list->unique->children)
+                metadata.unique_not_enforced.unique.push_back(unique_key);
+
         auto column_ttl_asts = args.columns.getColumnTTLs();
         for (const auto & [name, ast] : column_ttl_asts)
         {
@@ -863,7 +870,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         if (merging_params.mode != MergeTreeMetaBase::MergingParams::Ordinary || (!is_cnch && !is_cloud))
             throw Exception("Only CnchMergeTree and CloudMergeTree support UNIQUE KEY", ErrorCodes::BAD_ARGUMENTS);
 
-        if (engine_args.size() > 0)
+        if (arg_num < arg_cnt)
         {
             if (!engine_args.back()->as<ASTIdentifier>() && !engine_args.back()->as<ASTFunction>())
                 throw Exception("Version column must be identifier or function expression", ErrorCodes::BAD_ARGUMENTS);
@@ -895,7 +902,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         throw Exception("Wrong number of engine arguments.", ErrorCodes::BAD_ARGUMENTS);
 
     /// In ANSI mode, allow_nullable_key must be true
-    if (args.getLocalContext()->getSettingsRef().dialect_type == DialectType::ANSI)
+    if (args.getLocalContext()->getSettingsRef().dialect_type != DialectType::CLICKHOUSE)
     {
         // If user sets allow_nullable_key=0.
         if (storage_settings->allow_nullable_key.changed && !storage_settings->allow_nullable_key.value)

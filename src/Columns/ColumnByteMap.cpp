@@ -55,7 +55,7 @@ ColumnByteMap::ColumnByteMap(MutableColumnPtr && key_column_, MutableColumnPtr &
     :key_column(std::move(key_column_)), value_column(std::move(value_column_))
 {
     if (!key_column->empty() || !value_column->empty())
-       throw Exception("Not empty key, value passed to ColumnByteMap, but no offsets passed " + toString(key_column_->size()) + " : " + toString(value_column_->size()),
+       throw Exception("Not empty key, value passed to ColumnByteMap, but no offsets passed " + toString(key_column->size()) + " : " + toString(value_column->size()),
                ErrorCodes::BAD_ARGUMENTS);
     offsets = ColumnOffsets::create();
 }
@@ -541,7 +541,8 @@ ColumnPtr ColumnByteMap::index(const IColumn & indexes, size_t limit) const
     return ColumnByteMap::create(key_index_column, value_index_column);
 }
 
-void ColumnByteMap::getPermutation([[maybe_unused]] bool reverse,
+void ColumnByteMap::getPermutation([[maybe_unused]] PermutationSortDirection direction,
+                               [[maybe_unused]] PermutationSortStability stability,
                                [[maybe_unused]] size_t limit,
                                [[maybe_unused]] int nan_direction_hint,
                                [[maybe_unused]] Permutation & res) const
@@ -549,7 +550,8 @@ void ColumnByteMap::getPermutation([[maybe_unused]] bool reverse,
     throw Exception("ColumnByteMap::getPermutation not implemented", ErrorCodes::NOT_IMPLEMENTED);
 }
 
-void ColumnByteMap::updatePermutation(bool, size_t, int, IColumn::Permutation &, EqualRanges &) const
+void ColumnByteMap::updatePermutation(PermutationSortDirection /* direction */, PermutationSortStability /* stability */,
+                            size_t /* limit */, int /* nan_direction_hint */, Permutation & /* res */, EqualRanges & /* equal_ranges */) const
 {
     throw Exception("ColumnByteMap::updatePermutation not implemented", ErrorCodes::NOT_IMPLEMENTED);
 }
@@ -1210,22 +1212,27 @@ void ColumnByteMap::constructAllImplicitColumns(
  * __map__%27key%27 was accumulated.
  */
 void ColumnByteMap::fillByExpandedColumns(
-    const DataTypeByteMap & map_type, const std::map<String, std::pair<size_t, const IColumn *>> & impl_key_values)
+    const DataTypeByteMap & map_type, const std::map<String, std::pair<size_t, const IColumn *>> & impl_key_values, size_t rows)
 {
     // Append to ends of this ColumnByteMap
     if (impl_key_values.empty())
-        return;
-
-    if (impl_key_values.begin()->second.second->size() < impl_key_values.begin()->second.first)
     {
-        throw Exception(
-            "MAP implicit key size is slow than offset " + toString(impl_key_values.begin()->second.second->size()) + " "
-                + toString(impl_key_values.begin()->second.first),
-            ErrorCodes::LOGICAL_ERROR);
+        // Insert default values
+        insertManyDefaults(rows);
+        return;
     }
 
-    size_t rows = impl_key_values.begin()->second.second->size() - impl_key_values.begin()->second.first;
-
+    for (auto it = impl_key_values.begin(); it != impl_key_values.end(); ++it)
+    {
+        if (it->second.first + rows != it->second.second->size())
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "MAP implicit key size is not match required rows, key: {}, offset: {}, size: {}, required rows: {}",
+                it->first,
+                it->second.first,
+                it->second.second->size(),
+                rows);
+    }
 
     IColumn & key_col = getKey();
     IColumn & value_col = getValue();

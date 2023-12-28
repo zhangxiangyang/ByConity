@@ -32,14 +32,16 @@ public:
         const MergeTreePartInfo & info_,
         const VolumePtr & volume_,
         const std::optional<String> & relative_path_ = {},
-        const IMergeTreeDataPart * parent_part_ = nullptr);
+        const IMergeTreeDataPart * parent_part_ = nullptr,
+        const UUID& part_id = UUIDHelpers::Nil);
 
     MergeTreeDataPartCNCH(
         const MergeTreeMetaBase & storage_,
         const String & name_,
         const VolumePtr & volume_,
         const std::optional<String> & relative_path_ = {},
-        const IMergeTreeDataPart * parent_part_ = nullptr);
+        const IMergeTreeDataPart * parent_part_ = nullptr,
+        const UUID& part_id = UUIDHelpers::Nil);
 
     MergeTreeReaderPtr getReader(
         const NamesAndTypesList & columns_to_read,
@@ -48,8 +50,10 @@ public:
         UncompressedCache * uncompressed_cache,
         MarkCache * mark_cache,
         const MergeTreeReaderSettings & reader_settings_,
+        MergeTreeIndexExecutor * index_executor,
         const ValueSizeMap & avg_value_size_hints,
-        const ReadBufferFromFileBase::ProfileCallback & profile_callback) const override;
+        const ReadBufferFromFileBase::ProfileCallback & profile_callback,
+        const ProgressCallback & internal_progress_cb) const override;
 
     MergeTreeWriterPtr getWriter(
         const NamesAndTypesList & columns_list,
@@ -57,7 +61,8 @@ public:
         const std::vector<MergeTreeIndexPtr> & indices_to_recalc,
         const CompressionCodecPtr & default_codec_,
         const MergeTreeWriterSettings & writer_settings,
-        const MergeTreeIndexGranularity & computed_index_granularity) const override;
+        const MergeTreeIndexGranularity & computed_index_granularity,
+        const BitmapBuildInfo & bitmap_build_info) const override;
 
     bool operator < (const MergeTreeDataPartCNCH & r) const;
     bool operator > (const MergeTreeDataPartCNCH & r) const;
@@ -66,6 +71,8 @@ public:
     void fromLocalPart(const IMergeTreeDataPart & local_part);
 
     bool isStoredOnDisk() const override { return true; }
+
+    bool isStoredOnRemoteDisk() const override { return true; }
 
     bool supportsVerticalMerge() const override { return true; }
 
@@ -81,14 +88,31 @@ public:
 
     UniqueKeyIndexPtr getUniqueKeyIndex() const override;
 
-    /// @param is_unique_new_part whether it's a part of unique table which has not been deduplicated
-    /// For unique table, in normal case, the new part doesn't have delete_bitmap until it executes dedup action.
-    /// But when the part has delete_flag info, delete_bitmap represent the delete_flag info which leads to that new part has delete_bitmap.
-    const ImmutableDeleteBitmapPtr & getDeleteBitmap(bool is_unique_new_part = false) const override;
+    String getFullRelativePath() const override;
+
+    String getFullPath() const override;
+
+    /// @param allow_null whether allow delete bitmap to be nullptr
+    /// There are following cases that allow delete bitmap to be nullptr:
+    /// 1. For new part of unique table, it's valid if its delete_bitmap_metas is empty
+    /// 2. Detach commands can force detach parts even if the delete bitmap of part is broken.
+    /// 3. Repair part command
+    /// DELETE mutation is supported by adding a implicit column _row_exists,
+    /// and we combine the original delete bitmap and _row_exists when data processing.
+    const ImmutableDeleteBitmapPtr & getDeleteBitmap(bool allow_null = false) const override;
 
     virtual void projectionRemove(const String & parent_to, bool keep_shared_data) const override;
 
+    void preload(UInt64 preload_level, ThreadPool & pool, UInt64 submit_ts) const;
+    void dropDiskCache(ThreadPool & pool, bool drop_vw_disk_cache = false) const;
+
+    void setColumnsPtr(const NamesAndTypesListPtr & new_columns_ptr) override {columns_ptr = new_columns_ptr;}
 private:
+    /// See #getDeleteBitmap
+    const ImmutableDeleteBitmapPtr & getCombinedDeleteBitmapForUniqueTable(bool allow_null = false) const;
+    const ImmutableDeleteBitmapPtr & getCombinedDeleteBitmapForNormalTable(bool allow_null = false) const;
+
+    void combineWithRowExists(DeleteBitmapPtr & bitmap) const;
 
     bool isDeleted() const;
 
@@ -99,6 +123,7 @@ private:
     MergeTreeDataPartChecksums::FileChecksums loadPartDataFooter() const;
 
     ChecksumsPtr loadChecksums(bool require) override;
+    ChecksumsPtr loadChecksumsForPart(bool follow_part_chain);
 
     UniqueKeyIndexPtr loadUniqueKeyIndex() override;
 
@@ -112,8 +137,18 @@ private:
     void loadMetaInfoFromBuffer(ReadBuffer & buffer, bool load_hint_mutation);
 
     void calculateEachColumnSizes(ColumnSizeByName & each_columns_size, ColumnSize & total_size) const override;
+    ColumnSize getColumnSizeImpl(const NameAndTypePair & column, std::unordered_set<String> * processed_substreams) const;
+
+    void loadProjections(bool require_columns_checksums, bool check_consistency) override;
+
+    // for projection part
+    void updateCommitTimeForProjection();
 
     void removeImpl(bool keep_shared_data) const override;
+
+    void fillProjectionNamesFromChecksums(const MergeTreeDataPartChecksum & checksum_file);
+
+    std::unique_ptr<ReadBufferFromFileBase> openForReading(const DiskPtr& disk, const String& path, size_t file_size) const;
 };
 
 }

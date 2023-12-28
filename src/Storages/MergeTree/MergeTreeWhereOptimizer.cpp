@@ -35,6 +35,15 @@
 #include <DataTypes/NestedUtils.h>
 #include <common/map.h>
 
+#include <Interpreters/PartitionPredicateVisitor.h>
+#include <Interpreters/TreeRewriter.h>
+#include <Optimizer/PredicateUtils.h>
+#include <Optimizer/SymbolsExtractor.h>
+#include <Optimizer/Utils.h>
+#include <Parsers/queryToString.h>
+#include <QueryPlan/SymbolMapper.h>
+#include <Storages/MergeTree/MergeTreeCloudData.h>
+#include <Storages/MergeTree/Index/BitmapIndexHelper.h>
 
 namespace DB
 {
@@ -64,6 +73,7 @@ MergeTreeWhereOptimizer::MergeTreeWhereOptimizer(
     , log{log_}
     , column_sizes{std::move(column_sizes_)}
     , metadata_snapshot{metadata_snapshot_}
+    , enable_ab_index_optimization{context->getSettingsRef().enable_ab_index_optimization}
 {
     const auto & primary_key = metadata_snapshot->getPrimaryKey();
     if (!primary_key.column_names.empty())
@@ -205,6 +215,99 @@ ASTPtr MergeTreeWhereOptimizer::reconstruct(const Conditions & conditions)
     return function;
 }
 
+bool MergeTreeWhereOptimizer::containsArraySetCheck(const ASTPtr & condition) const
+{
+    if (!condition)
+        return false;
+
+    const auto * const function = typeid_cast<const ASTFunction *>(condition.get());
+
+    if (function)
+    {
+        if (function->name == "not")
+        {
+            return containsArraySetCheck(function->arguments->children.front());
+        }
+        if (function->name == "and" or function->name == "or")
+        {
+            bool result = false;
+            for (const auto & children_ast : function->arguments->children)
+            {
+                result |= containsArraySetCheck(children_ast);
+            }
+            return result;
+        }
+        else if (BitmapIndexHelper::isArraySetFunctions(function->name))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// A expression is arraySetCheck if
+// 1. single arraySetCheck function with column argument is a BLOOM column
+// 2. not arraySetCheck function
+bool MergeTreeWhereOptimizer::isArraySetCheck(const ASTPtr & condition, bool) const
+{
+    if (!condition)
+        return false;
+
+    const auto * const function = typeid_cast<const ASTFunction *>(condition.get());
+
+    if (function)
+    {
+        if (BitmapIndexHelper::isArraySetFunctions(function->name))
+        {
+            size_t arg_size = function->arguments->children.size();
+            if (arg_size % 2)
+                throw Exception("Wrong number of arguments of arraySetCheck", ErrorCodes::LOGICAL_ERROR);
+
+            for (size_t i = 0; i < arg_size; i += 2)
+            {
+                auto * left_arg = function->arguments->children.at(i).get();
+                auto * right_arg = function->arguments->children.at(i + 1).get();
+                auto * identifier = left_arg->as<ASTIdentifier>();
+                if (!identifier || right_arg->as<ASTIdentifier>())
+                    return false;
+
+                String identifier_name = identifier->getColumnName();
+                if (isMapImplicitKey(identifier_name))
+                    identifier_name = parseMapNameFromImplicitFileName(identifier_name);
+
+                auto columns = metadata_snapshot->getColumns();
+                if (!columns.has(identifier_name))
+                    return false;
+
+                // unlikely
+                {
+                    // Cannot handle column like 'map.key'
+                    auto [maybe_reserved_map_keys, name_without_suffix] = mayBeMapKVReservedKeys(identifier_name);
+                    if (maybe_reserved_map_keys)
+                    {
+                        if (!columns.has(name_without_suffix))
+                            return false;
+
+                        const ColumnDescription & column = columns.get(name_without_suffix);
+                        if (column.type->isMap())
+                            return false;
+                    }
+                }
+
+                const ColumnDescription & column = columns.get(identifier_name);
+
+                if (!column.type->isBitmapIndex())
+                    return false;
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void MergeTreeWhereOptimizer::optimize(ASTSelectQuery & select) const
 {
     if (!select.where() || select.prewhere())
@@ -223,6 +326,10 @@ void MergeTreeWhereOptimizer::optimize(ASTSelectQuery & select) const
         total_size_of_moved_conditions += cond_it->columns_size;
         total_number_of_moved_columns += cond_it->identifiers.size();
 
+        // for bitmap index, same column with diffetent value will use different index
+        if (isArraySetCheck(cond_it->node))
+            return;
+
         /// Move all other viable conditions that depend on the same set of columns.
         for (auto jt = where_conditions.begin(); jt != where_conditions.end();)
         {
@@ -233,6 +340,37 @@ void MergeTreeWhereOptimizer::optimize(ASTSelectQuery & select) const
         }
     };
 
+    /// @ab-opt, move ab check index if there is
+    if (enable_ab_index_optimization)
+    {
+        // LOG_DEBUG(log, "MergeTreeWhereOptimizer: try to use ab index optimization.");
+        size_t array_set_check_function_numbers = 0;
+        for (auto it = where_conditions.begin(); it != where_conditions.end();)
+        {
+            if (containsArraySetCheck(it->node))
+            {
+                array_set_check_function_numbers++;
+            }
+            ++it;
+        }
+
+        // current only support one array check function
+        /// TODO: support complex expressions
+        if (array_set_check_function_numbers == 1)
+        {
+            for (auto it = where_conditions.begin(); it != where_conditions.end();)
+            {
+                if (isArraySetCheck(it->node))
+                {
+                    auto move_it = it++;
+                    move_condition(move_it);
+                    continue;
+                }
+                ++it;
+            }
+        }
+    }
+
     /// Move conditions unless the ratio of total_size_of_moved_conditions to the total_size_of_queried_columns is less than some threshold.
     while (!where_conditions.empty())
     {
@@ -241,6 +379,9 @@ void MergeTreeWhereOptimizer::optimize(ASTSelectQuery & select) const
         auto it = std::min_element(where_conditions.begin(), where_conditions.end());
 
         if (!it->viable)
+            break;
+
+        if (containsArraySetCheck(it->node))
             break;
 
         bool moved_enough = false;
@@ -316,8 +457,15 @@ bool MergeTreeWhereOptimizer::isPrimaryKeyAtom(const ASTPtr & ast) const
             return false;
 
         const auto & args = func->arguments->children;
-        if (args.size() != 2)
-            return false;
+        if (functionIsEscapeLikeOperator(func->name))
+        {
+            if (args.size() != 3)
+                return false;
+        }
+        else {
+            if (args.size() != 2)
+                return false;
+        }
 
         const auto & first_arg_name = args.front()->getColumnName();
         const auto & second_arg_name = args.back()->getColumnName();
@@ -403,4 +551,86 @@ void MergeTreeWhereOptimizer::determineArrayJoinedNames(ASTSelectQuery & select)
         array_joined_names.emplace(ast->getAliasOrColumnName());
 }
 
+void optimizePartitionPredicate(ASTPtr & query, StoragePtr storage, SelectQueryInfo & query_info, ContextPtr context)
+{
+    ASTSelectQuery * select = query->as<ASTSelectQuery>();
+    if (!select || !select->where() || query_info.partition_filter || !storage)
+        return;
+
+    if (!dynamic_cast<MergeTreeCloudData *>(storage.get()))
+        return;
+
+    ASTs conjuncts = PredicateUtils::extractConjuncts(select->where()->clone());
+
+    // construct push filter by mapping symbol to origin column
+    std::unordered_map<String, String> column_to_alias;
+    for (const auto & item : query_info.syntax_analyzer_result->aliases)
+        column_to_alias.emplace(item.second->getColumnName(), item.first);
+    auto alias_to_column = Utils::reverseMap(column_to_alias);
+    ASTPtr push_filter;
+    if (!alias_to_column.empty())
+    {
+        auto mapper = SymbolMapper::simpleMapper(alias_to_column);
+        std::vector<ConstASTPtr> mapped_pushable_conjuncts;
+        for (auto & conjunct : conjuncts)
+        {
+            bool all_in = true;
+            auto symbols = SymbolsExtractor::extract(conjunct);
+            for (const auto & item : symbols)
+                all_in &= alias_to_column.contains(item);
+            if (all_in)
+               mapped_pushable_conjuncts.push_back(mapper.map(conjunct));
+            else
+               mapped_pushable_conjuncts.push_back(conjunct);
+        }
+
+        push_filter = PredicateUtils::combineConjuncts(mapped_pushable_conjuncts);
+    }
+    if (!PredicateUtils::isTruePredicate(push_filter))
+    {
+        if (auto * merge_tree_data = dynamic_cast<MergeTreeCloudData *>(storage.get()))
+        {
+            ASTs push_predicates;
+            ASTs remain_predicates;
+            Names partition_key_names = merge_tree_data->getInMemoryMetadataPtr()->getPartitionKey().column_names;
+            Names virtual_key_names = merge_tree_data->getSampleBlockWithVirtualColumns().getNames();
+            partition_key_names.insert(partition_key_names.end(), virtual_key_names.begin(), virtual_key_names.end());
+            auto iter = std::stable_partition(conjuncts.begin(), conjuncts.end(), [&](const auto & predicate) {
+                PartitionPredicateVisitor::Data visitor_data{context, partition_key_names};
+                PartitionPredicateVisitor(visitor_data).visit(predicate);
+                return visitor_data.getMatch();
+            });
+
+            push_predicates.insert(push_predicates.end(), conjuncts.begin(), iter);
+            remain_predicates.insert(remain_predicates.end(), iter, conjuncts.end());
+
+            ASTPtr new_partition_filter;
+
+            if (query_info.partition_filter)
+            {
+                push_predicates.push_back(query_info.partition_filter);
+                new_partition_filter = PredicateUtils::combineConjuncts(push_predicates);
+            }
+            else
+            {
+                new_partition_filter = PredicateUtils::combineConjuncts<false>(push_predicates);
+            }
+
+            if (!PredicateUtils::isTruePredicate(new_partition_filter))
+                query_info.partition_filter = std::move(new_partition_filter);
+
+            ASTPtr new_where = PredicateUtils::combineConjuncts<false>(remain_predicates);
+            if (!PredicateUtils::isTruePredicate(new_where))
+                select->setExpression(ASTSelectQuery::Expression::WHERE, std::move(new_where));
+            else
+                select->setExpression(ASTSelectQuery::Expression::WHERE, nullptr);
+            query_info.query = query;
+        }
+    }
+    if (query_info.partition_filter)
+    {
+        LOG_TRACE(&Poco::Logger::get("optimizePartitionPredicate"), "Optimize partition prediate push down query rewrited to {} , partiton filter-{} ",
+                queryToString(query), queryToString(query_info.partition_filter));
+    }
+}
 }

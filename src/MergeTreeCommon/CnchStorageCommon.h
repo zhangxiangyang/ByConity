@@ -23,14 +23,22 @@
 #include <DataStreams/copyData.h>
 #include <MergeTreeCommon/CnchTopologyMaster.h>
 #include <Interpreters/ProcessList.h>
+#include "Storages/Hive/HiveFile/IHiveFile_fwd.h"
 
 namespace DB
 {
+struct PrepareContextResult
+{
+    String local_table_name;
+    ServerDataPartsVector parts;
+    HiveFiles hive_files;
+    FileDataPartsCNCHVector file_parts;
+};
 
 enum class WorkerGroupUsageType
 {
     NORMAL,
-    WRITE,    /// write group for INSERT SELECT and INSERT INFILE
+    WRITE, /// write group for INSERT SELECT and INSERT INFILE
     BUFFER,
 };
 
@@ -58,18 +66,18 @@ enum class CNCHStorageMediumType
 };
 
 String toStr(CNCHStorageMediumType tp);
-CNCHStorageMediumType fromStr(const String& type_str);
+CNCHStorageMediumType fromStr(const String & type_str);
 
 class CnchStorageCommonHelper
 {
 public:
     CnchStorageCommonHelper(const StorageID & table_id_, const String & remote_database_, const String & remote_table_);
 
-    bool forwardQueryToServerIfNeeded(ContextPtr query_context, const UUID & storage_uuid) const;
+    bool forwardQueryToServerIfNeeded(ContextPtr query_context, const StorageID & storage_id, const String & query_to_forward = "", bool need_process_entry = true) const;
 
     static bool healthCheckForWorkerGroup(ContextPtr context, WorkerGroupHandle & worker_group);
 
-    static void sendQueryPerShard(
+    static BlockInputStreamPtr sendQueryPerShard(
         ContextPtr context,
         const String & query,
         const WorkerGroupHandleImpl::ShardInfo & shard_info,
@@ -100,15 +108,9 @@ public:
         const String & local_table_name,
         const ContextPtr & context = nullptr,
         bool enable_staging_area = false,
-        const std::optional<StorageID> & cnch_storage_id = std::nullopt) const;
-
-    String getCreateQueryForCloudTable(
-        const String & query,
-        const String & local_table_name,
-        const String & local_database_name,
-        const ContextPtr & context = nullptr,
-        bool enable_staging_area = false,
-        const std::optional<StorageID> & cnch_storage_id = std::nullopt) const;
+        const std::optional<StorageID> & cnch_storage_id = std::nullopt,
+        const Strings & engine_args = {},
+        const String & local_database_name = {}) const;
 
     static void rewritePlanSegmentQueryImpl(ASTPtr & query, const std::string & database, const std::string & table);
 

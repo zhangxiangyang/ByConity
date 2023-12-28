@@ -15,16 +15,21 @@
 
 #include <Optimizer/SymbolTransformMap.h>
 
-#include <Optimizer/SimpleExpressionRewriter.h>
 #include <Optimizer/Utils.h>
 #include <Parsers/ASTTableColumnReference.h>
+#include <Parsers/formatAST.h>
 #include <QueryPlan/PlanVisitor.h>
+#include <Interpreters/InDepthNodeVisitor.h>
 
 namespace DB
 {
 class SymbolTransformMap::Visitor : public PlanNodeVisitor<Void, Void>
 {
 public:
+    explicit Visitor(std::optional<PlanNodeId> stop_node_) : stop_node(std::move(stop_node_))
+    {
+    }
+
     Void visitAggregatingNode(AggregatingNode & node, Void & context) override
     {
         const auto * agg_step = dynamic_cast<const AggregatingStep *>(node.getStep().get());
@@ -36,10 +41,7 @@ public:
         return visitChildren(node, context);
     }
 
-    Void visitFilterNode(FilterNode & node, Void & context) override
-    {
-        return visitChildren(node, context);
-    }
+    Void visitFilterNode(FilterNode & node, Void & context) override { return visitChildren(node, context); }
 
     Void visitProjectionNode(ProjectionNode & node, Void & context) override
     {
@@ -60,27 +62,50 @@ public:
         return visitChildren(node, context);
     }
 
+    Void visitSortingNode(SortingNode & node, Void & context) override
+    {
+        return visitChildren(node, context);
+    }
+
     Void visitJoinNode(JoinNode & node, Void & context) override { return visitChildren(node, context); }
+    Void visitExchangeNode(ExchangeNode & node, Void & context) override { return visitChildren(node, context); }
 
     Void visitTableScanNode(TableScanNode & node, Void &) override
     {
         auto table_step = dynamic_cast<const TableScanStep *>(node.getStep().get());
         for (const auto & item : table_step->getColumnAlias())
         {
-            auto column_reference = std::make_shared<ASTTableColumnReference>(table_step->getStorage(), item.first);
+            auto column_reference = std::make_shared<ASTTableColumnReference>(table_step->getStorage().get(), node.getId(), item.first);
             addSymbolExpressionMapping(item.second, column_reference);
         }
+
+        for (const auto & item : table_step->getInlineExpressions())
+        {
+            auto inline_expr
+                = IdentifierToColumnReference::rewrite(table_step->getStorage().get(), node.getId(), item.second->clone(), false);
+            addSymbolExpressionMapping(item.first, inline_expr);
+        }
+        return Void{};
+    }
+
+    Void visitPlanNode(PlanNodeBase & node, Void & context) override
+    {
+        visitChildren(node, context);
+        valid = false; // unsupported node
         return Void{};
     }
 
     Void visitChildren(PlanNodeBase & node, Void & context)
     {
+        if (stop_node.has_value() && node.getId() == *stop_node)
+            return {};
         for (auto & child : node.getChildren())
             VisitorUtil::accept(*child, *this, context);
         return Void{};
     }
 
 public:
+    std::optional<PlanNodeId> stop_node; // visit this node, but not visit its descendant
     std::unordered_map<String, ConstASTPtr> symbol_to_expressions;
     std::unordered_map<String, ConstASTPtr> symbol_to_cast_lossless_expressions;
     bool valid = true;
@@ -107,16 +132,19 @@ public:
 
     ASTPtr visitASTIdentifier(ASTPtr & expr, Void & context) override
     {
-        auto & name = expr->as<ASTIdentifier &>().name();
+        const auto & name = expr->as<ASTIdentifier &>().name();
 
-        if (expression_lineage.count(name))
-            return expression_lineage.at(name)->clone();
+        if (auto iter = expression_lineage.find(name); iter != expression_lineage.end())
+            return iter->second->clone();
 
-        if (!symbol_to_expressions.count(name))
-            throw Exception("Unknown column " + name + " in SymbolTransformMap", ErrorCodes::LOGICAL_ERROR);
-        ASTPtr rewrite = ASTVisitorUtil::accept(symbol_to_expressions.at(name)->clone(), *this, context);
-        expression_lineage[name] = rewrite;
-        return rewrite;
+        if (auto iter = symbol_to_expressions.find(name); iter != symbol_to_expressions.end())
+        {
+            ASTPtr rewrite = ASTVisitorUtil::accept(iter->second->clone(), *this, context);
+            expression_lineage[name] = rewrite;
+            return rewrite->clone();
+        }
+
+        return expr;
     }
 
 private:
@@ -124,9 +152,9 @@ private:
     std::unordered_map<String, ConstASTPtr> & expression_lineage;
 };
 
-std::optional<SymbolTransformMap> SymbolTransformMap::buildFrom(PlanNodeBase & plan)
+std::optional<SymbolTransformMap> SymbolTransformMap::buildFrom(PlanNodeBase & plan, std::optional<PlanNodeId> stop_node)
 {
-    Visitor visitor;
+    Visitor visitor(stop_node);
     Void context;
     VisitorUtil::accept(plan, visitor, context);
     std::optional<SymbolTransformMap> ret;
@@ -140,5 +168,96 @@ ASTPtr SymbolTransformMap::inlineReferences(const ConstASTPtr & expression) cons
     Rewriter rewriter{symbol_to_expressions, expression_lineage};
     Void context;
     return ASTVisitorUtil::accept(expression->clone(), rewriter, context);
+}
+
+String SymbolTransformMap::toString() const
+{
+    String str;
+    str += "expression_lineage: ";
+    for (const auto & x: expression_lineage)
+        str += x.first + " = " + serializeAST(*x.second) + ", ";
+    str += "symbol_to_expressions: ";
+    for (const auto & x: symbol_to_expressions)
+        str += x.first + " = " + serializeAST(*x.second) + ", ";
+    return str;
+}
+
+void SymbolTranslationMap::addStorageTranslation(ASTPtr ast, String name, const IStorage * storage, UInt32 unique_id)
+{
+    ast = IdentifierToColumnReference::rewrite(storage, unique_id, ast, true);
+    translation.emplace(std::move(ast), std::move(name));
+}
+
+std::optional<String> SymbolTranslationMap::tryGetTranslation(const ASTPtr & expr) const
+{
+    std::optional<String> result = std::nullopt;
+
+    if (auto iter = translation.find(expr); iter != translation.end())
+        result = iter->second;
+
+    return result;
+}
+
+ASTPtr SymbolTranslationMap::translateImpl(ASTPtr ast) const
+{
+    // expression which can be translated
+    if (auto column = tryGetTranslation(ast))
+        return std::make_shared<ASTIdentifier>(*column);
+
+    // ASTFunction
+    if (const auto * func = ast->as<ASTFunction>())
+    {
+        ASTs translated_arguments;
+
+        if (func->arguments)
+            for (const auto & arg : func->arguments->children)
+                translated_arguments.push_back(translateImpl(arg));
+
+        return makeASTFunction(func->name, translated_arguments);
+    }
+
+    // other ast type
+    return ast;
+}
+
+ASTPtr IdentifierToColumnReference::rewrite(const IStorage * storage, UInt32 unique_id, ASTPtr ast, bool clone)
+{
+    if (clone)
+        ast = ast->clone();
+    IdentifierToColumnReference rewriter{storage, unique_id};
+    Void context;
+    return ASTVisitorUtil::accept(ast, rewriter, context);
+}
+
+IdentifierToColumnReference::IdentifierToColumnReference(const IStorage * storage_, UInt32 unique_id_)
+    : storage(storage_), unique_id(unique_id_)
+{
+    if (storage == nullptr)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "storage ptr is NULL");
+    storage_metadata = storage->getInMemoryMetadataPtr();
+}
+
+ASTPtr IdentifierToColumnReference::visitASTIdentifier(ASTPtr & node, Void &)
+{
+    const auto & iden = node->as<ASTIdentifier &>();
+    const auto & columns = storage_metadata->getColumns();
+    if (columns.hasColumnOrSubcolumn(ColumnsDescription::AllPhysical, iden.name()))
+        return std::make_shared<ASTTableColumnReference>(storage, unique_id, iden.name());
+    return node;
+}
+
+ASTPtr ColumnReferenceToIdentifier::rewrite(ASTPtr ast, bool clone)
+{
+    if (clone)
+        ast = ast->clone();
+    ColumnReferenceToIdentifier rewriter;
+    Void context;
+    return ASTVisitorUtil::accept(ast, rewriter, context);
+}
+
+ASTPtr ColumnReferenceToIdentifier::visitASTTableColumnReference(ASTPtr & node, Void &)
+{
+    const auto & column_ref = node->as<ASTTableColumnReference &>();
+    return std::make_shared<ASTIdentifier>(column_ref.column_name);
 }
 }

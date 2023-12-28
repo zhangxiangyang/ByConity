@@ -112,5 +112,7 @@ void registerDataTypeDomainSimpleAggregateFunction(DataTypeFactory & factory);
 void registerDataTypeDomainGeo(DataTypeFactory & factory);
 void registerDataTypeBitMap64(DataTypeFactory & factory);
 void registerDataTypeSet(DataTypeFactory & factory);
+void registerDataTypeSketchBinary(DataTypeFactory & factory);
+void registerDataTypeDomainBool(DataTypeFactory & factory);
 
 }

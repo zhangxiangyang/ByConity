@@ -32,10 +32,7 @@ namespace ErrorCodes
 namespace Catalog
 {
 
-MetastoreFDBImpl::MetastoreFDBImpl(const String & cluster_config_path)
-{
-    fdb_client = std::make_shared<FDB::FDBClient>(cluster_config_path);
-}
+MetastoreFDBImpl::MetastoreFDBImpl(const String & cluster_config_path) { fdb_client = FDB::FDBClient::Instance(cluster_config_path); }
 
 void MetastoreFDBImpl::put(const String & key, const String & value, bool if_not_exists)
 {
@@ -92,17 +89,29 @@ uint64_t MetastoreFDBImpl::get(const String & key, String & value)
 std::vector<std::pair<String, UInt64>> MetastoreFDBImpl::multiGet(const std::vector<String> & keys)
 {
     std::vector<std::pair<String, UInt64>> res;
-    FDB::FDBTransactionPtr tr = std::make_shared<FDB::FDBTransactionRAII>();
-    check_fdb_op(fdb_client->CreateTransaction(tr));
-    check_fdb_op(fdb_client->MultiGet(tr, keys, res));
+    res.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); i += DEFAULT_MULTI_GET_BATCH_COUNT)
+    {
+        std::vector<String> batch_keys(keys.begin() + i, keys.begin() + std::min(i + DEFAULT_MULTI_GET_BATCH_COUNT, keys.size()));
+        FDB::FDBTransactionPtr tr = std::make_shared<FDB::FDBTransactionRAII>();
+        check_fdb_op(fdb_client->CreateTransaction(tr));
+        check_fdb_op(fdb_client->MultiGet(tr, batch_keys, res));
+    }
     return res;
 }
 
-void MetastoreFDBImpl::drop(const String & key, const String & expected)
+void MetastoreFDBImpl::drop(const String & key, [[maybe_unused]] const UInt64 & expected)
 {
     FDB::FDBTransactionPtr tr = std::make_shared<FDB::FDBTransactionRAII>();
     check_fdb_op(fdb_client->CreateTransaction(tr));
-    check_fdb_op(fdb_client->Delete(tr, key, expected));
+    check_fdb_op(fdb_client->Delete(tr, key));
+}
+
+void MetastoreFDBImpl::drop(const String & key, const String & expected_value)
+{
+    FDB::FDBTransactionPtr tr = std::make_shared<FDB::FDBTransactionRAII>();
+    check_fdb_op(fdb_client->CreateTransaction(tr));
+    check_fdb_op(fdb_client->Delete(tr, key, expected_value));
 }
 
 MetastoreFDBImpl::IteratorPtr MetastoreFDBImpl::getAll()
@@ -146,10 +155,7 @@ bool MetastoreFDBImpl::batchWrite(const BatchCommitRequest & req, BatchCommitRes
     FDB::FDBTransactionPtr tr = std::make_shared<FDB::FDBTransactionRAII>();
     check_fdb_op(fdb_client->CreateTransaction(tr));
     fdb_error_t error_code = fdb_client->MultiWrite(tr, req, response);
-    if (error_code == FDB::FDBError::FDB_not_committed && !response.puts.empty())
-        return false;
-    else
-        check_fdb_op(error_code);
+    check_fdb_op(error_code);
 
     return true;
 }

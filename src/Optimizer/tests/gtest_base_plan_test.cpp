@@ -13,7 +13,6 @@
  * limitations under the License.
  */
 
-#include <Optimizer/Dump/PlanDump.h>
 #include <Optimizer/tests/gtest_base_plan_test.h>
 
 #include <Analyzers/QueryAnalyzer.h>
@@ -28,6 +27,7 @@
 #include <Interpreters/SelectIntersectExceptQueryVisitor.h>
 #include <Interpreters/executeQuery.h>
 #include <Optimizer/CardinalityEstimate/CardinalityEstimator.h>
+#include <Optimizer/Dump/PlanReproducer.h>
 #include <Optimizer/PlanOptimizer.h>
 #include <Parsers/ParserQuery.h>
 #include <Parsers/parseQuery.h>
@@ -35,6 +35,7 @@
 #include <QueryPlan/QueryPlanner.h>
 #include <Statistics/CacheManager.h>
 #include <Statistics/CatalogAdaptor.h>
+#include <Poco/NumberParser.h>
 #include <Poco/Util/MapConfiguration.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Common/tests/gtest_global_register.h>
@@ -59,6 +60,7 @@ BasePlanTest::BasePlanTest(const String & database_name_, const std::unordered_m
     tryRegisterFormats();
     tryRegisterStorages();
     tryRegisterAggregateFunctions();
+    tryRegisterHints();
 
     SettingsChanges setting_changes;
 
@@ -71,7 +73,7 @@ BasePlanTest::BasePlanTest(const String & database_name_, const std::unordered_m
 
     session_context->applySettingsChanges(setting_changes);
 
-    if (DatabaseCatalog::instance().tryGetDatabase(database_name))
+    if (DatabaseCatalog::instance().tryGetDatabase(database_name, session_context))
         DatabaseCatalog::instance().detachDatabase(session_context, database_name, true, false);
 
     auto database = std::make_shared<DatabaseMemory>(database_name, session_context);
@@ -95,7 +97,8 @@ QueryPlanPtr BasePlanTest::plan(const String & query, ContextMutablePtr query_co
     auto ast = parse(query, query_context);
 
     {
-        SelectIntersectExceptQueryVisitor::Data data{query_context->getSettingsRef()};
+        SelectIntersectExceptQueryVisitor::Data data{
+            query_context->getSettingsRef().intersect_default_mode, query_context->getSettingsRef().except_default_mode};
         SelectIntersectExceptQueryVisitor{data}.visit(ast);
     }
 
@@ -103,9 +106,9 @@ QueryPlanPtr BasePlanTest::plan(const String & query, ContextMutablePtr query_co
     NormalizeSelectWithUnionQueryVisitor::Data data{query_context->getSettingsRef().union_default_mode};
     NormalizeSelectWithUnionQueryVisitor{data}.visit(ast);
 
-    ast = QueryRewriter::rewrite(ast, query_context);
+    ast = QueryRewriter().rewrite(ast, query_context);
     AnalysisPtr analysis = QueryAnalyzer::analyze(ast, query_context);
-    QueryPlanPtr query_plan = QueryPlanner::plan(ast, *analysis, query_context);
+    QueryPlanPtr query_plan = QueryPlanner().plan(ast, *analysis, query_context);
     PlanOptimizer::optimize(*query_plan, query_context);
     return query_plan;
 }
@@ -118,7 +121,7 @@ PlanSegmentTreePtr BasePlanTest::planSegment(const String & query, ContextMutabl
 
     PlanSegmentTreePtr plan_segment_tree = std::make_unique<PlanSegmentTree>();
     ClusterInfoContext cluster_info_context{.query_plan = plan, .context = query_context, .plan_segment_tree = plan_segment_tree};
-    PlanSegmentContext plan_segment_context = ClusterInfoFinder::find(query_plan->getPlanNode(), cluster_info_context);
+    PlanSegmentContext plan_segment_context = ClusterInfoFinder::find(*query_plan, cluster_info_context);
     PlanSegmentSplitter::split(plan, plan_segment_context);
     return plan_segment_tree;
 }
@@ -203,8 +206,9 @@ std::string AbstractPlanTestSuite::explain(const std::string & name)
         if (sql.second->getType() == DB::ASTType::ASTSelectQuery || sql.second->getType() == DB::ASTType::ASTSelectWithUnionQuery)
         {
             auto query_plan = plan(sql.first, context);
+
             CardinalityEstimator::estimate(*query_plan, context);
-            explain += DB::PlanPrinter::textLogicalPlan(*query_plan, session_context, true, true);
+            explain += DB::PlanPrinter::textLogicalPlan(*query_plan, session_context, show_statistics, true);
         }
         else
             execute(sql.first, context);
@@ -264,6 +268,9 @@ void AbstractPlanTestSuite::loadTableStatistics()
     auto context = createQueryContext(std::unordered_map<String, Field>{{"graphviz_path", path.parent_path().string()}});
 
     auto file = path.parent_path() / std::filesystem::path(database_name + ".bin");
+    std::string expected_database = path.filename().string().substr(0, path.filename().string().size() - 4);
+    if (expected_database != database_name)
+        throw Exception("database should be " + expected_database, ErrorCodes::BAD_ARGUMENTS);
     if (!std::filesystem::exists(file))
         throw Exception(file.string() + " not found.", ErrorCodes::BAD_ARGUMENTS);
 
@@ -300,233 +307,22 @@ std::vector<std::string> AbstractPlanTestSuite::loadFile(const std::filesystem::
     }
     return sections;
 }
-String AbstractPlanTestSuite::dump(const String & name)
-{
-    auto context = createQueryContext({});
-    //    session_context->getSettings().graphviz_path = getPlanDumpPath();
-    context->setSetting("graphviz_path", getPlanDumpPath().string());
-    auto file = getQueriesDir() / (name + ".sql");
-    std::vector<String> splits = loadFile(file, ';');
-    if (context->getCurrentQueryId().empty())
-    {
-        context->setCurrentQueryId("test_tmp");
-    }
-
-    auto query = loadQuery(name);
-    for (auto & sql : query.sql)
-    {
-        if (sql.second->getType() == DB::ASTType::ASTSelectQuery || sql.second->getType() == DB::ASTType::ASTSelectWithUnionQuery)
-        {
-            auto ast = parse(sql.first, context);
-            if (!ast)
-            {
-                throw Exception("ast is null", ErrorCodes::BAD_ARGUMENTS);
-            }
-            context->createPlanNodeIdAllocator();
-            context->createSymbolAllocator();
-            context->createOptimizerMetrics();
-
-            ast = QueryRewriter::rewrite(ast, context);
-            AnalysisPtr analysis = QueryAnalyzer::analyze(ast, context);
-            QueryPlanPtr query_plan = QueryPlanner::plan(ast, *analysis, context);
-            dumpDdlStats(*query_plan, context);
-            PlanOptimizer::optimize(*query_plan, context);
-            CardinalityEstimator::estimate(*query_plan, context);
-            String explain = DB::PlanPrinter::textLogicalPlan(*query_plan, session_context, true, true);
-
-            String path = context->getSettingsRef().graphviz_path.toString() + context->getCurrentQueryId() + "/explain.txt";
-            std::ofstream out(path);
-            out << explain;
-            out.close();
-
-            dumpQuery(splits[0], context);
-            dumpClusterInfo(context, static_cast<size_t>(context->getSettingsRef().memory_catalog_worker_size));
-            return context->getCurrentQueryId();
-        }
-    }
-    return "";
-}
-String AbstractPlanTestSuite::reproduce(const String & query_id)
-{
-    String path_file = getPlanDumpPath().string() + query_id;
-    String path_query = path_file + "/query.sql";
-    String path_settings = path_file + "/settings_changed.json";
-    String path_stats = path_file + "/stats.json";
-    String path_ddl = path_file + "/ddl.json";
-    String path_others = path_file + "/others.json";
-
-    //get query
-    std::ifstream fin(path_query);
-    std::stringstream buffer;
-    buffer << fin.rdbuf();
-    String query(buffer.str());
-
-    //setting recreation
-    loadSettings(session_context, path_settings);
-    createClusterInfo(path_others);
-    database_name = session_context->getCurrentDatabase();
-
-    //ddl recreation
-    createTablesFromJson(path_ddl);
-
-    //load stats
-    auto query_context = createQueryContext({});
-    loadStats(query_context, path_stats);
-
-    ASTPtr ast = parse(query, session_context);
-    std::string explain;
-
-    if (ast->getType() == DB::ASTType::ASTSelectQuery || ast->getType() == DB::ASTType::ASTSelectWithUnionQuery)
-    {
-        auto local_context = createQueryContext({});
-        auto query_plan = plan(query, local_context);
-        CardinalityEstimator::estimate(*query_plan, local_context);
-        std::unordered_map<PlanNodeId, double> costs = CostCalculator::calculate(*query_plan, *local_context);
-        explain = PlanPrinter::textLogicalPlan(*query_plan, session_context, true, true, costs);
-    }
-    return explain;
-}
-String AbstractPlanTestSuite::loadExplainFromPath(const String & query_id)
-{
-    String path_file = getPlanDumpPath().string() + query_id + "/explain.txt";
-    if (!std::filesystem::exists(path_file))
-        return "";
-    return loadFile(path_file)[0];
-}
-
-void AbstractPlanTestSuite::unZip(const String & query_id)
-{
-    String des_dir = getPlanDumpPath().string() + query_id + "/";
-    String src_file = getPlanDumpPath().string() + query_id + ".zip";
-    std::filesystem::path plan_dump_path(des_dir);
-    try
-    {
-        if (!std::filesystem::exists(plan_dump_path))
-        {
-            std::filesystem::create_directories(plan_dump_path);
-        }
-    }
-    catch (...)
-    {
-    }
-    unzipDirectory(des_dir, src_file);
-}
-void AbstractPlanTestSuite::createTablesFromJson(const std::string & path)
-{
-    std::ifstream fin(path);
-    std::stringstream buffer;
-    buffer << fin.rdbuf();
-    String ddl(buffer.str());
-    fin.close();
-    Pparser parser;
-    PVar ddl_var = parser.parse(ddl);
-    PObject ddl_object = *ddl_var.extract<PObject::Ptr>();
-    for (auto & [k, v] : ddl_object)
-    {
-        String ddl_query = v.toString();
-        //        std::regex pattern("UUID.'\\w+-\\w+-\\w+-\\w+-\\w+'");
-        //        ddl_query = std::regex_replace(ddl_query, pattern, "");
-        ASTPtr ast = parse(ddl_query, session_context);
-
-        if (!ast)
-        {
-            continue;
-        }
-
-        if (auto * create = ast->as<ASTCreateQuery>())
-        {
-            auto engine = std::make_shared<ASTFunction>();
-            engine->name = "Memory";
-            auto storage = std::make_shared<ASTStorage>();
-            storage->set(storage->engine, engine);
-            create->set(create->storage, storage);
-        }
-
-        ThreadStatus thread_status;
-        thread_status.attachQueryContext(session_context);
-        auto & create = ast->as<ASTCreateQuery &>();
-        create.uuid = UUIDHelpers::Nil;
-        //        const ASTPtr & ast_ddl = std::make_shared<ASTCreateQuery>(std::move(create));
-        InterpreterCreateQuery create_interpreter(ast, session_context);
-        create_interpreter.execute();
-    }
-}
-void AbstractPlanTestSuite::createClusterInfo(const String & path)
-{
-    std::filesystem::path path_{path};
-    if (!std::filesystem::exists(path_))
-    {
-        throw Exception("the path of others.json is null. ", ErrorCodes::LOGICAL_ERROR);
-    }
-    std::ifstream fin(path);
-    std::stringstream buffer;
-    buffer << fin.rdbuf();
-    String others(buffer.str());
-    fin.close();
-    Pparser parser;
-    PVar others_var = parser.parse(others);
-    PObject others_object = *others_var.extract<PObject::Ptr>();
-    session_context->setSetting("memory_catalog_worker_size", others_object.get("memory_catalog_worker_size").toString());
-    String database_name = others_object.get("CurrentDatabase").toString();
-
-    if (DatabaseCatalog::instance().tryGetDatabase(database_name))
-        DatabaseCatalog::instance().detachDatabase(session_context, database_name, true, false);
-
-    auto database = std::make_shared<DatabaseMemory>(database_name, session_context);
-    DatabaseCatalog::instance().attachDatabase(database_name, database);
-    session_context->setCurrentDatabase(database_name);
-}
-std::vector<std::string> AbstractPlanTestSuite::checkDump(const String & query_id, const String & query_id2)
-{
-    std::vector<std::string> files_path = getPathDumpFiles(query_id);
-    std::vector<std::string> files_path2 = getPathDumpFiles(query_id2);
-    for (unsigned long i = 0; i < files_path.size(); ++i)
-    {
-        std::string file1 = files_path[i];
-        std::string file2 = files_path2[i];
-
-        std::ifstream fin(file1);
-        std::ifstream fin2(file2);
-        std::stringstream buffer, buffer2;
-        buffer << fin.rdbuf();
-        buffer2 << fin2.rdbuf();
-        if (buffer.str() != buffer2.str())
-            return std::vector<std::string>{buffer.str(), buffer2.str()};
-    }
-    return {"true", "true"};
-}
-std::vector<std::string> AbstractPlanTestSuite::getPathDumpFiles(const String & query_id)
-{
-    String path_file = getPlanDumpPath().string() + query_id;
-    std::vector<std::string> path_dump;
-    path_dump.push_back(path_file + "/query.sql");
-    //    path_dump.push_back(path_file + "/settings_changed.json");
-    path_dump.push_back(path_file + "/stats.json");
-    path_dump.push_back(path_file + "/ddl.json");
-    path_dump.push_back(path_file + "/others.json");
-    return path_dump;
-}
-void AbstractPlanTestSuite::cleanQueryFiles(const String & query_id)
-{
-    std::filesystem::path query_path(getPlanDumpPath());
-    try
-    {
-        if (std::filesystem::exists(query_path))
-        {
-            String zip_file = query_path.string() + query_id + ".zip";
-            String dir_file = query_path.string() + query_id + "/";
-            std::filesystem::remove_all(dir_file.c_str());
-            std::filesystem::remove_all(zip_file.c_str());
-        }
-    }
-    catch (...)
-    {
-    }
-}
 
 bool AbstractPlanTestSuite::enforce_regenerate()
 {
     return std::getenv("REGENERATE") != nullptr;
 }
 
+int AbstractPlanTestSuite::regenerate_task_thread_size()
+{
+    if (auto * str = std::getenv("REGENERATE_TASK_THREAD_SIZE"))
+    {
+        int value;
+        if (Poco::NumberParser::tryParse(String{str}, value) && value > 0 && value < 100)
+        {
+            return value;
+        }
+    }
+    return 8;
+}
 }

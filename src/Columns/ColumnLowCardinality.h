@@ -208,7 +208,13 @@ public:
 
     void insertData(const char * pos, size_t length) override;
 
-    void popBack(size_t n) override { idx.popBack(n); }
+    void popBack(size_t n) override
+    {
+        if (isFullState())
+            getNestedColumn().popBack(n);
+        else
+            idx.popBack(n);
+    }
 
     StringRef serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const override;
 
@@ -265,13 +271,17 @@ public:
 
     bool hasEqualValues() const override;
 
-    void getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
+    void getPermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int nan_direction_hint, Permutation & res) const override;
 
-    void updatePermutation(bool reverse, size_t limit, int, IColumn::Permutation & res, EqualRanges & equal_range) const override;
+    void updatePermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int, IColumn::Permutation & res, EqualRanges & equal_ranges) const override;
 
-    void getPermutationWithCollation(const Collator & collator, bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
+    void getPermutationWithCollation(const Collator & collator, IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int nan_direction_hint, Permutation & res) const override;
 
-    void updatePermutationWithCollation(const Collator & collator, bool reverse, size_t limit, int nan_direction_hint, Permutation & res, EqualRanges& equal_range) const override;
+    void updatePermutationWithCollation(const Collator & collator, IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int nan_direction_hint, Permutation & res, EqualRanges& equal_ranges) const override;
 
     ColumnPtr replicate(const Offsets & offsets) const override
     {
@@ -417,6 +427,8 @@ public:
 
     const ColumnPtr & getNestedColumnPtr() const { return nested_column; }
     ColumnPtr & getNestedColumnPtr() { return nested_column; }
+    bool nestedCanBeInsideNullable() const { return dictionary.getColumnUnique().getNestedColumn()->canBeInsideNullable(); }
+    ColumnPtr cloneWithDefaultOnNull() const;
 
     void switchToFull()
     {
@@ -529,10 +541,7 @@ private:
 
     int compareAtImpl(size_t n, size_t m, const IColumn & rhs, int nan_direction_hint, const Collator * collator=nullptr) const;
 
-    void getPermutationImpl(bool reverse, size_t limit, int nan_direction_hint, Permutation & res, const Collator * collator = nullptr) const;
-
-    template <typename Cmp>
-    void updatePermutationImpl(size_t limit, Permutation & res, EqualRanges & equal_ranges, Cmp comparator) const;
+    void getPermutationImpl(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability, size_t limit, int nan_direction_hint, Permutation & res, const Collator * collator = nullptr) const;
 };
 
 

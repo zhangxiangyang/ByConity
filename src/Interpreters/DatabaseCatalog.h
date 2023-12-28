@@ -49,6 +49,8 @@ class IDatabase;
 class Exception;
 class ColumnsDescription;
 struct ConstraintsDescription;
+struct ForeignKeysDescription;
+struct UniqueNotEnforcedDescription;
 
 using DatabasePtr = std::shared_ptr<IDatabase>;
 using DatabaseAndTable = std::pair<DatabasePtr, StoragePtr>;
@@ -117,6 +119,8 @@ struct TemporaryTableHolder : boost::noncopyable, WithContext
         ContextPtr context,
         const ColumnsDescription & columns,
         const ConstraintsDescription & constraints,
+        const ForeignKeysDescription & foreign_keys_,
+        const UniqueNotEnforcedDescription & unique_not_enforced_,
         const ASTPtr & query = {},
         bool create_for_global_subquery = false);
 
@@ -160,8 +164,8 @@ public:
     std::unique_lock<std::shared_mutex> getExclusiveDDLGuardForDatabase(const String & database);
 
 
-    void assertDatabaseExists(const String & database_name) const;
-    void assertDatabaseDoesntExist(const String & database_name) const;
+    void assertDatabaseExists(const String & database_name, ContextPtr local_context) const;
+    void assertDatabaseDoesntExist(const String & database_name, ContextPtr local_context) const;
 
     DatabasePtr getDatabaseForTemporaryTables() const;
     DatabasePtr getSystemDatabase() const;
@@ -171,17 +175,13 @@ public:
     void updateDatabaseName(const String & old_name, const String & new_name);
 
     /// database_name must be not empty
-    DatabasePtr getDatabase(const String & database_name) const;
+    DatabasePtr getDatabase(const String & database_name, ContextPtr local_context) const;
     DatabasePtr tryGetDatabase(const String & database_name, ContextPtr local_context) const;
-    DatabasePtr tryGetDatabase(const String & database_name) const;
-    DatabasePtr getDatabase(const UUID & uuid) const;
-    DatabasePtr tryGetDatabase(const UUID & uuid) const;
-    bool isDatabaseExist(const String & database_name) const;
-    Databases getDatabases() const;
+    bool isDatabaseExist(const String & database_name, ContextPtr local_context) const;
+    Databases getDatabases(ContextPtr local_context) const;
     Databases getNonCnchDatabases() const;
 
     /// Same as getDatabase(const String & database_name), but if database_name is empty, current database of local_context is used
-    DatabasePtr getDatabase(const String & database_name, ContextPtr local_context) const;
 
     /// For all of the following methods database_name in table_id must be not empty (even for temporary tables).
     void assertTableDoesntExist(const StorageID & table_id, ContextPtr context) const;
@@ -199,10 +199,6 @@ public:
     void addDependency(const StorageID & from, const StorageID & where);
     void removeDependency(const StorageID & from, const StorageID & where);
     Dependencies getDependencies(const StorageID & from) const;
-
-    void addMemoryTableDependency(const StorageID & local_table_id, const StorageID & memory_table_id);
-    void removeMemoryTableDependency(const StorageID & local_table_id);
-    std::optional<MemoryTableInfo> tryGetDependencyMemoryTable(const StorageID & local_table_id, ContextPtr local_context) const;
 
     /// For Materialized and Live View
     void updateDependency(const StorageID & old_from, const StorageID & old_where,const StorageID & new_from, const StorageID & new_where);
@@ -242,6 +238,10 @@ private:
     explicit DatabaseCatalog(ContextMutablePtr global_context_);
     void assertDatabaseExistsUnlocked(const String & database_name) const;
     void assertDatabaseDoesntExistUnlocked(const String & database_name) const;
+    DatabasePtr getDatabase(const String & database_name) const;
+    DatabasePtr tryGetDatabase(const String & database_name) const;
+    DatabasePtr getDatabase(const UUID & uuid) const;
+    DatabasePtr tryGetDatabase(const UUID & uuid) const;
 
     DatabasePtr tryGetDatabaseCnch(const String & database_name) const;
     DatabasePtr tryGetDatabaseCnch(const String & database_name, ContextPtr context) const;
@@ -265,7 +265,7 @@ private:
         return uuid.toUnderType().items[0] >> (64 - bits_for_first_level);
     }
 
-    inline bool preferCnchCatalog(const ContextPtr & context) const;
+    inline bool preferCnchCatalog(const Context & context) const;
 
     struct TableMarkedAsDropped
     {
@@ -288,7 +288,6 @@ private:
     mutable std::mutex databases_mutex;
 
     ViewDependencies view_dependencies;
-    MemoryTableDependencies memory_table_dependencies;
 
     Databases databases;
     UUIDToDatabaseMap db_uuid_map;

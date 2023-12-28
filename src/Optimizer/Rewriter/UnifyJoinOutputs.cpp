@@ -70,7 +70,6 @@ PlanNodePtr UnifyJoinOutputs::Rewriter::visitPlanNode(PlanNodeBase & node, std::
         return node.shared_from_this();
 
     PlanNodes children;
-    DataStreams inputs;
     for (const auto & child : node.getChildren())
     {
         std::set<String> require;
@@ -79,12 +78,7 @@ PlanNodePtr UnifyJoinOutputs::Rewriter::visitPlanNode(PlanNodeBase & node, std::
 
         auto result = VisitorUtil::accept(child, *this, require);
         children.emplace_back(result);
-        inputs.push_back(result->getStep()->getOutputStream());
     }
-
-    auto new_step = node.getStep()->copy(context);
-    new_step->setInputStreams(inputs);
-    node.setStep(new_step);
 
     node.replaceChildren(children);
     return node.shared_from_this();
@@ -161,6 +155,8 @@ PlanNodePtr UnifyJoinOutputs::Rewriter::visitJoinNode(JoinNode & node, std::set<
         DataStream{new_outputs},
         step->getKind(),
         step->getStrictness(),
+        step->getMaxStreams(),
+        step->getKeepLeftReadInOrder(),
         std::move(left_keys),
         std::move(right_keys),
         step->getFilter(),
@@ -168,7 +164,12 @@ PlanNodePtr UnifyJoinOutputs::Rewriter::visitJoinNode(JoinNode & node, std::set<
         step->getRequireRightKeys(),
         step->getAsofInequality(),
         step->getDistributionType(),
-        step->isMagic());
+        step->getJoinAlgorithm(),
+        step->isMagic(),
+        step->isOrdered(),
+        step->isSimpleReordered(),
+        step->getRuntimeFilterBuilders(),
+        step->getHints());
     return PlanNodeBase::createPlanNode(node.getId(), new_step, PlanNodes{left, right});
 }
 
@@ -181,11 +182,6 @@ PlanNodePtr UnifyJoinOutputs::Rewriter::visitCTERefNode(CTERefNode & node, std::
             mapped.emplace(step->getOutputColumns().at(item));
 
     auto cte_plan = cte_helper.acceptAndUpdate(step->getId(), *this, mapped);
-    auto new_step = std::dynamic_pointer_cast<CTERefStep>(node.getStep()->copy(context));
-    DataStreams input_streams;
-    input_streams.emplace_back(cte_plan->getStep()->getOutputStream());
-    new_step->setInputStreams(input_streams);
-    node.setStep(new_step);
     return node.shared_from_this();
 }
 

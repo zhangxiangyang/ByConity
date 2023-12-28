@@ -47,10 +47,14 @@ bvar::Adder<int> & getExecuteMetric(CnchBGThreadType type)
             return g_executeImpl_DedupWorker;
         case CnchBGThreadType::GlobalGC:
             return g_executeImpl_GlobalGC;
+        case CnchBGThreadType::AutoStatistics:
+            return g_executeImpl_AutoStatistics;
         case CnchBGThreadType::TxnGC:
             return g_executeImpl_TxnGC;
         case CnchBGThreadType::Clustering:
             return g_executeImpl_Clustering;
+        case CnchBGThreadType::MaterializedMySQL:
+            return g_executeImpl_MaterializedMySQL;
         default:
             throw Exception(String{"No metric add for daemon job type "} + toString(type) + ", this is coding mistake", ErrorCodes::LOGICAL_ERROR);
     }
@@ -71,10 +75,14 @@ bvar::Adder<int> & getExecuteErrorMetric(CnchBGThreadType type)
             return g_executeImpl_DedupWorker_error;
         case CnchBGThreadType::GlobalGC:
             return g_executeImpl_GlobalGC_error;
+        case CnchBGThreadType::AutoStatistics:
+            return g_executeImpl_AutoStatistics_error;
         case CnchBGThreadType::TxnGC:
             return g_executeImpl_TxnGC_error;
         case CnchBGThreadType::Clustering:
             return g_executeImpl_Clustering_error;
+        case CnchBGThreadType::MaterializedMySQL:
+            return g_executeImpl_MaterializedMySQL_error;
         default:
             throw Exception(String{"No error metric add for daemon job type "} + toString(type) + ", this is coding mistake", ErrorCodes::LOGICAL_ERROR);
     }

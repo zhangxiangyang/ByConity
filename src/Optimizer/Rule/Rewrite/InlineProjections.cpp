@@ -17,6 +17,7 @@
 
 #include <Optimizer/ExpressionDeterminism.h>
 #include <Optimizer/ExpressionInliner.h>
+#include <Optimizer/Rewriter/BitmapIndexSplitter.h>
 #include <Optimizer/Rule/Patterns.h>
 #include <Optimizer/SymbolUtils.h>
 #include <Optimizer/SymbolsExtractor.h>
@@ -27,25 +28,36 @@ namespace DB
 {
 PatternPtr InlineProjections::getPattern() const
 {
-    return Patterns::project()->withSingle(Patterns::project());
+    return Patterns::project().withSingle(Patterns::project()).result();
 }
 
 TransformResult InlineProjections::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
 {
     auto & parent = node;
+    const auto & step = dynamic_cast<const ProjectionStep &>(*node->getStep());
     auto & child = node->getChildren()[0];
-    return TransformResult::of(inlineProjections(parent, child, rule_context.context));
+    const auto & child_step = dynamic_cast<const ProjectionStep &>(*child->getStep());
+    if (step.isFinalProject())
+    {
+        for (const auto & item : child_step.getAssignments())
+        {
+            auto func_count = CollectFuncs::collect(item.second, rule_context.context).size();
+            if (func_count > 0)
+                return {};
+        }
+    }
+    return TransformResult::of(inlineProjections(parent, child, rule_context.context, inline_arraysetcheck));
 }
 
 std::optional<PlanNodePtr>
-InlineProjections::inlineProjections(PlanNodePtr & parent_node, PlanNodePtr & child_node, ContextMutablePtr & context)
+InlineProjections::inlineProjections(PlanNodePtr & parent_node, PlanNodePtr & child_node, ContextMutablePtr & context, bool inline_arraysetcheck)
 {
-    auto parent = dynamic_cast<ProjectionNode *>(parent_node.get());
-    auto child = dynamic_cast<ProjectionNode *>(child_node.get());
+    auto *parent = dynamic_cast<ProjectionNode *>(parent_node.get());
+    auto *child = dynamic_cast<ProjectionNode *>(child_node.get());
     if (!parent || !child)
         return {};
 
-    std::set<String> targets = extractInliningTargets(parent, child, context);
+    std::set<String> targets = extractInliningTargets(parent, child, context, inline_arraysetcheck);
     if (targets.empty())
     {
         return std::nullopt;
@@ -119,23 +131,10 @@ InlineProjections::inlineProjections(PlanNodePtr & parent_node, PlanNodePtr & ch
 
     for (const String & input : inputs)
     {
-        if (input_types.contains(input))
+        if (input_types.contains(input) && !new_child_assignments.count(input))
         {
             new_child_assignments.emplace_back(Assignment{input, std::make_shared<ASTIdentifier>(input)});
             new_child_types[input] = input_types.at(input);
-        }
-    }
-
-    // merge dynamic filters
-    auto new_dynamic_filters = parent_step.getDynamicFilters();
-    for (const auto & dynamic_filter : child_step.getDynamicFilters())
-    {
-        const auto & name = dynamic_filter.first;
-        new_dynamic_filters.emplace(dynamic_filter);
-        if (!new_parent_types.contains(name))
-        {
-            new_parent_assignments.emplace_back(Assignment{name, std::make_shared<ASTIdentifier>(name)});
-            new_parent_types.emplace(name, new_child_types.at(name));
         }
     }
 
@@ -155,7 +154,8 @@ InlineProjections::inlineProjections(PlanNodePtr & parent_node, PlanNodePtr & ch
         new_child_node->getStep()->getOutputStream(),
         new_parent_assignments,
         new_parent_types,
-        parent_step.isFinalProject() /*, new_dynamic_filters*/);
+        parent_step.isFinalProject(),
+        parent_step.isIndexProject());
     return std::make_shared<ProjectionNode>(parent->getId(), std::move(new_parent_step), PlanNodes{new_child_node});
 }
 
@@ -167,7 +167,7 @@ InlineProjections::inlineProjections(PlanNodePtr & parent_node, PlanNodePtr & ch
  *      b. are not identity projections
  * which come from the child, as opposed to an enclosing scope.
  */
-std::set<String> InlineProjections::extractInliningTargets(ProjectionNode * parent, ProjectionNode * child, ContextMutablePtr & context)
+std::set<String> InlineProjections::extractInliningTargets(ProjectionNode * parent, ProjectionNode * child, ContextMutablePtr & context, bool inline_arraysetcheck)
 {
     std::set<String> child_output_set;
     for (const auto & column : child->getStep()->getOutputStream().header)
@@ -179,7 +179,7 @@ std::set<String> InlineProjections::extractInliningTargets(ProjectionNode * pare
     const auto & child_step = *child->getStep();
 
     std::unordered_map<String, UInt32> dependencies;
-    for (auto & assignment : parent_step.getAssignments())
+    for (const auto & assignment : parent_step.getAssignments())
     {
         auto expr = assignment.second;
         std::set<std::string> symbols = SymbolsExtractor::extract(expr);
@@ -188,6 +188,13 @@ std::set<String> InlineProjections::extractInliningTargets(ProjectionNode * pare
             if (child_output_set.contains(symbol))
             {
                 dependencies[symbol]++;
+            }
+        }
+        if (inline_arraysetcheck)
+        {
+            if (Poco::toLower(tryGetFunctionName(expr.get()).value_or("")) == "arrayjoin")
+            {
+                return {};
             }
         }
     }
@@ -215,9 +222,10 @@ std::set<String> InlineProjections::extractInliningTargets(ProjectionNode * pare
             continue;
         }
 
-        auto& expr = child_step.getAssignments().at(symbol);
+        const auto& expr = child_step.getAssignments().at(symbol);
+        bool must_inline = inline_arraysetcheck && Poco::toLower(tryGetFunctionName(expr.get()).value_or("")) == "arraysetcheck";
 
-        if(!ExpressionDeterminism::isDeterministic(expr, context)) {
+        if(!ExpressionDeterminism::isDeterministic(expr, context) && !must_inline) {
             continue;
         }
 
@@ -274,7 +282,7 @@ ASTPtr InlineProjections::inlineReferences(const ConstASTPtr & expression, Assig
 
 PatternPtr InlineProjectionIntoJoin::getPattern() const
 {
-    return Patterns::join();
+    return Patterns::join().result();
 }
 
 TransformResult InlineProjectionIntoJoin::transformImpl(PlanNodePtr node, const Captures &, RuleContext & context)
@@ -315,6 +323,8 @@ TransformResult InlineProjectionIntoJoin::transformImpl(PlanNodePtr node, const 
         DataStream{.header = join_step.getOutputStream().header},
         join_step.getKind(),
         join_step.getStrictness(),
+        join_step.getMaxStreams(),
+        join_step.getKeepLeftReadInOrder(),
         join_step.getLeftKeys(),
         join_step.getRightKeys(),
         join_step.getFilter(),
@@ -322,7 +332,12 @@ TransformResult InlineProjectionIntoJoin::transformImpl(PlanNodePtr node, const 
         join_step.getRequireRightKeys(),
         join_step.getAsofInequality(),
         join_step.getDistributionType(),
-        join_step.isMagic());
+        join_step.getJoinAlgorithm(),
+        join_step.isMagic(),
+        join_step.isOrdered(),
+        join_step.isSimpleReordered(),
+        join_step.getRuntimeFilterBuilders(),
+        join_step.getHints());
     PlanNodePtr new_join_node = std::make_shared<JoinNode>(context.context->nextNodeId(), std::move(new_join_step), PlanNodes{left, right});
     return new_join_node;
 }
@@ -330,8 +345,8 @@ TransformResult InlineProjectionIntoJoin::transformImpl(PlanNodePtr node, const 
 PatternPtr InlineProjectionOnJoinIntoJoin::getPattern() const
 {
     return Patterns::project()
-        ->matchingStep<ProjectionStep>([](const auto & step) { return Utils::isIdentity(step); })
-        ->withSingle(Patterns::join());
+        .matchingStep<ProjectionStep>([](const auto & step) { return Utils::isIdentity(step); })
+        .withSingle(Patterns::join()).result();
 }
 
 TransformResult InlineProjectionOnJoinIntoJoin::transformImpl(PlanNodePtr node, const Captures &, RuleContext & context)
@@ -344,6 +359,8 @@ TransformResult InlineProjectionOnJoinIntoJoin::transformImpl(PlanNodePtr node, 
         DataStream{.header = projection_step->getOutputStream().header},
         join_step->getKind(),
         join_step->getStrictness(),
+        join_step->getMaxStreams(),
+        join_step->getKeepLeftReadInOrder(),
         join_step->getLeftKeys(),
         join_step->getRightKeys(),
         join_step->getFilter(),
@@ -351,7 +368,12 @@ TransformResult InlineProjectionOnJoinIntoJoin::transformImpl(PlanNodePtr node, 
         join_step->getRequireRightKeys(),
         join_step->getAsofInequality(),
         join_step->getDistributionType(),
-        join_step->isMagic());
+        join_step->getJoinAlgorithm(),
+        join_step->isMagic(),
+        join_step->isOrdered(),
+        join_step->isSimpleReordered(),
+        join_step->getRuntimeFilterBuilders(),
+        join_step->getHints());
 
     return {PlanNodeBase::createPlanNode(context.context->nextNodeId(), new_join_step, node->getChildren()[0]->getChildren())};
 }

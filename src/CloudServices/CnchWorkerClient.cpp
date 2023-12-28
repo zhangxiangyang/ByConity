@@ -15,19 +15,23 @@
 
 #include <CloudServices/CnchWorkerClient.h>
 
+#include <CloudServices/CnchServerResource.h>
+#include <CloudServices/DedupWorkerStatus.h>
 #include <Interpreters/Context.h>
 #include <Protos/DataModelHelpers.h>
 #include <Protos/RPCHelpers.h>
 #include <Protos/cnch_worker_rpc.pb.h>
 #include <Storages/IStorage.h>
+#include <Storages/StorageCnchMergeTree.h>
 #include <Transaction/ICnchTransaction.h>
-#include <CloudServices/DedupWorkerStatus.h>
 #include <WorkerTasks/ManipulationList.h>
 #include <WorkerTasks/ManipulationTaskParams.h>
+#include "Storages/Hive/HiveFile/IHiveFile.h"
 
 #include <brpc/channel.h>
 #include <brpc/controller.h>
-
+#include <common/logger_useful.h>
+#include <Storages/MergeTree/MarkRange.h>
 namespace DB
 {
 CnchWorkerClient::CnchWorkerClient(String host_port_)
@@ -43,7 +47,7 @@ CnchWorkerClient::CnchWorkerClient(HostWithPorts host_ports_)
 CnchWorkerClient::~CnchWorkerClient() = default;
 
 void CnchWorkerClient::submitManipulationTask(
-    const MergeTreeMetaBase & storage, const ManipulationTaskParams & params, TxnTimestamp txn_id, TxnTimestamp begin_ts)
+    const MergeTreeMetaBase & storage, const ManipulationTaskParams & params, TxnTimestamp txn_id)
 {
     if (!params.rpc_port)
         throw Exception("Rpc port is not set in ManipulationTaskParams", ErrorCodes::LOGICAL_ERROR);
@@ -53,7 +57,7 @@ void CnchWorkerClient::submitManipulationTask(
     Protos::SubmitManipulationTaskResp response;
 
     request.set_txn_id(txn_id);
-    request.set_timestamp(begin_ts);
+    request.set_timestamp(0); /// NOTE: do not remove this as `timestamp` is a required field.
     request.set_type(static_cast<UInt32>(params.type));
     request.set_task_id(params.task_id);
     request.set_rpc_port(params.rpc_port);
@@ -76,13 +80,18 @@ void CnchWorkerClient::submitManipulationTask(
     RPCHelpers::checkResponse(response);
 }
 
-void CnchWorkerClient::shutdownManipulationTasks(const UUID & table_uuid)
+void CnchWorkerClient::shutdownManipulationTasks(const UUID & table_uuid, const Strings & task_ids)
 {
     brpc::Controller cntl;
     Protos::ShutdownManipulationTasksReq request;
     Protos::ShutdownManipulationTasksResp response;
 
     RPCHelpers::fillUUID(table_uuid, *request.mutable_table_uuid());
+    if (!task_ids.empty())
+    {
+        std::for_each(task_ids.begin(), task_ids.end(), [&request](const String & task_id) { request.add_task_ids(task_id); });
+    }
+
     stub->shutdownManipulationTasks(&cntl, &request, &response, nullptr);
 
     assertController(cntl);
@@ -120,6 +129,8 @@ std::vector<ManipulationInfo> CnchWorkerClient::getManipulationTasksStatus()
     RPCHelpers::checkResponse(response);
 
     std::vector<ManipulationInfo> res;
+    res.reserve(response.tasks_size());
+
     for (const auto & task : response.tasks())
     {
         ManipulationInfo info(RPCHelpers::createStorageID(task.storage_id()));
@@ -134,6 +145,7 @@ std::vector<ManipulationInfo> CnchWorkerClient::getManipulationTasksStatus()
         info.partition_id = task.partition_id();
         info.total_size_bytes_compressed = task.total_size_bytes_compressed();
         info.total_size_marks = task.total_size_marks();
+        info.total_rows_count = task.total_rows_count();
         info.progress = task.progress();
         info.bytes_read_uncompressed = task.bytes_read_uncompressed();
         info.bytes_written_uncompressed = task.bytes_written_uncompressed();
@@ -170,30 +182,66 @@ void CnchWorkerClient::sendCreateQueries(const ContextPtr & context, const std::
     RPCHelpers::checkResponse(response);
 }
 
-brpc::CallId CnchWorkerClient::sendCnchHiveDataParts(
+brpc::CallId CnchWorkerClient::preloadDataParts(
     const ContextPtr & context,
-    const StoragePtr & storage,
-    const String & local_table_name,
-    const HiveDataPartsCNCHVector & parts,
-    ExceptionHandler & handler)
+    const TxnTimestamp & txn_id,
+    const IStorage & storage,
+    const String & create_local_table_query,
+    const ServerDataPartsVector & parts,
+    const ExceptionHandlerPtr & handler,
+    bool enable_parts_sync_preload,
+    UInt64 parts_preload_level,
+    UInt64 submit_ts
+   )
 {
-    Protos::SendCnchHiveDataPartsReq request;
-
-    request.set_txn_id(context->getCurrentTransactionID());
-    request.set_database_name(storage->getDatabaseName());
-    request.set_table_name(local_table_name);
-    fillCnchHivePartsModel(parts, *request.mutable_parts());
+    Protos::PreloadDataPartsReq request;
+    request.set_txn_id(txn_id);
+    request.set_create_table_query(create_local_table_query);
+    request.set_sync(enable_parts_sync_preload);
+    request.set_preload_level(parts_preload_level);
+    request.set_submit_ts(submit_ts);
+    fillPartsModelForSend(storage, parts, *request.mutable_parts());
 
     auto * cntl = new brpc::Controller();
-    Protos::SendCnchHiveDataPartsResp * response = new Protos::SendCnchHiveDataPartsResp();
+    auto * response = new Protos::PreloadDataPartsResp();
+    /// adjust the timeout to prevent timeout if there are too many parts to send,
     const auto & settings = context->getSettingsRef();
-    auto send_timeout = std::max(settings.max_execution_time.value.totalMilliseconds() >> 1, 30 * 1000L);
+    auto send_timeout = std::max(settings.max_execution_time.value.totalMilliseconds() >> 1, settings.brpc_data_parts_timeout_ms.totalMilliseconds());
     cntl->set_timeout_ms(send_timeout);
 
     auto call_id = cntl->call_id();
-    stub->sendCnchHiveDataParts(cntl, &request, response, brpc::NewCallback(RPCHelpers::onAsyncCallDone, response, cntl, &handler));
-
+    stub->preloadDataParts(cntl, &request, response, brpc::NewCallback(RPCHelpers::onAsyncCallDone, response, cntl, handler));
     return call_id;
+}
+
+brpc::CallId CnchWorkerClient::dropPartDiskCache(
+    const ContextPtr & context,
+    const TxnTimestamp & txn_id,
+    const IStorage & storage,
+    const String & create_local_table_query,
+    const ServerDataPartsVector & parts,
+    bool sync,
+    bool drop_vw_disk_cache)
+{
+    brpc::Controller cntl;
+    Protos::DropPartDiskCacheReq request;
+    Protos::DropPartDiskCacheResp response;
+
+    const auto & settings = context->getSettingsRef();
+    auto send_timeout = std::max(settings.max_execution_time.value.totalMilliseconds() >> 1, settings.brpc_data_parts_timeout_ms.totalMilliseconds());
+    cntl.set_timeout_ms(send_timeout);
+
+    request.set_txn_id(txn_id);
+    request.set_create_table_query(create_local_table_query);
+    request.set_sync(sync);
+    request.set_drop_vw_disk_cache(drop_vw_disk_cache);
+
+    fillPartsModelForSend(storage, parts, *request.mutable_parts());
+    stub->dropPartDiskCache(&cntl, &request, &response, nullptr);
+
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+    return cntl.call_id();
 }
 
 brpc::CallId CnchWorkerClient::sendQueryDataParts(
@@ -202,12 +250,14 @@ brpc::CallId CnchWorkerClient::sendQueryDataParts(
     const String & local_table_name,
     const ServerDataPartsVector & data_parts,
     const std::set<Int64> & required_bucket_numbers,
-    ExceptionHandler & handler)
+    const ExceptionHandlerWithFailedInfoPtr & handler,
+    const WorkerId & worker_id)
 {
     Protos::SendDataPartsReq request;
     request.set_txn_id(context->getCurrentTransactionID());
     request.set_database_name(storage->getDatabaseName());
     request.set_table_name(local_table_name);
+    request.set_disk_cache_mode(context->getSettingsRef().disk_cache_mode.toString());
 
     fillBasePartAndDeleteBitmapModels(*storage, data_parts, *request.mutable_parts(), *request.mutable_bitmaps());
     for (const auto & bucket_num : required_bucket_numbers)
@@ -227,24 +277,110 @@ brpc::CallId CnchWorkerClient::sendQueryDataParts(
     auto * response = new Protos::SendDataPartsResp();
     /// adjust the timeout to prevent timeout if there are too many parts to send,
     const auto & settings = context->getSettingsRef();
-    auto send_timeout = std::max(settings.max_execution_time.value.totalMilliseconds() >> 1, 30 * 1000L);
+    auto send_timeout = std::max(settings.max_execution_time.value.totalMilliseconds() >> 1, settings.brpc_data_parts_timeout_ms.totalMilliseconds());
     cntl->set_timeout_ms(send_timeout);
 
     auto call_id = cntl->call_id();
-    stub->sendQueryDataParts(cntl, &request, response, brpc::NewCallback(RPCHelpers::onAsyncCallDone, response, cntl, &handler));
+    stub->sendQueryDataParts(
+        cntl, &request, response, brpc::NewCallback(RPCHelpers::onAsyncCallDoneWithFailedInfo, response, cntl, handler, worker_id));
 
     return call_id;
 }
 
-brpc::CallId CnchWorkerClient::sendOffloadingInfo(
+brpc::CallId CnchWorkerClient::sendOffloadingInfo( // NOLINT
     [[maybe_unused]] const ContextPtr & context,
     [[maybe_unused]] const HostWithPortsVec & read_workers,
     [[maybe_unused]] const std::vector<std::pair<StorageID, String>> & worker_table_names,
     [[maybe_unused]] const std::vector<HostWithPortsVec> & buffer_workers_vec,
-    [[maybe_unused]] ExceptionHandler & handler)
+    [[maybe_unused]] const ExceptionHandlerPtr & handler)
 {
     /// TODO:
     return {};
+}
+
+brpc::CallId CnchWorkerClient::sendResources(
+    const ContextPtr & context,
+    const std::vector<AssignedResource> & resources_to_send,
+    const ExceptionHandlerWithFailedInfoPtr & handler,
+    const WorkerId & worker_id,
+    bool with_mutations)
+{
+    Protos::SendResourcesReq request;
+
+    const auto & settings = context->getSettingsRef();
+    auto max_execution_time = settings.max_execution_time.value.totalSeconds();
+
+    request.set_txn_id(context->getCurrentTransactionID());
+    request.set_primary_txn_id(context->getCurrentTransaction()->getPrimaryTransactionID());
+    /// recycle_timeout refers to the time when the session is recycled under abnormal case,
+    /// so it should be larger than max_execution_time to make sure the session is not to be destroyed in advance.
+    auto recycle_timeout = max_execution_time ? max_execution_time + 60 : 3600;
+    request.set_timeout(recycle_timeout);
+
+    for (const auto & resource : resources_to_send)
+    {
+        if (!resource.sent_create_query)
+            request.add_create_queries(resource.create_table_query);
+
+        /// parts
+        auto & table_data_parts = *request.mutable_data_parts()->Add();
+
+        /// Send storage's mutations to worker if needed.
+        if (with_mutations)
+        {
+            auto * cnch_merge_tree = dynamic_cast<StorageCnchMergeTree *>(resource.storage.get());
+            if (cnch_merge_tree)
+            {
+                for (auto const & mutation_str : cnch_merge_tree->getPlainMutationEntries())
+                {
+                    LOG_TRACE(&Poco::Logger::get(__func__), "Send mutations to worker: {}", mutation_str);
+                    table_data_parts.add_cnch_mutation_entries(mutation_str);
+                }
+            }
+        }
+
+        table_data_parts.set_database(resource.storage->getDatabaseName());
+        table_data_parts.set_table(resource.worker_table_name);
+
+        if (!resource.server_parts.empty())
+        {
+            // todo(jiashuo): bitmap need handler?
+            fillBasePartAndDeleteBitmapModels(
+                *resource.storage,
+                resource.server_parts,
+                *table_data_parts.mutable_server_parts(),
+                *table_data_parts.mutable_server_part_bitmaps());
+        }
+
+        if (!resource.hive_parts.empty())
+        {
+            auto * mutable_hive_parts = table_data_parts.mutable_hive_parts();
+            RPCHelpers::serialize(*mutable_hive_parts, resource.hive_parts);
+        }
+
+        if (!resource.file_parts.empty())
+        {
+            fillCnchFilePartsModel(resource.file_parts, *table_data_parts.mutable_file_parts());
+        }
+
+        /// bucket numbers
+        for (const auto & bucket_num : resource.bucket_numbers)
+            *table_data_parts.mutable_bucket_numbers()->Add() = bucket_num;
+    }
+
+    request.set_disk_cache_mode(context->getSettingsRef().disk_cache_mode.toString());
+
+    brpc::Controller * cntl = new brpc::Controller;
+    /// send_timeout refers to the time to send resource to worker
+    /// If max_execution_time is not set, the send_timeout will be set to brpc_data_parts_timeout_ms
+    auto send_timeout_ms = max_execution_time ? max_execution_time * 1000L : settings.brpc_data_parts_timeout_ms.totalMilliseconds();
+    cntl->set_timeout_ms(send_timeout_ms);
+    const auto call_id = cntl->call_id();
+    auto * response = new Protos::SendResourcesResp();
+    LOG_INFO(&Poco::Logger::get(__func__), request.DebugString());
+    stub->sendResources(cntl, &request, response, brpc::NewCallback(RPCHelpers::onAsyncCallDoneWithFailedInfo, response, cntl, handler, worker_id));
+
+    return call_id;
 }
 
 void CnchWorkerClient::removeWorkerResource(TxnTimestamp txn_id)
@@ -286,7 +422,6 @@ void CnchWorkerClient::dropDedupWorker(const StorageID & storage_id)
     stub->dropDedupWorker(&cntl, &request, &response, nullptr);
     assertController(cntl);
     RPCHelpers::checkResponse(response);
-
 }
 
 DedupWorkerStatus CnchWorkerClient::getDedupWorkerStatus(const StorageID & storage_id)
@@ -357,6 +492,7 @@ void CnchWorkerClient::submitKafkaConsumeTask(const KafkaTaskCommand & command)
     request.set_type(command.type);
     request.set_task_id(command.task_id);
     request.set_rpc_port(command.rpc_port);
+    RPCHelpers::fillStorageID(command.cnch_storage_id, *request.mutable_cnch_storage_id());
     request.set_database(command.local_database_name);
     request.set_table(command.local_table_name);
     request.set_assigned_consumer(command.assigned_consumer);
@@ -371,15 +507,59 @@ void CnchWorkerClient::submitKafkaConsumeTask(const KafkaTaskCommand & command)
         cur_tpl->set_partition(tpl.get_partition());
         cur_tpl->set_offset(tpl.get_offset());
     }
-    if (command.type == KafkaTaskCommand::START_CONSUME)
-    {
-        RPCHelpers::fillStorageID(command.cnch_storage_id, *request.mutable_cnch_storage_id());
-    }
 
     stub->submitKafkaConsumeTask(&cntl, &request, &response, nullptr);
 
     assertController(cntl);
     RPCHelpers::checkResponse(response);
+}
+#endif
+
+#if USE_MYSQL
+void CnchWorkerClient::submitMySQLSyncThreadTask(const MySQLSyncThreadCommand & command)
+{
+    brpc::Controller cntl;
+    Protos::SubmitMySQLSyncThreadTaskReq request;
+    Protos::SubmitMySQLSyncThreadTaskResp response;
+
+    request.set_type(command.type);
+    request.set_database_name(command.database_name);
+    request.set_sync_thread_key(command.sync_thread_key);
+    request.set_rpc_port(command.rpc_port);
+    request.set_table(command.table);
+
+    if (command.type == MySQLSyncThreadCommand::START_SYNC)
+    {
+        for (const auto & create_sql : command.create_sqls)
+            request.add_create_sqls(create_sql);
+
+        request.set_binlog_file(command.binlog.binlog_file);
+        request.set_binlog_position(command.binlog.binlog_position);
+        request.set_executed_gtid_set(command.binlog.executed_gtid_set);
+        request.set_meta_version(command.binlog.meta_version);
+    }
+
+    stub->submitMySQLSyncThreadTask(&cntl, &request, &response, nullptr);
+
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+}
+
+bool CnchWorkerClient::checkMySQLSyncThreadStatus(const String & database_name, const String & sync_thread)
+{
+    brpc::Controller cntl;
+    Protos::CheckMySQLSyncThreadStatusReq request;
+    Protos::CheckMySQLSyncThreadStatusResp response;
+
+    request.set_database_name(database_name);
+    request.set_sync_thread_key(sync_thread);
+
+    stub->checkMySQLSyncThreadStatus(&cntl, &request, &response, nullptr);
+
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+
+    return response.is_running();
 }
 #endif
 

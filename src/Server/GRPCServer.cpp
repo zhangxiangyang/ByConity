@@ -560,6 +560,7 @@ namespace
 
         void finishQuery();
         void onException(const Exception & exception);
+        void handleException(const Exception & exception);
         void onFatalError();
         void close();
 
@@ -763,7 +764,7 @@ namespace
         /// Set the current database if specified.
         if (!query_info.database().empty())
         {
-            if (!DatabaseCatalog::instance().isDatabaseExist(query_info.database()))
+            if (!DatabaseCatalog::instance().isDatabaseExist(query_info.database(), query_context))
                 throw Exception("Database " + query_info.database() + " doesn't exist", ErrorCodes::UNKNOWN_DATABASE);
             query_context->setCurrentDatabase(query_info.database());
         }
@@ -776,7 +777,7 @@ namespace
         query_text = std::move(*(query_info.mutable_query()));
         const char * begin = query_text.data();
         const char * end = begin + query_text.size();
-        ParserQuery parser(end, ParserSettings::valueOf(settings.dialect_type));
+        ParserQuery parser(end, ParserSettings::valueOf(settings));
         ast = parseQuery(parser, begin, end, "", settings.max_query_size, settings.max_parser_depth);
 
         /// Choose input format.
@@ -989,7 +990,7 @@ namespace
                         column.type = DataTypeFactory::instance().get(name_and_type.type());
                         columns.emplace_back(std::move(column));
                     }
-                    auto temporary_table = TemporaryTableHolder(query_context, ColumnsDescription{columns}, {});
+                    auto temporary_table = TemporaryTableHolder(query_context, ColumnsDescription{columns}, {}, {}, {});
                     storage = temporary_table.getTable();
                     query_context->addExternalTable(temporary_id.table_name, std::move(temporary_table));
                 }
@@ -1217,10 +1218,8 @@ namespace
             static_cast<double>(waited_for_client_writing) / 1000000000ULL);
     }
 
-    void Call::onException(const Exception & exception)
+    void Call::handleException(const Exception & exception)
     {
-        io.onException();
-
         LOG_ERROR(log, "Code: {}, e.displayText() = {}, Stack trace:\n\n{}", exception.code(), exception.displayText(), exception.getStackTraceString());
 
         if (responder && !responder_finished)
@@ -1246,6 +1245,19 @@ namespace
         }
 
         close();
+    }
+
+    void Call::onException(const Exception & exception)
+    {
+        try
+        {
+            io.onException();
+        }
+        catch (Exception & exception)
+        {
+            handleException(exception);
+        }
+        handleException(exception);
     }
 
     void Call::onFatalError()

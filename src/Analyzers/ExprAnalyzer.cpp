@@ -21,6 +21,7 @@
 #include <Analyzers/function_utils.h>
 #include <Core/ColumnsWithTypeAndName.h>
 #include <Common/StringUtils/StringUtils.h>
+#include <Parsers/ASTTableColumnReference.h>
 #include <DataTypes/DataTypeFunction.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -30,11 +31,15 @@
 #include <DataTypes/FieldToDataType.h>
 #include <DataTypes/getLeastSupertype.h>
 #include <Functions/FunctionFactory.h>
+#include <Functions/FunctionHelpers.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Interpreters/misc.h>
 #include <IO/WriteHelpers.h>
 #include <Parsers/ASTVisitor.h>
 #include <QueryPlan/Void.h>
+#include <DataTypes/DataTypeMap.h>
+#include <Interpreters/join_common.h>
+#include <Functions/InternalFunctionRuntimeFilter.h>
 
 #include <Poco/String.h>
 
@@ -71,21 +76,22 @@ public:
     ColumnWithTypeAndName visitASTLiteral(ASTPtr & node, const Void &) override;
     ColumnWithTypeAndName visitASTOrderByElement(ASTPtr & node, const Void &) override;
     ColumnWithTypeAndName visitASTQuantifiedComparison(ASTPtr & node, const Void &) override;
+    ColumnWithTypeAndName visitASTTableColumnReference(ASTPtr & node, const Void &) override;
 
-    ExprAnalyzerVisitor(ContextMutablePtr context_, Analysis & analysis_, ScopePtr scope_, ExprAnalyzerOptions options_):
-        context(std::move(context_)),
-        analysis(analysis_),
-        options(std::move(options_)),
-        use_ansi_semantic(context->getSettingsRef().dialect_type == DialectType::ANSI),
-        enable_implicit_type_conversion(context->getSettingsRef().enable_implicit_type_conversion),
-        allow_extended_conversion(context->getSettingsRef().allow_extended_type_conversion),
-        scopes({scope_})
+    ExprAnalyzerVisitor(ContextPtr context_, Analysis & analysis_, ScopePtr scope_, ExprAnalyzerOptions options_)
+        : context(std::move(context_))
+        , analysis(analysis_)
+        , options(std::move(options_))
+        , use_ansi_semantic(context->getSettingsRef().dialect_type != DialectType::CLICKHOUSE)
+        , enable_implicit_type_conversion(context->getSettingsRef().enable_implicit_type_conversion)
+        , allow_extended_conversion(context->getSettingsRef().allow_extended_type_conversion)
+        , scopes({scope_})
     {}
 
     void setInWindow(bool x) { in_window = x; }
 
 private:
-    ContextMutablePtr context;
+    ContextPtr context;
     Analysis & analysis;
     const ExprAnalyzerOptions options;
     const bool use_ansi_semantic;
@@ -135,19 +141,18 @@ private:
     ColumnWithTypeAndName analyzeInSubquery(ASTFunctionPtr & function);
     ColumnWithTypeAndName analyzeExistsSubquery(ASTFunctionPtr & function);
     ColumnWithTypeAndName analyzeOrdinaryFunction(ASTFunctionPtr & function);
+    void expandAsterisk(ASTs & nodes);
 
-    std::pair<AggregateFunctionPtr, Array> resolveAggregateFunction(ASTFunction & function);
+    std::tuple<AggregateFunctionPtr, Array, String> resolveAggregateFunction(ASTFunction & function);
     DataTypePtr handleSubquery(const ASTPtr & subquery);
     ColumnWithTypeAndName handleResolvedField(ASTPtr & node, const ResolvedField & field);
 
     void processSubqueryArgsWithCoercion(ASTPtr & lhs_ast, ASTPtr & rhs_ast);
+    void expandUntuple(ASTs & nodes);
+    static String getFunctionColumnName(const String & func_name, const ColumnsWithTypeAndName & arguments);
 };
 
-DataTypePtr ExprAnalyzer::analyze(ASTPtr expression,
-                                  ScopePtr scope,
-                                  ContextMutablePtr context,
-                                  Analysis & analysis,
-                                  ExprAnalyzerOptions options)
+DataTypePtr ExprAnalyzer::analyze(ASTPtr expression, ScopePtr scope, ContextPtr context, Analysis & analysis, ExprAnalyzerOptions options)
 {
     ExprAnalyzerVisitor expr_visitor {context, analysis, scope, options};
     return expr_visitor.process(expression).type;
@@ -155,15 +160,20 @@ DataTypePtr ExprAnalyzer::analyze(ASTPtr expression,
 
 ColumnWithTypeAndName ExprAnalyzerVisitor::process(ASTPtr & node)
 {
-    if (analysis.hasExpressionType(node))
-        return {analysis.getExpressionType(node), ""};
+    if (auto processed = analysis.tryGetExpressionColumnWithType(node))
+    {
+        if (processed->column)
+            return {processed->column, processed->type, ""};
+        else
+            return {processed->type, ""};
+    }
 
     auto result = ASTVisitorUtil::accept(node, *this, {});
 
     if (!result.type)
         throw Exception("Can not determine expression type: " + serializeAST(*node), ErrorCodes::LOGICAL_ERROR);
 
-    analysis.setExpressionType(node, result.type);
+    analysis.setExpressionColumnWithType(node, {result.type, result.column});
     return result;
 }
 
@@ -179,13 +189,20 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::visitNode(ASTPtr & node, const Void &
     throw Exception("Unsupported Node" + node->getID(), ErrorCodes::NOT_IMPLEMENTED);
 }
 
+ColumnWithTypeAndName ExprAnalyzerVisitor::visitASTTableColumnReference(ASTPtr & node, const Void &)
+{
+    auto & ref = node->as<ASTTableColumnReference &>();
+    auto name_and_type = ref.storage->getInMemoryMetadataPtr()->getColumns().getPhysical(ref.column_name);
+    return {nullptr, name_and_type.type, name_and_type.name};
+}
+
 ColumnWithTypeAndName ExprAnalyzerVisitor::visitASTLiteral(ASTPtr & node, const Void &)
 {
     auto & literal = node->as<ASTLiteral &>();
     DataTypePtr type = applyVisitor(FieldToDataType(), literal.value);
     // TODO: remove convertFieldToType if we have done in parser/rewriter phase
     ColumnPtr column = type->createColumnConst(1, convertFieldToType(literal.value, *type));
-    return {column, type, ""};
+    return {column, type, node->getColumnName()};
 }
 
 ColumnWithTypeAndName ExprAnalyzerVisitor::visitASTIdentifier(ASTPtr & node, const Void &)
@@ -220,15 +237,16 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::visitASTFieldReference(ASTPtr & node,
 ColumnWithTypeAndName ExprAnalyzerVisitor::visitASTOrderByElement(ASTPtr & node, const Void &)
 {
     auto & order_by = node->as<ASTOrderByElement &>();
-    // TODO: handle collation/fill_xxx fields
-    if (order_by.with_fill)
-        throw Exception("ORDER BY WITH FILL not implemented", ErrorCodes::NOT_IMPLEMENTED);
     return process(order_by.children.front());
 }
 
 ColumnWithTypeAndName ExprAnalyzerVisitor::visitASTFunction(ASTPtr & node, const Void &)
 {
     ASTFunctionPtr function_ptr = std::dynamic_pointer_cast<ASTFunction>(node);
+    expandUntuple(function_ptr->arguments->children);
+    expandAsterisk(function_ptr->arguments->children);
+    if (options.record_used_object)
+        analysis.addUsedFunction(function_ptr->name);
     auto function_type = getFunctionType(*function_ptr, context);
 
     if (function_type == FunctionType::WINDOW_FUNCTION)
@@ -264,7 +282,7 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::visitASTQuantifiedComparison(ASTPtr &
     auto & rhs_ast = quantified_comparison->children[1];
     processSubqueryArgsWithCoercion(lhs_ast, rhs_ast);
     analysis.quantified_comparison_subqueries[options.select_query].push_back(quantified_comparison);
-    return {nullptr, std::make_shared<DataTypeUInt8>(), ""};
+    return {nullptr, std::make_shared<DataTypeUInt8>(), node->getColumnName()};
 }
 
 
@@ -275,14 +293,14 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::visitASTSubquery(ASTPtr & node, const
     // when a scalar subquery has 0 rows, it returns NULL, hence we change its type to Nullable type
     // note that this feature is not compatible with subquery with multiple output returning Tuple type
     // see test 00420_null_in_scalar_subqueries
-    if (!type->isNullable() && type->canBeInsideNullable())
+    if (!type->isNullable() && JoinCommon::canBecomeNullable(type))
     {
-        type = makeNullable(type);
+        type = JoinCommon::tryConvertTypeToNullable(type);
         analysis.setTypeCoercion(node, type);
     }
 
     analysis.scalar_subqueries[options.select_query].push_back(node);
-    return {nullptr, type, ""};
+    return {nullptr, type, node->getColumnName()};
 }
 
 ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeOrdinaryFunction(ASTFunctionPtr & function)
@@ -292,6 +310,7 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeOrdinaryFunction(ASTFunctionPt
     ColumnsWithTypeAndName processed_arguments(arguments.size());
     DataTypes arguments_types(arguments.size());
     std::vector<size_t> lambda_arg_index;
+    bool all_const = true;
 
     for (size_t i = 0; i < arguments.size(); ++i)
     {
@@ -315,6 +334,8 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeOrdinaryFunction(ASTFunctionPt
 
             arguments_types[i] = processed_arguments[i].type;
         }
+        if (!processed_arguments[i].column)
+            all_const = false;
     }
 
     if (!lambda_arg_index.empty())
@@ -349,32 +370,76 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeOrdinaryFunction(ASTFunctionPt
 
             auto resolved_lambda_type = std::make_shared<DataTypeFunction>(lambda_type->getArgumentTypes(), lambda_ret_type);
             // since we don't call `process` for lambda argument, register its type manually
-            analysis.setExpressionType(arguments[index], resolved_lambda_type);
+            analysis.setExpressionColumnWithType(arguments[index], {resolved_lambda_type});
             processed_arguments[index] = {nullptr, resolved_lambda_type,""};
         }
     }
 
     auto function_base = overload_resolver->build(processed_arguments);
+    auto column_name = getFunctionColumnName(function->name, processed_arguments);
+
+    ColumnPtr res_col;
+    auto function_ret_type = function_base->getResultType();
+    if (options.evaluate_constant_expression && function_base->isSuitableForConstantFolding()
+        && !functionIsDictGet(function->name) // 01852_dictionary_found_rate_long
+        && !functionIsInOrGlobalInOperator(function->name))
+    {
+        if (all_const)
+            res_col = function_base->execute(processed_arguments, function_ret_type, 1, false);
+        else
+            res_col = function_base->getConstantResultForNonConstArguments(processed_arguments, function_ret_type);
+
+        if (res_col && isColumnConst(*res_col) && res_col->empty())
+            res_col = res_col->cloneResized(1);
+    }
 
     // post analysis for sub column optimization
     String func_name_lowercase = Poco::toLower(function->name);
 
+    auto check_subcolumn = [](const FieldDescription & field, auto && pred) {
+        if (!field.hasOriginInfo())
+            return false;
+
+        for (const auto & origin_col : field.origin_columns)
+            if (!pred(origin_col))
+                return false;
+
+        return true;
+    };
+
+    auto register_subcolumn = [&](const ASTPtr & ast, const ResolvedField & column_ref, const SubColumnID & sub_column_id) {
+        analysis.setSubColumnReference(ast, SubColumnReference{column_ref, sub_column_id});
+
+        for (const auto & origin_col : column_ref.getFieldDescription().origin_columns)
+            analysis.addReadSubColumn(origin_col.table_ast, origin_col.index_of_scope, sub_column_id);
+    };
     if ((startsWith(func_name_lowercase, "mapelement") || startsWith(func_name_lowercase, "arrayelement"))
         && function->arguments->children.size() == 2)
     {
         if (auto column_reference = analysis.tryGetColumnReference(function->arguments->children[0]))
         {
             const auto & resolved_field = column_reference->getFieldDescription();
-            if (resolved_field.origin_table &&
-                resolved_field.origin_table->supportsMapImplicitColumn() &&
-                !resolved_field.type->isMapKVStore())
+            if (check_subcolumn(resolved_field, [](const auto & origin_col) -> bool {
+                    if (!origin_col.storage->supportsMapImplicitColumn())
+                        return false;
+
+                    DataTypePtr type = origin_col.metadata_snapshot->columns.getPhysical(origin_col.column).type;
+                    return type->isMap() && !type->isMapKVStore();
+                }))
             {
+                String map_column_name;
                 if (auto * key_lit = function->arguments->children[1]->as<ASTLiteral>())
+                    map_column_name = key_lit->getColumnName();
+                else if (processed_arguments.size() > 1 && processed_arguments[1].column)
                 {
-                    auto key_name = key_lit->getColumnName();
-                    auto column_id = SubColumnID::mapElement(key_name);
-                    analysis.setSubColumnReference(function, SubColumnReference {*column_reference, column_id});
-                    analysis.addUsedSubColumn(resolved_field.origin_table_ast, resolved_field.index_of_origin_scope, column_id);
+                    auto argument_value = std::make_shared<ASTLiteral>((*processed_arguments[1].column)[0]);
+                    map_column_name = argument_value->getColumnName();
+                }
+
+                if (!map_column_name.empty())
+                {
+                    auto column_id = SubColumnID::mapElement(map_column_name);
+                    register_subcolumn(function, *column_reference, column_id);
                 }
             }
         }
@@ -384,25 +449,45 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeOrdinaryFunction(ASTFunctionPt
         if (auto column_reference = analysis.tryGetColumnReference(function->arguments->children[0]))
         {
             const auto & resolved_field = column_reference->getFieldDescription();
-            if (resolved_field.origin_table &&
-                resolved_field.origin_table->supportsMapImplicitColumn() &&
-                resolved_field.type->isMap() &&
-                resolved_field.type->isMapKVStore())
+            if (check_subcolumn(resolved_field, [](const auto & origin_col) -> bool {
+                    if (!origin_col.storage->supportsMapImplicitColumn())
+                        return false;
+                    DataTypePtr type = origin_col.metadata_snapshot->columns.getPhysical(origin_col.column).type;
+                    return type->isMap() && type->isMapKVStore();
+                }))
             {
                 auto column_id = SubColumnID::mapKeys();
-                analysis.setSubColumnReference(function, SubColumnReference {*column_reference, column_id});
-                analysis.addUsedSubColumn(resolved_field.origin_table_ast, resolved_field.index_of_origin_scope, column_id);
+                register_subcolumn(function, *column_reference, column_id);
+            }
+        }
+    }
+    if (startsWith(func_name_lowercase, "mapvalues") && function->arguments->children.size() == 1)
+    {
+        if (auto column_reference = analysis.tryGetColumnReference(function->arguments->children[0]))
+        {
+            const auto & resolved_field = column_reference->getFieldDescription();
+            if (check_subcolumn(resolved_field, [](const auto & origin_col) -> bool {
+                    if (!origin_col.storage->supportsMapImplicitColumn())
+                        return false;
+
+                    DataTypePtr type = origin_col.metadata_snapshot->columns.getPhysical(origin_col.column).type;
+                    return type->isMap() && type->isMapKVStore();
+                }))
+            {
+                auto column_id = SubColumnID::mapValues();
+                register_subcolumn(function, *column_reference, column_id);
             }
         }
     }
 
-    if (!function_base->isDeterministicInScopeOfQuery() || !function_base->isDeterministicInScopeOfQuery()
-        || !function_base->isSuitableForConstantFolding())
+    if (!function_base->isDeterministicInScopeOfQuery() || !function_base->isDeterministicInScopeOfQuery())
     {
         analysis.addNonDeterministicFunctions(*function);
         context->setFunctionDeterministic(function->name, false);
     }
-    return {nullptr, function_base->getResultType(), ""};
+
+    analysis.addUsedFunctionArgument(function->name, processed_arguments);
+    return {res_col, function_ret_type, column_name};
 }
 
 ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeAggregateFunction(ASTFunctionPtr & function)
@@ -420,7 +505,8 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeAggregateFunction(ASTFunctionP
     in_aggregate = true;
     AggregateFunctionPtr aggregator;
     Array parameters;
-    std::tie(aggregator, parameters) = resolveAggregateFunction(*function);
+    String column_name;
+    std::tie(aggregator, parameters, column_name) = resolveAggregateFunction(*function);
 
     AggregateAnalysis aggregate_analysis;
     aggregate_analysis.expression = function;
@@ -428,7 +514,7 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeAggregateFunction(ASTFunctionP
     aggregate_analysis.parameters = parameters;
     analysis.aggregate_results[options.select_query].push_back(aggregate_analysis);
     in_aggregate = false;
-    return {nullptr, aggregate_analysis.function->getReturnType(), ""};
+    return {nullptr, aggregate_analysis.function->getReturnType(), column_name};
 }
 
 ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeWindowFunction(ASTFunctionPtr & function)
@@ -451,11 +537,29 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeWindowFunction(ASTFunctionPtr 
     ResolvedWindowPtr resolved_window;
     AggregateFunctionPtr aggregator;
     Array parameters;
+    String column_name;
 
     if (!function->window_name.empty())
     {
         window_name = function->window_name;
         resolved_window = analysis.getRegisteredWindow(*options.select_query, function->window_name);
+        // Lead and lag
+        if (function->window_definition)
+        {
+            const struct WindowFrame def =
+            {
+                .is_default = false,
+                .type = WindowFrame::FrameType::Rows,
+                .end_type = WindowFrame::BoundaryType::Unbounded,
+            };
+
+            if (resolved_window->frame != def)
+            {
+                window_name = function->window_name + "(ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)";
+                resolved_window = std::make_shared<ResolvedWindow>(*resolved_window);
+                resolved_window->frame = def;
+            }
+        }
     }
     else
     {
@@ -464,12 +568,20 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeWindowFunction(ASTFunctionPtr 
     }
 
     if (resolved_window->partition_by)
+    {
+        expandUntuple(resolved_window->partition_by->children);
+        expandAsterisk(resolved_window->partition_by->children);
         processNodes(resolved_window->partition_by->children);
+    }
 
     if (resolved_window->order_by)
+    {
+        expandUntuple(resolved_window->order_by->children);
+        expandAsterisk(resolved_window->order_by->children);
         processNodes(resolved_window->order_by->children);
+    }
 
-    std::tie(aggregator, parameters) = resolveAggregateFunction(*function);
+    std::tie(aggregator, parameters, column_name) = resolveAggregateFunction(*function);
 
     auto window_analysis = std::make_shared<WindowAnalysis>();
     window_analysis->expression = function;
@@ -479,7 +591,7 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeWindowFunction(ASTFunctionPtr 
     window_analysis->parameters = parameters;
     analysis.addWindowAnalysis(*options.select_query, std::move(window_analysis));
     in_window = false;
-    return {nullptr, aggregator->getReturnType(), ""};
+    return {nullptr, aggregator->getReturnType(), column_name};
 }
 
 ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeGroupingOperation(ASTFunctionPtr & function)
@@ -502,11 +614,12 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeGroupingOperation(ASTFunctionP
     if (function->arguments->children.size() > 64)
         throw Exception(ErrorCodes::TOO_MANY_ARGUMENTS_FOR_FUNCTION, "Function GROUPING can have up to 64 arguments, but {} provided", function->arguments->children.size());
 
-    processNodes(function->arguments->children);
+    auto processed_arguments = processNodes(function->arguments->children);
+    auto column_name = getFunctionColumnName(function->name, processed_arguments);
 
     analysis.grouping_operations[options.select_query].push_back(function);
     in_aggregate = false;
-    return {nullptr, std::make_shared<DataTypeUInt64>(), ""};
+    return {nullptr, std::make_shared<DataTypeUInt64>(), column_name};
 }
 
 ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeInSubquery(ASTFunctionPtr & function)
@@ -515,7 +628,7 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeInSubquery(ASTFunctionPtr & fu
     auto & rhs_ast = function->arguments->children[1];
     processSubqueryArgsWithCoercion(lhs_ast, rhs_ast);
     analysis.in_subqueries[options.select_query].push_back(function);
-    return {nullptr, std::make_shared<DataTypeUInt8>(), ""};
+    return {nullptr, std::make_shared<DataTypeUInt8>(), function->getColumnName()};
 }
 
 ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeExistsSubquery(ASTFunctionPtr & function)
@@ -525,7 +638,7 @@ ColumnWithTypeAndName ExprAnalyzerVisitor::analyzeExistsSubquery(ASTFunctionPtr 
 
     handleSubquery(function->arguments->children[0]);
     analysis.exists_subqueries[options.select_query].push_back(function);
-    return {nullptr, std::make_shared<DataTypeUInt8>(), ""};
+    return {nullptr, std::make_shared<DataTypeUInt8>(), function->getColumnName()};
 }
 
 void ExprAnalyzerVisitor::processSubqueryArgsWithCoercion(ASTPtr & lhs_ast, ASTPtr & rhs_ast)
@@ -533,7 +646,7 @@ void ExprAnalyzerVisitor::processSubqueryArgsWithCoercion(ASTPtr & lhs_ast, ASTP
     auto lhs_type = process(lhs_ast).type;
     auto rhs_type = handleSubquery(rhs_ast);
 
-    if (!lhs_type->equals(*rhs_type))
+    if (!JoinCommon::isJoinCompatibleTypes(lhs_type, rhs_type))
     {
         DataTypePtr super_type = nullptr;
         if (enable_implicit_type_conversion)
@@ -547,7 +660,50 @@ void ExprAnalyzerVisitor::processSubqueryArgsWithCoercion(ASTPtr & lhs_ast, ASTP
     }
 }
 
-std::pair<AggregateFunctionPtr, Array> ExprAnalyzerVisitor::resolveAggregateFunction(ASTFunction & function)
+void ExprAnalyzerVisitor::expandUntuple(ASTs & nodes)
+{
+    if (!options.expand_untuple)
+        return;
+
+    ASTs new_nodes;
+    new_nodes.reserve(nodes.size());
+    bool has_untuple = false;
+
+    for (auto & node: nodes)
+    {
+        if (auto * untuple = node->as<ASTFunction>(); untuple && untuple->name == "untuple")
+        {
+            if (untuple->arguments->children.size() != 1)
+                throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+                                "Number of arguments for function untuple doesn't match. Passed {}, should be 1",
+                                untuple->arguments->children.size());
+
+            auto & tuple_ast = untuple->arguments->children[0];
+            /// Get type and name for tuple argument
+            auto argument_type = process(tuple_ast);
+            const auto * tuple_type = typeid_cast<const DataTypeTuple *>(argument_type.type.get());
+            if (!tuple_type)
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Function untuple expect tuple argument, got {}", argument_type.type->getName());
+
+            size_t tid = 0;
+            for (const auto & name [[maybe_unused]] : tuple_type->getElementNames())
+            {
+                auto literal = std::make_shared<ASTLiteral>(UInt64(++tid));
+                auto func = makeASTFunction("tupleElement", tuple_ast, literal);
+                new_nodes.push_back(std::move(func));
+            }
+
+            has_untuple = true;
+        }
+        else
+            new_nodes.push_back(node);
+    }
+
+    if (has_untuple)
+        nodes.swap(new_nodes);
+}
+
+std::tuple<AggregateFunctionPtr, Array, String> ExprAnalyzerVisitor::resolveAggregateFunction(ASTFunction & function)
 {
     auto processed_arguments = processNodes(function.arguments->children);
     Array parameters = (function.parameters) ? getAggregateFunctionParametersArray(function.parameters, "", context) : Array();
@@ -560,7 +716,8 @@ std::pair<AggregateFunctionPtr, Array> ExprAnalyzerVisitor::resolveAggregateFunc
     AggregateFunctionProperties properties;
     auto aggregate = AggregateFunctionFactory::instance().get(function.name, argument_types, parameters, properties);
 
-    return {aggregate, parameters};
+    auto column_name = getFunctionColumnName(function.name, processed_arguments);
+    return {aggregate, parameters, column_name};
 }
 
 DataTypePtr ExprAnalyzerVisitor::handleSubquery(const ASTPtr & subquery)
@@ -594,18 +751,82 @@ DataTypePtr ExprAnalyzerVisitor::handleSubquery(const ASTPtr & subquery)
         type = std::make_shared<DataTypeTuple>(column_types);
     }
 
-    analysis.setExpressionType(subquery, type);
+    analysis.setExpressionColumnWithType(subquery, {type});
     return type;
 }
 
 ColumnWithTypeAndName ExprAnalyzerVisitor::handleResolvedField(ASTPtr & node, const ResolvedField & field)
 {
     if (field.scope->getType() == Scope::ScopeType::RELATION)
+    {
         analysis.setColumnReference(node, field);
+        analysis.addReadColumn(field, options.record_used_object);
+    }
     else if (field.scope->getType() == Scope::ScopeType::LAMBDA)
         analysis.setLambdaArgumentReference(node, field);
 
-    return {nullptr, field.getFieldDescription().type, ""};
+    return {nullptr, field.getFieldDescription().type, node->getColumnName()};
+}
+
+String ExprAnalyzerVisitor::getFunctionColumnName(const String & func_name, const ColumnsWithTypeAndName & arguments)
+{
+    Strings arg_result_names;
+    for (const auto & arg: arguments)
+        arg_result_names.emplace_back(arg.name);
+    return getFunctionResultName(func_name, arg_result_names);
+}
+
+void ExprAnalyzerVisitor::expandAsterisk(ASTs & nodes)
+{
+    if (!options.expand_asterisk)
+        return;
+
+    ASTs new_nodes;
+    new_nodes.reserve(nodes.size());
+    bool has_asterisk = false;
+
+    for (auto & node: nodes)
+    {
+        if (auto * asterisk = node->as<ASTAsterisk>())
+        {
+            has_asterisk = true;
+            for (size_t field_index = 0; field_index < baseScope()->size(); ++field_index)
+            {
+                if (baseScope()->at(field_index).substituted_by_asterisk)
+                {
+                    auto field_reference = std::make_shared<ASTFieldReference>(field_index);
+                    field_reference->setFieldName(baseScope()->at(field_index).name);
+                    new_nodes.push_back(field_reference);
+                }
+            }
+         }
+        else if (auto * qualified_asterisk = node->as<ASTQualifiedAsterisk>())
+        {
+            if (qualified_asterisk->children.empty() || !qualified_asterisk->getChildren()[0]->as<ASTTableIdentifier>())
+                throw Exception("Unable to resolve qualified asterisk", ErrorCodes::UNKNOWN_IDENTIFIER);
+
+            has_asterisk = true;
+            ASTIdentifier& astidentifier = qualified_asterisk->getChildren()[0]->as<ASTTableIdentifier&>();
+            auto prefix = QualifiedName::extractQualifiedName(astidentifier);
+            bool matched = false;
+            for (size_t field_index = 0; field_index < baseScope()->size(); ++field_index)
+            {
+                if (baseScope()->at(field_index).substituted_by_asterisk && baseScope()->at(field_index).prefix.hasSuffix(prefix))
+                {
+                    matched = true;
+                    auto field_reference = std::make_shared<ASTFieldReference>(field_index);
+                    field_reference->setFieldName(baseScope()->at(field_index).name);
+                    new_nodes.push_back(field_reference);
+                }
+            }
+            if (!matched)
+                throw Exception("Can not find column of " + prefix.toString() + " in Scope", ErrorCodes::UNKNOWN_IDENTIFIER);
+        }
+        else
+            new_nodes.push_back(node);
+    }
+    if (has_asterisk)
+        nodes.swap(new_nodes);
 }
 
 }

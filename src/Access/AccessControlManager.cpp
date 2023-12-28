@@ -4,6 +4,7 @@
 #include <Access/UsersConfigAccessStorage.h>
 #include <Access/DiskAccessStorage.h>
 #include <Access/LDAPAccessStorage.h>
+#include <Access/KVAccessStorage.h>
 #include <Access/ContextAccess.h>
 #include <Access/RoleCache.h>
 #include <Access/RowPolicyCache.h>
@@ -30,28 +31,6 @@ namespace ErrorCodes
 }
 
 
-namespace
-{
-    void checkForUsersNotInMainConfig(
-        const Poco::Util::AbstractConfiguration & config,
-        const std::string & config_path,
-        const std::string & users_config_path,
-        Poco::Logger * log)
-    {
-        if (config.getBool("skip_check_for_incorrect_settings", false))
-            return;
-
-        if (config.has("users") || config.has("profiles") || config.has("quotas"))
-        {
-            /// We cannot throw exception here, because we have support for obsolete 'conf.d' directory
-            /// (that does not correspond to config.d or users.d) but substitute configuration to both of them.
-
-            LOG_ERROR(log, "The <users>, <profiles> and <quotas> elements should be located in users config file: {} not in main config {}."
-                " Also note that you should place configuration changes to the appropriate *.d directory like 'users.d'.",
-                users_config_path, config_path);
-        }
-    }
-}
 
 
 class AccessControlManager::ContextAccessCache
@@ -130,7 +109,7 @@ private:
 
 
 AccessControlManager::AccessControlManager()
-    : MultipleAccessStorage("user directories"),
+    : MultipleAccessStorage("KV Storage"),
       context_access_cache(std::make_unique<ContextAccessCache>(*this)),
       role_cache(std::make_unique<RoleCache>(*this)),
       row_policy_cache(std::make_unique<RowPolicyCache>(*this)),
@@ -225,6 +204,28 @@ void AccessControlManager::startPeriodicReloadingUsersConfigs()
     }
 }
 
+void AccessControlManager::addKVStorage(const ContextPtr & context)
+{
+    auto storages = getStoragesPtr();
+    for (const auto & storage : *storages)
+    {
+        if (auto kv_storage = typeid_cast<std::shared_ptr<KVAccessStorage>>(storage))
+            return;
+    }
+    auto new_storage = std::make_shared<KVAccessStorage>(context);
+    addStorage(new_storage);
+    LOG_DEBUG(getLogger(), "Added {} access storage '{}'", String(new_storage->getStorageType()), new_storage->getStorageName());
+}
+
+void AccessControlManager::stopBgJobForKVStorage()
+{
+    auto storages = getStoragesPtr();
+    for (const auto & storage : *storages)
+    {
+        if (auto kv_storage = typeid_cast<std::shared_ptr<KVAccessStorage>>(storage))
+            kv_storage->stopBgJob();
+    }
+}
 
 void AccessControlManager::addDiskStorage(const String & directory_, bool readonly_)
 {
@@ -338,28 +339,10 @@ void AccessControlManager::addStoragesFromMainConfig(
     String include_from_path = config.getString("include_from", "/etc/metrika.xml");
     bool has_user_directories = config.has("user_directories");
 
-    /// If path to users' config isn't absolute, try guess its root (current) dir.
-    /// At first, try to find it in dir of main config, after will use current dir.
-    String users_config_path = config.getString("users_config", "");
-    if (users_config_path.empty())
-    {
-        if (!has_user_directories)
-            users_config_path = config_path;
-    }
-    else if (std::filesystem::path{users_config_path}.is_relative() && std::filesystem::exists(config_dir + users_config_path))
-        users_config_path = config_dir + users_config_path;
 
-    if (!users_config_path.empty())
-    {
-        if (users_config_path != config_path)
-            checkForUsersNotInMainConfig(config, config_path, users_config_path, getLogger());
-
-        addUsersConfigStorage(users_config_path, include_from_path, dbms_dir, get_zookeeper_function);
-    }
-
-    String disk_storage_dir = config.getString("access_control_path", "");
-    if (!disk_storage_dir.empty())
-        addDiskStorage(disk_storage_dir);
+    // String disk_storage_dir = config.getString("access_control_path", "");
+    // if (!disk_storage_dir.empty())
+    //     addDiskStorage(disk_storage_dir);
 
     if (has_user_directories)
         addStoragesFromUserDirectoriesConfig(config, "user_directories", config_dir, dbms_dir, include_from_path, get_zookeeper_function);

@@ -33,8 +33,7 @@ NamesAndTypesList QueryExchangeLogElement::getNamesAndTypes()
         {"event_date", std::make_shared<DataTypeDate>()},
         {"event_time", std::make_shared<DataTypeDateTime>()},
         {"type", std::make_shared<DataTypeString>()},
-        {"write_segment_id", std::make_shared<DataTypeString>()},
-        {"read_segment_id", std::make_shared<DataTypeString>()},
+        {"exchange_id", std::make_shared<DataTypeString>()},
         {"partition_id", std::make_shared<DataTypeString>()},
         {"coordinator_address", std::make_shared<DataTypeString>()},
 
@@ -56,6 +55,12 @@ NamesAndTypesList QueryExchangeLogElement::getNamesAndTypes()
         {"register_time_ms", std::make_shared<DataTypeUInt64>()},
         {"recv_bytes", std::make_shared<DataTypeUInt64>()},
         {"dser_time_ms", std::make_shared<DataTypeInt64>()},
+
+        {"disk_partition_writer_create_file_ms", std::make_shared<DataTypeUInt64>()},
+        {"disk_partition_writer_pop_ms", std::make_shared<DataTypeUInt64>()},
+        {"disk_partition_writer_write_ms", std::make_shared<DataTypeUInt64>()},
+        {"disk_partition_writer_write_num", std::make_shared<DataTypeUInt64>()},
+        {"disk_partition_writer_commit_ms", std::make_shared<DataTypeUInt64>()},
 
 #ifdef USE_COMMUNITY_MAP
         {"ProfileEvents", std::make_shared<DataTypeMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeUInt64>())},
@@ -81,8 +86,7 @@ void QueryExchangeLogElement::appendToBlock(MutableColumns & columns) const
     columns[i++]->insert(DateLUT::instance().toDayNum(event_time).toUnderType());
     columns[i++]->insert(event_time);
     columns[i++]->insertData(type.data(), type.size());
-    columns[i++]->insert(write_segment_id);
-    columns[i++]->insert(read_segment_id);
+    columns[i++]->insert(exchange_id);
     columns[i++]->insert(partition_id);
     columns[i++]->insert(coordinator_address);
 
@@ -104,6 +108,12 @@ void QueryExchangeLogElement::appendToBlock(MutableColumns & columns) const
     columns[i++]->insert(register_time_ms);
     columns[i++]->insert(recv_bytes);
     columns[i++]->insert(dser_time_ms);
+
+    columns[i++]->insert(disk_partition_writer_create_file_ms);
+    columns[i++]->insert(disk_partition_writer_pop_ms);
+    columns[i++]->insert(disk_partition_writer_write_ms);
+    columns[i++]->insert(disk_partition_writer_write_num);
+    columns[i++]->insert(disk_partition_writer_commit_ms);
 
 
     if (profile_counters)

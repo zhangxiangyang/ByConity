@@ -34,6 +34,12 @@
 #include <Common/TypePromotion.h>
 #include <Common/serverLocality.h>
 #include <common/logger_useful.h>
+#include "Transaction/LockRequest.h"
+#include <bthread/recursive_mutex.h>
+
+#if USE_MYSQL
+#include <Databases/MySQL/MaterializedMySQLCommon.h>
+#endif
 
 #include <memory>
 #include <string>
@@ -41,6 +47,7 @@
 namespace DB
 {
 struct TxnCleanTask;
+class CnchLockHolder;
 
 namespace ErrorCodes
 {
@@ -52,6 +59,7 @@ bool isReadOnlyTransaction(const DB::IAST * ast);
 class ICnchTransaction : public TypePromotion<ICnchTransaction>, public WithContext
 {
 public:
+    friend class CnchLockHolder;
     explicit ICnchTransaction(const ContextPtr & context_) : WithContext(context_), global_context(context_->getGlobalContext()) { }
     explicit ICnchTransaction(const ContextPtr & context_, TransactionRecord record)
         : WithContext(context_), global_context(context_->getGlobalContext()), txn_record(std::move(record))
@@ -144,6 +152,12 @@ public:
     void setInsertionLabel(InsertionLabelPtr label) { insertion_label = std::move(label); }
     const InsertionLabelPtr & getInsertionLabel() const { return insertion_label; }
 
+#if USE_MYSQL
+    void setBinlogName(String binlog_name_) { binlog_name = std::move(binlog_name_); }
+    void setBinlogInfo(MySQLBinLogInfo binlog_info) { binlog = std::move(binlog_info); }
+    const MySQLBinLogInfo & getBinlogInfo() const { return binlog; }
+#endif
+
 public:
     // Commit API for 2PC, internally calls precommit() and commit()
     // Returns commit_ts on success.
@@ -180,6 +194,8 @@ public:
     // Clean intermediate parts synchronously
     virtual void removeIntermediateData() { }
 
+    std::shared_ptr<CnchLockHolder> createLockHolder(std::vector<LockInfoPtr> && elems);
+
     bool force_clean_by_dm = false;
 
     DatabasePtr tryGetDatabaseViaCache(const String & database_name);
@@ -189,6 +205,8 @@ public:
 protected:
     void setStatus(CnchTransactionStatus status);
     void setTransactionRecord(TransactionRecord record);
+    void assertLockAcquired() const;
+    void setLockHolder(std::shared_ptr<CnchLockHolder> p) { lock_holder = p; }
 
 protected:
     /// Transaction still needs global context because the query context will expired after query is finished, but
@@ -201,7 +219,13 @@ protected:
     String consumer_group;
     cppkafka::TopicPartitionList tpl;
 
+#if USE_MYSQL
+    MySQLBinLogInfo binlog;
+    String binlog_name;
+#endif
+
     InsertionLabelPtr insertion_label;
+    std::weak_ptr<CnchLockHolder> lock_holder;
 
 private:
     String creator;

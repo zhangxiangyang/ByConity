@@ -17,7 +17,12 @@
 #include <Statistics/StatisticsCollector.h>
 #include <Statistics/StatsTableBasic.h>
 #include <Poco/Logger.h>
+#include "Common/DefaultCatalogName.h"
 #include <common/ErrorHandlers.h>
+#include <Parsers/ASTSelectQuery.h>
+#include <Optimizer/CardinalityEstimate/LimitEstimator.h>
+#include <Interpreters/convertFieldToType.h>
+#include <DataTypes/DataTypesNumber.h>
 
 namespace DB
 {
@@ -59,6 +64,14 @@ PlanNodeStatisticsPtr TableScanEstimator::estimate(ContextMutablePtr context, co
             plan_node_stats->getSymbolStatistics()[col.name]->setDbTableColumn(
                 step.getDatabase() + "-" + step.getTable() + "-" + alias_to_column[col.name]);
         }
+    }
+
+    auto query_info = step.getQueryInfo();
+    auto *query = query_info.query->as<ASTSelectQuery>();
+    if (step.hasLimit() && query->getLimitLength())
+    {
+        Field converted = convertFieldToType(query->refLimitLength()->as<ASTLiteral>()->value, DataTypeUInt64());
+        return LimitEstimator::getLimitStatistics(plan_node_stats, converted.safeGet<UInt64>());
     }
 
     return plan_node_stats;

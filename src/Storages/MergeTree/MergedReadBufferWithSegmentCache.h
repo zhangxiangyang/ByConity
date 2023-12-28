@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <ctime>
 #include <memory>
 #include <Compression/CachedCompressedReadBuffer.h>
@@ -24,9 +25,12 @@
 #include <Storages/DiskCache/IDiskCache.h>
 #include <Storages/MergeTree/MergeTreeIOSettings.h>
 #include <Storages/MergeTree/MergeTreeMarksLoader.h>
+#include <IO/ReadBufferFromRpcStreamFile.h>
 
 namespace DB
 {
+
+using ProgressCallback = std::function<void(const Progress & progress)>;
 
 class MergedReadBufferWithSegmentCache: public ReadBuffer
 {
@@ -34,19 +38,24 @@ public:
     MergedReadBufferWithSegmentCache(const StorageID& storage_id_,
         const String& part_name_, const String& stream_name_, const DiskPtr& source_disk_,
         const String& source_file_path_, size_t source_data_offset_,
-        size_t source_data_size_, size_t cache_segment_size_,
-        IDiskCache* segment_cache_, size_t estimated_range_bytes_,
-        size_t buffer_size_, const MergeTreeReaderSettings& settings_,
+        size_t source_data_size_, size_t cache_segment_size_, const PartHostInfo & part_host_,
+        IDiskCache* segment_cache_, const MergeTreeReaderSettings& settings_,
         size_t total_segment_count_, MergeTreeMarksLoader& marks_loader_,
         UncompressedCache* uncompressed_cache_ = nullptr,
         const ReadBufferFromFileBase::ProfileCallback& profile_callback_ = {},
+        const ProgressCallback & internal_progress_cb_ = {},
         clockid_t clock_type_ = CLOCK_MONOTONIC_COARSE);
 
     virtual size_t readBig(char* to, size_t n) override;
     virtual bool nextImpl() override;
 
+    void prefetch(Priority priority) override;
+
     void seekToStart();
     void seekToMark(size_t mark);
+
+    void setReadUntilPosition(size_t position) override;
+    void setReadUntilEnd() override;
 
 private:
     class DualCompressedReadBuffer
@@ -77,10 +86,15 @@ private:
 
     void seekToPosition(size_t segment_idx, const MarkInCompressedFile& mark_pos);
     bool seekToMarkInSegmentCache(size_t segment_idx, const MarkInCompressedFile& mark_pos);
+    void initialize();
+    bool seekToMarkInRemoteSegmentCache(size_t segment_idx, const MarkInCompressedFile& mark_pos, const String & segment_key);
+    void initCacheBufferIfNeeded(const DiskPtr & disk, const String & path, std::unique_ptr<ReadBufferFromRpcStreamFile> remote_cache = nullptr);
     void initSourceBufferIfNeeded();
 
     inline size_t toSourceDataOffset(size_t logical_offset) const;
     inline size_t fromSourceDataOffset(size_t physical_offset) const;
+
+    ReadBuffer& activeBuffer();
 
     // Reader stream info
     StorageID storage_id;
@@ -97,12 +111,10 @@ private:
     const size_t cache_segment_size;
     IDiskCache* segment_cache;
 
-    // Readbuffer's settings
-    size_t estimated_range_bytes;
-    size_t buffer_size;
     MergeTreeReaderSettings settings;
     UncompressedCache* uncompressed_cache;
     ReadBufferFromFileBase::ProfileCallback profile_callback;
+    ProgressCallback internal_progress_callback;
     clockid_t clock_type;
 
     size_t total_segment_count;
@@ -117,7 +129,11 @@ private:
     DualCompressedReadBuffer cache_buffer;
     DualCompressedReadBuffer source_buffer;
 
+    PartHostInfo part_host;
+
     Poco::Logger* logger;
+
+    off_t read_until_position = 0;
 };
 
 }

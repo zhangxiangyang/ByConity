@@ -46,9 +46,11 @@
 #include <Parsers/QueryWithOutputSettingsPushDownVisitor.h>
 #include <Parsers/ParserRefreshQuery.h>
 #include <Parsers/ParserStatsQuery.h>
-#include <Parsers/ParserDumpInfoQuery.h>
+#include <Parsers/ParserDumpQuery.h>
 #include <Parsers/ParserReproduceQuery.h>
 #include <Parsers/ParserUndropQuery.h>
+#include <Parsers/ParserAlterDiskCacheQuery.h>
+#include <Parsers/ParserTransaction.h>
 
 namespace DB
 {
@@ -66,6 +68,7 @@ bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     ParserDropQuery drop_p;
     ParserUndropQuery undrop_p;
     ParserCheckQuery check_p(dt);
+    ParserAlterDiskCacheQuery alter_disk_cache_p;
     ParserOptimizeQuery optimize_p(dt);
     ParserKillQueryQuery kill_query_p(dt);
     ParserWatchQuery watch_p;
@@ -75,19 +78,24 @@ bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     ParserShowGrantsQuery show_grants_p;
     ParserShowPrivilegesQuery show_privileges_p;
     ParserExplainQuery explain_p(end, dt);
-    ParserDumpInfoQuery dump_info_p(end, dt);
+    ParserDumpQuery dump_p;
     ParserReproduceQuery reproduce_p(end);
     ParserRefreshQuery refresh_p(dt);
     ParserCreateStatsQuery create_stats_p;
     ParserShowStatsQuery show_stats_p;
     ParserDropStatsQuery drop_stats_p;
+    ParserShowStatementsQuery show_statements_p;
+    ParserBeginTransactionQuery begin_transaction_p;
+    ParserBeginQuery begin_p;
+    ParserCommitQuery commit_p;
+    ParserRollbackQuery rollback_p;
 
     ASTPtr query;
 
     bool parsed =
            explain_p.parse(pos, query, expected)
         || reproduce_p.parse(pos, query, expected)
-        || dump_info_p.parse(pos, query, expected)
+        || dump_p.parse(pos, query, expected)
         || select_p.parse(pos, query, expected)
         || show_create_access_entity_p.parse(pos, query, expected) /// should be before `show_tables_p`
         || show_tables_p.parse(pos, query, expected)
@@ -100,6 +108,7 @@ bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
         || drop_p.parse(pos, query, expected)
         || undrop_p.parse(pos, query, expected)
         || check_p.parse(pos, query, expected)
+        || alter_disk_cache_p.parse(pos, query, expected)
         || kill_query_p.parse(pos, query, expected)
         || optimize_p.parse(pos, query, expected)
         || watch_p.parse(pos, query, expected)
@@ -110,7 +119,12 @@ bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
         || refresh_p.parse(pos, query, expected)
         || create_stats_p.parse(pos, query, expected)
         || show_stats_p.parse(pos, query, expected)
-        || drop_stats_p.parse(pos, query, expected);
+        || drop_stats_p.parse(pos, query, expected)
+        || show_statements_p.parse(pos, query, expected)
+        || begin_transaction_p.parse(pos, query, expected)
+        || begin_p.parse(pos, query, expected)
+        || commit_p.parse(pos, query, expected)
+        || rollback_p.parse(pos, query, expected);
 
     if (!parsed)
         return false;
@@ -128,17 +142,44 @@ bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
         query_with_output.children.push_back(query_with_output.out_file);
     }
 
-    ParserKeyword s_format("FORMAT");
-
-    if (s_format.ignore(pos, expected))
+    auto parse_format = [&]()
     {
-        ParserIdentifier format_p;
+        ParserKeyword s_format("FORMAT");
 
-        if (!format_p.parse(pos, query_with_output.format, expected))
+        if (s_format.ignore(pos, expected))
+        {
+            ParserIdentifier format_p;
+
+            if (!format_p.parse(pos, query_with_output.format, expected))
+                return false;
+            setIdentifierSpecial(query_with_output.format);
+
+            query_with_output.children.push_back(query_with_output.format);
+        }
+
+        return true;
+    };
+
+    if (!parse_format())
+        return false;
+
+    // [ COMPRESSION "compression_method_vaule" [LEVEL compression_level_value] ]
+    ParserKeyword s_compression_method("COMPRESSION");
+    if (s_compression_method.ignore(pos, expected))
+    {
+        ParserStringLiteral compression_method_p;
+        if (!compression_method_p.parse(pos, query_with_output.compression_method, expected))
             return false;
-        setIdentifierSpecial(query_with_output.format);
+        query_with_output.children.push_back(query_with_output.compression_method);
 
-        query_with_output.children.push_back(query_with_output.format);
+        ParserKeyword s_compression_level("LEVEL");
+        if (s_compression_level.ignore(pos, expected))
+        {
+            ParserNumber compression_level_p;
+            if (!compression_level_p.parse(pos, query_with_output.compression_level, expected))
+                return false;
+            query_with_output.children.push_back(query_with_output.compression_level);
+        }
     }
 
     // SETTINGS key1 = value1, key2 = value2, ...
@@ -157,6 +198,15 @@ bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
             QueryWithOutputSettingsPushDownVisitor::Data data{query_with_output.settings_ast};
             QueryWithOutputSettingsPushDownVisitor(data).visit(query);
         }
+    }
+
+    /**
+     * if no format before, try parse format after settings, i.g. (select 1) settings xxxxx format xxxxx;
+     */
+    if (!query_with_output.format)
+    {
+        if (!parse_format())
+            return false;
     }
 
     node = std::move(query);

@@ -19,12 +19,17 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
+#include <Core/Types.h>
 #include <Core/UUID.h>
-#include <Common/thread_local_rng.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/WriteHelpers.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <Common/SipHash.h>
+#include <Common/thread_local_rng.h>
+#include <common/strong_typedef.h>
+#include <common/wide_integer_impl.h>
+
 
 
 namespace DB
@@ -35,8 +40,8 @@ namespace UUIDHelpers
     UUID generateV4()
     {
         UInt128 res{thread_local_rng(), thread_local_rng()};
-        res.items[0] = (res.items[0] & 0xffffffffffff0fffull) | 0x0000000000004000ull;
-        res.items[1] = (res.items[1] & 0x3fffffffffffffffull) | 0x8000000000000000ull;
+        res.items[0] = (res.items[0] & 0xffffffffffff0fffull) | 0x0000000000004000ull; // low
+        res.items[1] = (res.items[1] & 0x3fffffffffffffffull) | 0x8000000000000000ull; // high
         return UUID{res};
     }
 
@@ -53,8 +58,21 @@ namespace UUIDHelpers
         UUID uuid;
         ReadBufferFromString buff(uuid_str);
         readUUIDText(uuid, buff);
-        return uuid;
+       return uuid;
     }
+
+    PairInt64 UUIDToPairInt64(const UUID & uuid)
+    {
+        return PairInt64(uuid.toUnderType().items[0], uuid.toUnderType().items[1]);
+    }
+
+    UUID hashUUIDfromString(const String & str)
+    {
+        auto hash_val = sipHash128(str.data(),str.length());
+        return UUID(hash_val);
+
+    }
+
 }
 
 }

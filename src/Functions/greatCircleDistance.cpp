@@ -6,7 +6,7 @@
 #include <Functions/IFunction.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/FunctionFactory.h>
-#include <Functions/TargetSpecific.h>
+#include <Common/TargetSpecific.h>
 #include <Functions/PerformanceAdaptors.h>
 #include <common/range.h>
 #include <cmath>
@@ -316,7 +316,7 @@ private:
     ImplementationSelector<IFunction> selector;
 };
 
-void registerFunctionGeoDistance(FunctionFactory & factory)
+REGISTER_FUNCTION(GeoDistance)
 {
     geodistInit();
     factory.registerFunction<FunctionGeoDistance<Method::SPHERE_DEGREES>>();

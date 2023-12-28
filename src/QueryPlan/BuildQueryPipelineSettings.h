@@ -32,12 +32,13 @@ struct BuildQueryPipelineSettings
     ExpressionActionsSettings actions_settings;
     DistributedPipelineSettings distributed_settings;
     ContextPtr context;
+    bool is_expand = false;
 
     const ExpressionActionsSettings & getActionsSettings() const { return actions_settings; }
 
     static BuildQueryPipelineSettings fromSettings(const Settings & from);
     static BuildQueryPipelineSettings fromContext(ContextPtr from);
-    static BuildQueryPipelineSettings fromPlanSegment(PlanSegment * plan_segment, ContextPtr context);
+    static BuildQueryPipelineSettings fromPlanSegment(PlanSegment * plan_segment, ContextPtr context, bool is_explain = false);
 };
 
 }

@@ -100,6 +100,8 @@ public:
 
     String name() const override { return entry->path().filename(); }
 
+    size_t size() const override { return entry->file_size(); }
+
 private:
     fs::path dir_path;
     fs::directory_iterator entry;
@@ -402,13 +404,11 @@ void registerDiskLocal(DiskFactory & factory)
                     ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG);
             path = context->getPath();
         }
-        else
-        {
-            if (path.empty())
-                throw Exception("Disk path can not be empty. Disk " + name, ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG);
-            if (path.back() != '/')
-                throw Exception("Disk path must end with /. Disk " + name, ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG);
-        }
+
+        if (path.empty())
+            throw Exception("Disk path can not be empty. Disk " + name, ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG);
+        if (path.back() != '/')
+            path.push_back('/');
 
         // if (!FS::canRead(path) || !FS::canWrite(path))
         //     throw Exception("There is no RW access to the disk " + name + " (" + path + ")", ErrorCodes::PATH_ACCESS_DENIED);

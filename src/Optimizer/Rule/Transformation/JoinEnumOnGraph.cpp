@@ -30,8 +30,8 @@ namespace DB
 PatternPtr JoinEnumOnGraph::getPattern() const
 {
     return Patterns::join()
-        ->matchingStep<JoinStep>([&](const JoinStep & s) { return s.supportReorder(support_filter); })
-        ->with({Patterns::tree(), Patterns::tree()});
+        .matchingStep<JoinStep>([&](const JoinStep & s) { return s.supportReorder(support_filter) && !s.isSimpleReordered() && !s.isOrdered(); })
+        .with(Patterns::tree(), Patterns::tree()).result();
 }
 
 static std::pair<Names, Names> createJoinCondition(UnionFind<String> & union_find, const std::vector<std::pair<String, String>> & edges)
@@ -65,6 +65,7 @@ static std::pair<Names, Names> createJoinCondition(UnionFind<String> & union_fin
 
     // create join key using the common equivalent symbols, each equivalent set create one join criteria.
     std::vector<std::pair<String, String>> criteria;
+    criteria.reserve(intersect_set.size());
     for (const auto & set : intersect_set)
     {
         criteria.emplace_back(
@@ -123,6 +124,8 @@ static PlanNodePtr createJoinNode(
         DataStream{output},
         ASTTableJoin::Kind::Inner,
         ASTTableJoin::Strictness::All,
+        context->getOptimizerContext().getContext()->getSettingsRef().max_threads,
+        context->getOptimizerContext().getContext()->getSettingsRef().optimize_read_in_order,
         join_keys.first,
         join_keys.second,
         filter,
@@ -257,6 +260,8 @@ TransformResult JoinEnumOnGraph::transformImpl(PlanNodePtr node, const Captures 
     {
         for (const auto & right_join_set : right_group->getJoinSets())
         {
+            if (left_join_set.getGroups().size() + right_join_set.getGroups().size() > context.context->getSettingsRef().max_graph_reorder_size)
+                continue;
             std::vector<ConstASTPtr> conjuncts;
             if (join_step->getFilter() && !PredicateUtils::isTruePredicate(join_step->getFilter()))
             {
@@ -360,7 +365,7 @@ TransformResult JoinEnumOnGraph::transformImpl(PlanNodePtr node, const Captures 
 
 const std::vector<RuleType> & JoinEnumOnGraph::blockRules() const
 {
-    static std::vector<RuleType> block{RuleType::JOIN_ENUM_ON_GRAPH, RuleType::INNER_JOIN_REORDER};
+    static std::vector<RuleType> block{RuleType::JOIN_ENUM_ON_GRAPH, RuleType::INNER_JOIN_COMMUTATION};
     return block;
 }
 
@@ -503,7 +508,7 @@ BitSet MinCutBranchAlg::neighbor(const BitSet & nodes)
     {
         if (!graph.getEdges().contains(pos))
         {
-            std::cout << "bug";
+            throw Exception("Not found edge in graph", DB::ErrorCodes::LOGICAL_ERROR);
         }
         for (const auto & item : graph.getEdges().at(pos))
         {

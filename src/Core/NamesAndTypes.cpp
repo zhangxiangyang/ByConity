@@ -26,11 +26,12 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/MapHelpers.h>
 #include <IO/ReadBuffer.h>
-#include <IO/WriteBuffer.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteBuffer.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <Protos/plan_node_utils.pb.h>
 #include <sparsehash/dense_hash_map>
 
 
@@ -98,6 +99,24 @@ void NameAndTypePair::deserialize(ReadBuffer & buf)
     }
 }
 
+void NameAndTypePair::toProto(Protos::NameAndTypePair & proto) const
+{
+    proto.set_name(name);
+    serializeDataTypeToProto(type, *proto.mutable_type());
+    serializeDataTypeToProto(type_in_storage, *proto.mutable_type_in_storage());
+    if (subcolumn_delimiter_position.has_value())
+        proto.set_subcolumn_delimiter_position(subcolumn_delimiter_position.value());
+}
+
+void NameAndTypePair::fillFromProto(const Protos::NameAndTypePair & proto)
+{
+    name = proto.name();
+    type = deserializeDataTypeFromProto(proto.type());
+    type_in_storage = deserializeDataTypeFromProto(proto.type_in_storage());
+    if (proto.has_subcolumn_delimiter_position())
+        subcolumn_delimiter_position = proto.subcolumn_delimiter_position();
+}
+
 void NamesAndTypesList::readText(ReadBuffer & buf)
 {
     const DataTypeFactory & data_type_factory = DataTypeFactory::instance();
@@ -137,6 +156,22 @@ void NamesAndTypesList::readText(ReadBuffer & buf)
             {
                 it.type->setFlags(TYPE_COMPRESSION_FLAG);
             }
+            else if (options == "BitEngineEncode")
+            {
+                const_cast<IDataType *>(it.type.get())->setFlags(TYPE_BITENGINE_ENCODE_FLAG);
+            }
+            else if (options == "BLOOM")
+            {
+                it.type->setFlags(TYPE_BLOOM_FLAG);
+            }
+            else if (options == "BitmapIndex")
+            {
+                it.type->setFlags(TYPE_BITMAP_INDEX_FLAG);
+            }
+            else if (options == "SegmentBitmapIndex")
+            {
+                it.type->setFlags(TYPE_SEGMENT_BITMAP_INDEX_FLAG);
+            }
             else
             {
                 // TBD: ignore for now, or throw exception
@@ -174,11 +209,35 @@ void NamesAndTypesList::writeText(WriteBuffer & buf) const
                 writeString("COMPRESSION", buf);
                 flag ^= TYPE_COMPRESSION_FLAG;
             }
+            else if (flag & TYPE_BLOOM_FLAG)
+            {
+                writeChar('\t', buf);
+                writeString("BLOOM", buf);
+                flag ^= TYPE_BLOOM_FLAG;
+            }
+            else if (flag & TYPE_BITMAP_INDEX_FLAG)
+            {
+                writeChar('\t', buf);
+                writeString("BitmapIndex", buf);
+                flag ^= TYPE_BITMAP_INDEX_FLAG;
+            }
+            else if (flag & TYPE_SEGMENT_BITMAP_INDEX_FLAG)
+            {
+                writeChar('\t', buf);
+                writeString("SegmentBitmapIndex", buf);
+                flag ^= TYPE_SEGMENT_BITMAP_INDEX_FLAG;
+            }
             else if (flag & TYPE_MAP_KV_STORE_FLAG)
             {
                 writeChar('\t', buf);
                 writeString("KV", buf);
                 flag ^= TYPE_MAP_KV_STORE_FLAG;
+            }
+            else if (flag & TYPE_BITENGINE_ENCODE_FLAG)
+            {
+                writeChar('\t', buf);
+                writeString("BitEngineEncode", buf);
+                flag ^= TYPE_BITENGINE_ENCODE_FLAG;
             }
             else
                 break;
@@ -291,7 +350,7 @@ NamesAndTypesList NamesAndTypesList::filter(const Names & names) const
     return filter(NameSet(names.begin(), names.end()));
 }
 
-NamesAndTypesList NamesAndTypesList::addTypes(const Names & names) const
+NamesAndTypesList NamesAndTypesList::addTypes(const Names & names, BitEngineReadType bitengine_read_type) const
 {
     /// NOTE: It's better to make a map in `IStorage` than to create it here every time again.
 #if !defined(ARCADIA_BUILD)
@@ -348,7 +407,21 @@ NamesAndTypesList NamesAndTypesList::addTypes(const Names & names) const
                 throw Exception("No column " + name, ErrorCodes::THERE_IS_NO_COLUMN);
             }
 
-            res.emplace_back(name, *it->second);
+            if (isBitmap64(*it->second) && (*it->second)->isBitEngineEncode())
+            { /// Type `BOTH` is used in BitEngineDictionaryManager::checkEncodedPart
+                if (bitengine_read_type == BitEngineReadType::BOTH && res.contains(name))
+                    res.emplace_back(name + BITENGINE_COLUMN_EXTENSION, *it->second);
+                else if (bitengine_read_type == BitEngineReadType::ONLY_ENCODE)
+                { // Type `ONLY_ENCODE` used in BitEngine parts merge
+                    res.emplace_back(name + BITENGINE_COLUMN_EXTENSION, *it->second);
+                }
+                else // Default type `ONLY_SOURCE` is used in encoding and select
+                    res.emplace_back(name, *it->second);
+            }
+            else
+            {
+                res.emplace_back(name, *it->second);
+            }
         }
     }
 
@@ -387,23 +460,5 @@ size_t NamesAndTypesList::getPosByName(const std::string &name) const noexcept
     return pos;
 }
 
-void NamesAndTypesList::serialize(WriteBuffer & buf) const
-{
-    writeBinary(size(), buf);
-    for (auto & elem : *this)
-        elem.serialize(buf);
-}
-
-void NamesAndTypesList::deserialize(ReadBuffer & buf)
-{
-    size_t size;
-    readBinary(size, buf);
-    for (size_t i = 0; i < size; ++i)
-    {
-        NameAndTypePair pair;
-        pair.deserialize(buf);
-        this->push_back(pair);
-    }
-}
 
 }

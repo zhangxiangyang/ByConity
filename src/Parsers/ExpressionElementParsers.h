@@ -279,6 +279,15 @@ public:
     using IParserDialectBase::IParserDialectBase;
 };
 
+class ParserGroupConcatExpression : public IParserDialectBase
+{
+protected:
+    const char * getName() const override { return "GROUP_CONCAT expression"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
 class ParserTrimExpression : public IParserDialectBase
 {
 protected:
@@ -342,6 +351,14 @@ protected:
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
 };
 
+/** Bool literal.
+  */
+class ParserBool : public IParserBase
+{
+protected:
+    const char * getName() const override { return "Bool"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+};
 
 /** Numeric literal.
   */
@@ -597,6 +614,14 @@ class ParserAssignment : public IParserDialectBase
 {
 protected:
     const char * getName() const  override{ return "column assignment"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserEscapeExpression : public IParserDialectBase
+{
+    const char * getName() const override { return "ESCAPE clause"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
 public:
     using IParserDialectBase::IParserDialectBase;

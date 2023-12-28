@@ -20,8 +20,8 @@
 #include <Optimizer/Property/Property.h>
 #include <Optimizer/Rewriter/Rewriter.h>
 #include <Optimizer/Rule/Rule.h>
-#include <QueryPlan/PlanNode.h>
 #include <QueryPlan/CTEVisitHelper.h>
+#include <QueryPlan/PlanNode.h>
 
 #include <stack>
 
@@ -40,17 +40,21 @@ using OptContextPtr = std::shared_ptr<OptimizationContext>;
 class CascadesOptimizer : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    explicit CascadesOptimizer(bool enable_cbo_ = true): enable_cbo(enable_cbo_) {}
 
     String name() const override { return "CascadesOptimizer"; }
-    static Property optimize(GroupId root, CascadesContext & context, const Property & required_prop);
+    static WinnerPtr optimize(GroupId root, CascadesContext & context, const Property & required_prop);
     static PlanNodePtr buildPlanNode(GroupId root, CascadesContext & context, const Property & required_prop);
+private:
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override { return context->getSettingsRef().enable_cascades_optimizer;}
+    bool enable_cbo;
 };
 
 class CascadesContext
 {
 public:
-    explicit CascadesContext(ContextMutablePtr context_, CTEInfo & cte_info, size_t worker_size_, size_t max_join_size_);
+    explicit CascadesContext(ContextMutablePtr context_, CTEInfo & cte_info, size_t worker_size_, size_t max_join_size_, bool enable_cbo_);
 
     GroupExprPtr initMemo(const PlanNodePtr & plan_node);
 
@@ -61,7 +65,7 @@ public:
         GroupId target_group = UNDEFINED_GROUP);
     GroupExprPtr makeGroupExpression(const PlanNodePtr & plan_node, RuleType produce_rule = RuleType::UNDEFINED);
 
-    ContextMutablePtr getContext() const { return context; }
+    ContextMutablePtr & getContext() { return context; }
     TaskStack & getTaskStack() { return task_stack; }
     Memo & getMemo() { return memo; }
     size_t getWorkerSize() const { return worker_size; }
@@ -95,6 +99,12 @@ public:
 
     UInt64 getTaskExecutionTimeout() const { return task_execution_timeout; }
 
+    bool isEnablePruning() const { return enable_pruning; }
+
+    void setEnableWhatIfMode(bool enable_what_if_mode_) { enable_what_if_mode = enable_what_if_mode_; }
+    bool isEnableWhatIfMode() const { return enable_what_if_mode;}
+    bool isEnableCbo() const { return enable_cbo; }
+
 private:
     ContextMutablePtr context;
     CTEInfo & cte_info;
@@ -104,24 +114,35 @@ private:
     std::vector<RulePtr> transformation_rules;
     std::vector<RulePtr> implementation_rules;
     size_t worker_size = 1;
-    size_t max_join_size;
     bool support_filter;
     UInt64 task_execution_timeout;
+    bool enable_pruning;
+    bool enable_what_if_mode = false;
+    bool enable_cbo;
     Poco::Logger * log;
 };
 
 class OptimizationContext
 {
 public:
-    OptimizationContext(
-        CascadesContext & context_, const Property & required_prop_, double cost_upper_bound_ = std::numeric_limits<double>::max())
+    OptimizationContext(CascadesContext & context_, const Property & required_prop_, double cost_upper_bound_)
         : context(context_), required_prop(required_prop_), cost_upper_bound(cost_upper_bound_)
     {
+        if (!context.isEnablePruning())
+        {
+            cost_upper_bound = std::numeric_limits<double>::max();
+        }
     }
 
     const Property & getRequiredProp() const { return required_prop; }
     double getCostUpperBound() const { return cost_upper_bound; }
-    void setCostUpperBound(double cost_upper_bound_) { cost_upper_bound = cost_upper_bound_; }
+    void setCostUpperBound(double cost_upper_bound_)
+    {
+        if (context.isEnablePruning())
+        {
+            cost_upper_bound = cost_upper_bound_;
+        }
+    }
     void pushTask(const OptimizerTaskPtr & task) const { context.getTaskStack().push(task); }
 
     const std::vector<RulePtr> & getTransformationRules() const { return context.getTransformationRules(); }

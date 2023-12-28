@@ -202,7 +202,10 @@ void RemoteQueryExecutor::sendQuery()
 
     auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(settings);
     ClientInfo modified_client_info = context->getClientInfo();
-    modified_client_info.query_kind = ClientInfo::QueryKind::SECONDARY_QUERY;
+    
+    if (!is_server_forwarding)
+        modified_client_info.query_kind = ClientInfo::QueryKind::SECONDARY_QUERY;
+
     if (CurrentThread::isInitialized())
     {
         modified_client_info.client_trace_context = CurrentThread::get().thread_trace_context;
@@ -237,6 +240,7 @@ Block RemoteQueryExecutor::read()
 
     while (true)
     {
+        std::lock_guard lock(was_cancelled_mutex);
         if (was_cancelled)
             return Block();
 
@@ -548,7 +552,8 @@ void RemoteQueryExecutor::sendExternalTables()
 void RemoteQueryExecutor::tryCancel(const char * reason, std::unique_ptr<ReadContext> * read_context)
 {
     {
-        /// Flag was_cancelled is atomic because it is checked in read().
+        /// Flag was_cancelled is atomic because it is checked in read(),
+        /// in case of packet had been read by fiber (async_socket_for_remote).
         std::lock_guard guard(was_cancelled_mutex);
 
         if (was_cancelled)
@@ -595,6 +600,10 @@ void RemoteQueryExecutor::parseQueryWorkerMetrics(const QueryWorkerMetricElement
             context->getQueryContext()->insertQueryWorkerMetricsElement(*element);
         else if (context->getServerType() == ServerType::cnch_worker)  /// For cnch aggre worker, store the elements and forward them to cnch server
             context->getQueryContext()->addQueryWorkerMetricElements(std::move(element));
+
+        auto internal_progress_callback = context->getInternalProgressCallback();
+        if (internal_progress_callback)
+            internal_progress_callback({element->read_rows, element->read_bytes, 0, 0, element->read_cached_bytes});
     }
 }
 

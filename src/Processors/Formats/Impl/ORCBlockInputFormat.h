@@ -2,29 +2,36 @@
 #include "config_formats.h"
 #if USE_ORC
 
-#include <Processors/Formats/IInputFormat.h>
+#    include <Formats/FormatSettings.h>
+#    include <Processors/Formats/IInputFormat.h>
 
-namespace arrow::adapters::orc { class ORCFileReader; }
+namespace arrow::adapters::orc
+{
+class ORCFileReader;
+}
+namespace arrow
+{
+class Schema;
+}
 
 namespace DB
 {
-
 class ArrowColumnToCHColumn;
-
 class ORCBlockInputFormat : public IInputFormat
 {
 public:
-    ORCBlockInputFormat(ReadBuffer & in_, Block header_);
+    ORCBlockInputFormat(ReadBuffer & in_, Block header_, const FormatSettings & format_settings_);
 
     String getName() const override { return "ORCBlockInputFormat"; }
 
     void resetParser() override;
 
+    static std::vector<int> getColumnIndices(const std::shared_ptr<arrow::Schema> & schema, const Block & header);
+
 protected:
     Chunk generate() override;
 
 private:
-
     // TODO: check that this class implements every part of its parent
 
     std::unique_ptr<arrow::adapters::orc::ORCFileReader> file_reader;
@@ -37,6 +44,8 @@ private:
 
     // indices of columns to read from ORC file
     std::vector<int> include_indices;
+
+    const FormatSettings format_settings;
 
     void prepareReader();
 };

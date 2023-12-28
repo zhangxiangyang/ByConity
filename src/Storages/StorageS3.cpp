@@ -228,7 +228,7 @@ bool StorageS3Source::initialize()
     file_path = fs::path(bucket) / current_key;
 
     read_buf = wrapReadBufferWithCompressionMethod(
-        std::make_unique<ReadBufferFromS3>(client, bucket, current_key, max_single_read_retries), chooseCompressionMethod(current_key, compression_hint));
+        std::make_unique<ReadBufferFromS3>(client, bucket, current_key, getContext()->getReadSettings(), max_single_read_retries), chooseCompressionMethod(current_key, compression_hint));
     auto input_format = FormatFactory::instance().getInput(format, *read_buf, sample_block, getContext(), max_block_size);
     pipeline = std::make_unique<QueryPipeline>();
     pipeline->init(Pipe(input_format));
@@ -488,24 +488,27 @@ void StorageS3::truncate(const ASTPtr & /* query */, const StorageMetadataPtr &,
 
 void StorageS3::updateClientAndAuthSettings(ContextPtr ctx, StorageS3::ClientAuthentication & upd)
 {
-    auto settings = ctx->getStorageS3Settings().getSettings(upd.uri.uri.toString());
+    auto settings = ctx->getStorageS3Settings().getSettings(upd.uri.uri.toString()).auth_settings;
     if (upd.client && (!upd.access_key_id.empty() || settings == upd.auth_settings))
         return;
 
     Aws::Auth::AWSCredentials credentials(upd.access_key_id, upd.secret_access_key);
-    HeaderCollection headers;
+    HTTPHeaderEntries headers;
     if (upd.access_key_id.empty())
     {
-        credentials = Aws::Auth::AWSCredentials(settings.access_key_id, settings.secret_access_key);
+        credentials = Aws::Auth::AWSCredentials(settings.access_key_id, settings.access_key_secret);
         headers = settings.headers;
     }
 
-    S3::PocoHTTPClientConfiguration client_configuration = S3::ClientFactory::instance().createClientConfiguration(
-        settings.region,
-        ctx->getRemoteHostFilter(), ctx->getGlobalContext()->getSettingsRef().s3_max_redirects);
+    std::shared_ptr<Aws::Client::ClientConfiguration> client_configuration =
+        S3::ClientFactory::instance().createClientConfiguration(
+            settings.region,
+            ctx->getRemoteHostFilter(), ctx->getGlobalContext()->getSettingsRef().s3_max_redirects,
+            ctx->getConfigRef().getUInt("s3.http_keep_alive_timeout_ms", 5000),
+            ctx->getConfigRef().getUInt("s3.http_connection_pool_size", 1024), false);
 
-    client_configuration.endpointOverride = upd.uri.endpoint;
-    client_configuration.maxConnections = upd.max_connections;
+    client_configuration->endpointOverride = upd.uri.endpoint;
+    client_configuration->maxConnections = upd.max_connections;
 
     upd.client = S3::ClientFactory::instance().create(
         client_configuration,
@@ -514,8 +517,14 @@ void StorageS3::updateClientAndAuthSettings(ContextPtr ctx, StorageS3::ClientAut
         credentials.GetAWSSecretKey(),
         settings.server_side_encryption_customer_key_base64,
         std::move(headers),
-        settings.use_environment_credentials.value_or(ctx->getConfigRef().getBool("s3.use_environment_credentials", false)),
-        settings.use_insecure_imds_request.value_or(ctx->getConfigRef().getBool("s3.use_insecure_imds_request", false)));
+        S3::CredentialsConfiguration
+        {
+            settings.use_environment_credentials.value_or(ctx->getConfigRef().getBool("s3.use_environment_credentials", true)),
+            settings.use_insecure_imds_request.value_or(ctx->getConfigRef().getBool("s3.use_insecure_imds_request", false)),
+            settings.expiration_window_seconds.value_or(
+                ctx->getConfigRef().getUInt64("s3.expiration_window_seconds", S3::DEFAULT_EXPIRATION_WINDOW_SECONDS)),
+            settings.no_sign_request.value_or(ctx->getConfigRef().getBool("s3.no_sign_request", false))
+        });
 
     upd.auth_settings = std::move(settings);
 }

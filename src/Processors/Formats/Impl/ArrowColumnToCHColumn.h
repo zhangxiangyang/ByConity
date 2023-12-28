@@ -36,6 +36,8 @@
 #include <arrow/buffer.h>
 #include <Processors/Chunk.h>
 #include <Core/Block.h>
+#include <Formats/FormatSettings.h>
+
 
 namespace DB
 {
@@ -43,7 +45,12 @@ namespace DB
 class ArrowColumnToCHColumn
 {
 public:
-    ArrowColumnToCHColumn(const Block & header_, std::shared_ptr<arrow::Schema> schema_, const std::string & format_name_, const std::map<String, String> & partition_kv = {});
+    ArrowColumnToCHColumn(
+        const Block & header_,
+        std::shared_ptr<arrow::Schema> schema_,
+        const std::string & format_name_,
+        bool allow_missing_columns_,
+        bool null_as_default_);
 
     void arrowTableToCHChunk(Chunk & res, std::shared_ptr<arrow::Table> & table);
 
@@ -75,12 +82,14 @@ private:
     const Block & header;
     std::unordered_map<std::string, DataTypePtr> name_to_internal_type;
     const std::string format_name;
+    /// If false, throw exception if some columns in header not exists in arrow table.
+    bool allow_missing_columns;
+    bool null_as_default;
+
     /// Map {column name : dictionary column}.
     /// To avoid converting dictionary from Arrow Dictionary
     /// to LowCardinality every chunk we save it and reuse.
     std::unordered_map<std::string, ColumnPtr> dictionary_values;
-
-    const std::map<String, String> partition_kv;
 };
 }
 #endif

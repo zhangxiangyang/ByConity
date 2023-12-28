@@ -70,6 +70,7 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeBitMap64.h>
 
 #include <Databases/DatabaseFactory.h>
 #include <Databases/DatabaseReplicated.h>
@@ -87,19 +88,29 @@
 
 #include <TableFunctions/TableFunctionFactory.h>
 #include <common/logger_useful.h>
+#include <Parsers/queryToString.h>
 #include <Interpreters/executeQuery.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/executeQuery.h>
 #include <Interpreters/trySetVirtualWarehouse.h>
 #include <Storages/StorageCnchMergeTree.h>
+#include <TableFunctions/TableFunctionFactory.h>
 #include <Transaction/TransactionCoordinatorRcCnch.h>
+#include <Parsers/ASTForeignKeyDeclaration.h>
+#include <Parsers/ASTUniqueNotEnforcedDeclaration.h>
 
 #include <Catalog/Catalog.h>
+#include <ExternalCatalog/IExternalCatalogMgr.h>
+#include <Databases/MySQL/DatabaseCnchMaterializedMySQL.h>
+
+#include <fmt/format.h>
 
 namespace DB
 {
 
 namespace ErrorCodes
 {
+    extern const int UNSUPPORTED_METHOD;
     extern const int TABLE_ALREADY_EXISTS;
     extern const int DICTIONARY_ALREADY_EXISTS;
     extern const int EMPTY_LIST_OF_COLUMNS_PASSED;
@@ -107,6 +118,7 @@ namespace ErrorCodes
     extern const int UNKNOWN_DATABASE_ENGINE;
     extern const int DUPLICATE_COLUMN;
     extern const int DATABASE_ALREADY_EXISTS;
+    extern const int CATALOG_ALREADY_EXISTS;
     extern const int BAD_ARGUMENTS;
     extern const int BAD_DATABASE_FOR_TEMPORARY_TABLE;
     extern const int SUSPICIOUS_TYPE_FOR_LOW_CARDINALITY;
@@ -126,6 +138,42 @@ namespace fs = std::filesystem;
 InterpreterCreateQuery::InterpreterCreateQuery(const ASTPtr & query_ptr_, ContextMutablePtr context_)
     : WithMutableContext(context_), query_ptr(query_ptr_)
 {
+    /// if the settting is enabled and query are from user
+    if (context_->getSettingsRef().enable_cnch_engine_conversion && context_->getInitialQueryId().size())
+        query_ptr = convertMergeTreeToCnchEngine(std::move(query_ptr));
+}
+
+static void createPlainConfigFromSettings(const ASTSetQuery & settings, ExternalCatalog::PlainConfigs & conf)
+{
+    for (const auto & change : settings.changes)
+    {
+        conf.setString(change.name, toString(change.value));
+    }
+}
+
+
+BlockIO InterpreterCreateQuery::createExternalCatalog(ASTCreateQuery & create)
+{
+    String catalog_name = create.catalog;
+    if (catalog_name.empty())
+        throw Exception("Database name is empty while creating database", ErrorCodes::BAD_ARGUMENTS);
+    //TODO(ExterncalCatalog):: add intent lock.
+    if (ExternalCatalog::Mgr::instance().isCatalogExist(catalog_name))
+    {
+        if (create.if_not_exists)
+            return {};
+        else
+            throw Exception("Catalog " + catalog_name + " already exists.", ErrorCodes::CATALOG_ALREADY_EXISTS);
+    }
+
+    ExternalCatalog::PlainConfigsPtr conf_ptr(new ExternalCatalog::PlainConfigs());
+    createPlainConfigFromSettings(*create.catalog_properties, *conf_ptr);
+
+    bool created = ExternalCatalog::Mgr::instance().createCatalog(catalog_name, conf_ptr.get(), TxnTimestamp(getContext()->getTimestamp()));
+    if (created)
+        return {};
+    else
+        throw Exception("Catalog " + catalog_name + " could not be created", ErrorCodes::LOGICAL_ERROR);
 }
 
 
@@ -138,7 +186,7 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
     auto guard = DatabaseCatalog::instance().getDDLGuard(database_name, "");
 
     /// Database can be created before or it can be created concurrently in another thread, while we were waiting in DDLGuard
-    if (DatabaseCatalog::instance().isDatabaseExist(database_name))
+    if (DatabaseCatalog::instance().isDatabaseExist(database_name, getContext()))
     {
         if (create.if_not_exists)
             return {};
@@ -171,7 +219,7 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
         /// When attaching old-style database during server startup, we must always use Ordinary engine
         if (create.attach)
             throw Exception("Database engine must be specified for ATTACH DATABASE query", ErrorCodes::UNKNOWN_DATABASE_ENGINE);
-        DefaultDatabaseEngine default_database_engine = getContext()->getSettingsRef().default_database_engine.value;
+        DefaultDatabaseEngine default_database_engine = (database_name == "default") ? DefaultDatabaseEngine::Atomic : getContext()->getSettingsRef().default_database_engine.value;
         auto engine = std::make_shared<ASTFunction>();
         auto storage = std::make_shared<ASTStorage>();
 
@@ -199,6 +247,8 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
 
     if (create.storage->engine->name == "Atomic" || create.storage->engine->name == "Replicated" || create.storage->engine->name == "MaterializedPostgreSQL" || create.storage->engine->name == "Cnch")
     {
+        if (create.storage->engine->name == "Cnch" && database_name == "default")
+            throw Exception(ErrorCodes::INCORRECT_QUERY, "Create default database with Cnch Engine is not allowed.");
         if (create.attach && create.uuid == UUIDHelpers::Nil)
             throw Exception(ErrorCodes::INCORRECT_QUERY, "UUID must be specified for ATTACH. "
                             "If you want to attach existing database, use just ATTACH DATABASE {};", create.database);
@@ -210,7 +260,7 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
         if (!create.attach && fs::exists(metadata_path))
             throw Exception(ErrorCodes::DATABASE_ALREADY_EXISTS, "Metadata directory {} already exists", metadata_path.string());
     }
-    else if (create.storage->engine->name == "MaterializeMySQL")
+    else if (create.storage->engine->name == "CnchMaterializedMySQL" || create.storage->engine->name == "CloudMaterializedMySQL")
     {
         /// It creates nested database with Ordinary or Atomic engine depending on UUID in query and default engine setting.
         /// Do nothing if it's an internal ATTACH on server startup or short-syntax ATTACH query from user,
@@ -219,12 +269,8 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
         bool attach_from_user = create.attach && !internal && !create.attach_short_syntax;
         bool create_from_user = !create.attach;
 
-        if (create_from_user)
-        {
-            const auto & default_engine = getContext()->getSettingsRef().default_database_engine.value;
-            if (create.uuid == UUIDHelpers::Nil && default_engine == DefaultDatabaseEngine::Atomic)
-                create.uuid = UUIDHelpers::generateV4();    /// Will enable Atomic engine for nested database
-        }
+        if (create_from_user && create.uuid == UUIDHelpers::Nil)
+            create.uuid = UUIDHelpers::generateV4();
         else if (attach_from_user && create.uuid == UUIDHelpers::Nil)
         {
             /// Ambiguity is possible: should we attach nested database as Ordinary
@@ -234,10 +280,7 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
         }
 
         /// Set metadata path according to nested engine
-        if (create.uuid == UUIDHelpers::Nil)
-            metadata_path = metadata_path / "metadata" / database_name_escaped;
-        else
-            metadata_path = metadata_path / "store" / DatabaseCatalog::getPathForUUID(create.uuid);
+        metadata_path = metadata_path / "store" / DatabaseCatalog::getPathForUUID(create.uuid);
     }
     else
     {
@@ -250,10 +293,10 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
         metadata_path = metadata_path / "metadata" / database_name_escaped;
     }
 
-    if (create.storage->engine->name == "MaterializeMySQL" && !getContext()->getSettingsRef().allow_experimental_database_materialize_mysql
+    if (create.storage->engine->name == "CnchMaterializedMySQL" && !getContext()->getSettingsRef().allow_experimental_database_materialize_mysql
         && !internal)
     {
-        throw Exception("MaterializeMySQL is an experimental database engine. "
+        throw Exception("CnchMaterializedMySQL is an experimental database engine. "
                         "Enable allow_experimental_database_materialize_mysql to use it.", ErrorCodes::UNKNOWN_DATABASE_ENGINE);
     }
 
@@ -280,20 +323,24 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
         /// Need to acquire kv lock before creating entry
         auto db_lock = txn->createIntentLock(IntentLock::DB_LOCK_PREFIX, database_name);
         db_lock->lock();
-        if (DatabaseCatalog::instance().isDatabaseExist(database_name))
+        if (DatabaseCatalog::instance().isDatabaseExist(database_name, getContext()))
         {
             if (create.if_not_exists)
                 return {};
             else
                 throw Exception("Database " + database_name + " already exists.", ErrorCodes::DATABASE_ALREADY_EXISTS);
         }
-        database_cnch->createEntryInCnchCatalog(getContext());
+        if (const auto * database_cnch_mmsql = dynamic_cast<const DatabaseCnchMaterializedMySQL *>(database.get()))
+            database_cnch_mmsql->createEntryInCnchCatalog(getContext(), queryToString(create));
+        else
+            database_cnch->createEntryInCnchCatalog(getContext());
     }
 
     if (create.uuid != UUIDHelpers::Nil)
         create.database = TABLE_WITH_UUID_NAME_PLACEHOLDER;
 
-    bool need_write_metadata_on_disk = (database->getEngineName() != "Cnch") && (!create.attach || !fs::exists(metadata_file_path));
+    bool need_write_metadata_on_disk = (database->getEngineName() != "Cnch") && (database->getEngineName() != "CnchMaterializedMySQL")
+                                        && (database->getEngineName() != "CloudMaterializedMySQL") && (!create.attach || !fs::exists(metadata_file_path));
 
     if (need_write_metadata_on_disk)
     {
@@ -465,6 +512,26 @@ ASTPtr InterpreterCreateQuery::formatConstraints(const ConstraintsDescription & 
     return res;
 }
 
+ASTPtr InterpreterCreateQuery::formatForeignKeys(const ForeignKeysDescription & foreign_keys)
+{
+    auto res = std::make_shared<ASTExpressionList>();
+
+    for (const auto & foreign_key : foreign_keys.foreign_keys)
+        res->children.push_back(foreign_key->clone());
+
+    return res;
+}
+
+ASTPtr InterpreterCreateQuery::formatUnique(const UniqueNotEnforcedDescription & unique)
+{
+    auto res = std::make_shared<ASTExpressionList>();
+
+    for (const auto & unique_key : unique.unique)
+        res->children.push_back(unique_key->clone());
+
+    return res;
+}
+
 ASTPtr InterpreterCreateQuery::formatProjections(const ProjectionsDescription & projections)
 {
     auto res = std::make_shared<ASTExpressionList>();
@@ -571,8 +638,12 @@ ColumnsDescription InterpreterCreateQuery::getColumnsDescription(
             if (col_decl.type)
                 column.type = name_type_it->type;
             else
+            {
                 column.type = defaults_sample_block.getByName(column.name).type;
-
+                /// set nullability for case of column declaration w/o type but with default expression
+                if ((col_decl.null_modifier && *col_decl.null_modifier) || make_columns_nullable)
+                    column.type = makeNullable(column.type);
+            }
             column.default_desc.kind = columnDefaultKindFromString(col_decl.default_specifier);
             column.default_desc.expression = default_expr;
         }
@@ -617,20 +688,59 @@ ConstraintsDescription InterpreterCreateQuery::getConstraintsDescription(const A
     return res;
 }
 
+ForeignKeysDescription InterpreterCreateQuery::getForeignKeysDescription(const ASTExpressionList * foreign_keys)
+{
+    ForeignKeysDescription res;
+    if (foreign_keys)
+        for (const auto & foreign_key : foreign_keys->children)
+            res.foreign_keys.push_back(std::dynamic_pointer_cast<ASTForeignKeyDeclaration>(foreign_key->clone()));
+    return res;
+}
+
+UniqueNotEnforcedDescription InterpreterCreateQuery::getUniqueNotEnforcedDescription(const ASTExpressionList * unique)
+{
+    UniqueNotEnforcedDescription res;
+    if (unique)
+        for (const auto & unique_key : unique->children)
+            res.unique.push_back(std::dynamic_pointer_cast<ASTUniqueNotEnforcedDeclaration>(unique_key->clone()));
+    return res;
+}
+
 
 InterpreterCreateQuery::TableProperties InterpreterCreateQuery::setProperties(ASTCreateQuery & create) const
 {
     TableProperties properties;
     TableLockHolder as_storage_lock;
 
+    auto check_view_columns_same_with_select = [&](const ColumnsDescription & columns) {
+        if (!create.attach && create.is_ordinary_view && create.select && getContext()->getSettingsRef().create_view_check_column_names)
+        {
+            Block select_sample = InterpreterSelectWithUnionQuery::getSampleBlock(create.select->clone(), getContext());
+            Names select_names = select_sample.getNames();
+            Names column_names = columns.getNamesOfOrdinary();
+
+            if (select_names != column_names)
+                throw Exception(
+                    ErrorCodes::INCORRECT_QUERY,
+                    "Columns of select query are not same with the column list, select query: {}, columns list: {}",
+                    fmt::join(select_names, ","),
+                    fmt::join(column_names, ","));
+        }
+    };
+
     if (create.columns_list)
     {
-        if (create.as_table_function && (create.columns_list->indices || create.columns_list->constraints))
-            throw Exception("Indexes and constraints are not supported for table functions", ErrorCodes::INCORRECT_QUERY);
+        if (create.as_table_function
+            && (create.columns_list->indices || create.columns_list->constraints || create.columns_list->foreign_keys
+                || create.columns_list->unique))
+            throw Exception(
+                "Indexes, constraints and foreign keys and unique(not enforced) are not supported for table functions",
+                ErrorCodes::INCORRECT_QUERY);
 
         if (create.columns_list->columns)
         {
             properties.columns = getColumnsDescription(*create.columns_list->columns, getContext(), create.attach);
+            check_view_columns_same_with_select(properties.columns);
         }
 
         if (create.columns_list->indices)
@@ -646,6 +756,8 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::setProperties(AS
             }
 
         properties.constraints = getConstraintsDescription(create.columns_list->constraints);
+        properties.foreign_keys = getForeignKeysDescription(create.columns_list->foreign_keys);
+        properties.unique = getUniqueNotEnforcedDescription(create.columns_list->unique);
     }
     else if (!create.as_table.empty())
     {
@@ -656,13 +768,20 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::setProperties(AS
         as_storage_lock = as_storage->lockForShare(getContext()->getCurrentQueryId(), getContext()->getSettingsRef().lock_acquire_timeout);
         auto as_storage_metadata = as_storage->getInMemoryMetadataPtr();
         properties.columns = as_storage_metadata->getColumns();
+        check_view_columns_same_with_select(properties.columns);
 
         /// Secondary indices make sense only for MergeTree family of storage engines.
         /// We should not copy them for other storages.
         if (create.storage && endsWith(create.storage->engine->name, "MergeTree"))
             properties.indices = as_storage_metadata->getSecondaryIndices();
 
+        /// Create table as should set projections
+        if (as_storage_metadata->hasProjections())
+            properties.projections = as_storage_metadata->getProjections().clone();
+
         properties.constraints = as_storage_metadata->getConstraints();
+        properties.foreign_keys = as_storage_metadata->getForeignKeys();
+        properties.unique = as_storage_metadata->getUniqueNotEnforced();
     }
     else if (create.select)
     {
@@ -674,14 +793,26 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::setProperties(AS
         /// Table function without columns list.
         auto table_function = TableFunctionFactory::instance().get(create.as_table_function, getContext());
         properties.columns = table_function->getActualTableStructure(getContext());
+        check_view_columns_same_with_select(properties.columns);
         assert(!properties.columns.empty());
     }
     else if (create.is_dictionary)
     {
         return {};
     }
-    else
+    else if (!create.storage || !create.storage->engine)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected application state. CREATE query is missing either its storage or engine.");
+    /// We can have queries like "CREATE TABLE <table> ENGINE=<engine>" if <engine>
+    /// supports schema inference (will determine table structure in it's constructor).
+    else if (!StorageFactory::instance().checkIfStorageSupportsSchemaInference(create.storage->engine->name))
         throw Exception("Incorrect CREATE query: required list of column descriptions or AS section or SELECT.", ErrorCodes::INCORRECT_QUERY);
+
+    if (create.ignore_bitengine_encode)
+    {
+        /// there's no bitengine columns in table, just reset the flag
+        if (0 == processIgnoreBitEngineEncode(properties.columns))
+            create.ignore_bitengine_encode = false;
+    }
 
     /// Even if query has list of columns, canonicalize it (unfold Nested columns).
     if (!create.columns_list)
@@ -690,11 +821,15 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::setProperties(AS
     ASTPtr new_columns = formatColumns(properties.columns);
     ASTPtr new_indices = formatIndices(properties.indices);
     ASTPtr new_constraints = formatConstraints(properties.constraints);
+    ASTPtr new_foreign_keys = formatForeignKeys(properties.foreign_keys);
+    ASTPtr new_unique = formatUnique(properties.unique);
     ASTPtr new_projections = formatProjections(properties.projections);
 
     create.columns_list->setOrReplace(create.columns_list->columns, new_columns);
     create.columns_list->setOrReplace(create.columns_list->indices, new_indices);
     create.columns_list->setOrReplace(create.columns_list->constraints, new_constraints);
+    create.columns_list->setOrReplace(create.columns_list->foreign_keys, new_foreign_keys);
+    create.columns_list->setOrReplace(create.columns_list->unique, new_unique);
     create.columns_list->setOrReplace(create.columns_list->projections, new_projections);
 
     validateTableStructure(create, properties);
@@ -783,7 +918,7 @@ void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
         String as_database_name = getContext()->resolveDatabase(create.as_database);
         String as_table_name = create.as_table;
 
-        ASTPtr as_create_ptr = DatabaseCatalog::instance().getDatabase(as_database_name)->getCreateTableQuery(as_table_name, getContext());
+        ASTPtr as_create_ptr = DatabaseCatalog::instance().getDatabase(as_database_name, getContext())->getCreateTableQuery(as_table_name, getContext());
         const auto & as_create = as_create_ptr->as<ASTCreateQuery &>();
 
         const String qualified_name = backQuoteIfNeed(as_database_name) + "." + backQuoteIfNeed(as_table_name);
@@ -889,6 +1024,11 @@ void InterpreterCreateQuery::assertOrSetUUID(ASTCreateQuery & create, const Data
 
         generateUUIDForTable(create);
     }
+    /// CnchMergeTree shold always have the UUID.
+    else if (database->getEngineName() == "Cnch")
+    {
+        generateUUIDForTable(create);
+    }
     else
     {
         /// As table name is always not the same with it on server side,
@@ -940,13 +1080,108 @@ void InterpreterCreateQuery::assertOrSetUUID(ASTCreateQuery & create, const Data
 
 BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
 {
+    // Make sure names in foreign key exist.
+    if (create.columns_list && create.columns_list->foreign_keys)
+    {
+        if (create.database.empty())
+            create.database = getContext()->getCurrentDatabase();
+
+        auto contains_columns = [](const ASTExpressionList & name_list, const Names & names) {
+            NameSet name_set;
+            for (const auto & name : names)
+                name_set.insert(name);
+
+            for (const auto & ptr : name_list.children)
+                if (!name_set.contains(ptr->as<ASTIdentifier &>().name()))
+                    return ptr->as<ASTIdentifier &>().name();
+            return String();
+        };
+
+        Names columns;
+        for (const auto & expr : create.columns_list->columns->as<ASTExpressionList &>().children)
+            columns.push_back(expr->as<ASTColumnDeclaration &>().name);
+
+        // FOREIGN KEY (foreign_key.column_names) REFERENCES(foreign_key.ref_column_names)
+        if (!columns.empty())
+        {
+            const ASTExpressionList * foreign_keys = create.columns_list->foreign_keys;
+            NameSet used_fk_names;
+
+            for (const auto & foreign_key_child : foreign_keys->children)
+            {
+                auto & foreign_key = foreign_key_child->as<ASTForeignKeyDeclaration &>();
+
+                if (!used_fk_names.contains(foreign_key.fk_name))
+                    used_fk_names.insert(foreign_key.fk_name);
+                else
+                    throw Exception("FOREIGN KEY constraint name duplicated with " + foreign_key.fk_name, ErrorCodes::ILLEGAL_COLUMN);
+
+                auto ref_storage_ptr = DatabaseCatalog::instance().tryGetTable({create.database, foreign_key.ref_table_name}, getContext());
+                if (!ref_storage_ptr)
+                    throw Exception("FOREIGN KEY references unknown table " + foreign_key.ref_table_name, ErrorCodes::UNKNOWN_TABLE);
+
+                auto check_res = contains_columns(foreign_key.column_names->as<ASTExpressionList &>(), columns);
+                auto ref_check_res = contains_columns(
+                    foreign_key.ref_column_names->as<ASTExpressionList &>(),
+                    ref_storage_ptr->getInMemoryMetadataPtr()->getColumns().getAll().getNames());
+
+                if (!check_res.empty())
+                    throw Exception("FOREIGN KEY references unknown column " + check_res, ErrorCodes::ILLEGAL_COLUMN);
+                if (!ref_check_res.empty())
+                    throw Exception("FOREIGN KEY references unknown column " + ref_check_res, ErrorCodes::ILLEGAL_COLUMN);
+            }
+        }
+    }
+
+    // Make sure names in unique not enforced exist.
+    if (create.columns_list && create.columns_list->unique)
+    {
+        if (create.database.empty())
+            create.database = getContext()->getCurrentDatabase();
+
+        auto contains_columns = [](const ASTExpressionList & name_list, const Names & names) {
+            NameSet name_set;
+            for (const auto & name : names)
+                name_set.insert(name);
+
+            for (const auto & ptr : name_list.children)
+                if (!name_set.contains(ptr->as<ASTIdentifier &>().name()))
+                    return ptr->as<ASTIdentifier &>().name();
+            return String();
+        };
+
+        Names columns;
+        for (const auto & expr : create.columns_list->columns->as<ASTExpressionList &>().children)
+            columns.push_back(expr->as<ASTColumnDeclaration &>().name);
+
+        if (!columns.empty())
+        {
+            const ASTExpressionList * unique = create.columns_list->unique;
+            NameSet used_uk_names;
+
+            for (const auto & unique_child : unique->children)
+            {
+                auto & unique_key = unique_child->as<ASTUniqueNotEnforcedDeclaration &>();
+
+                if (!used_uk_names.contains(unique_key.name))
+                    used_uk_names.insert(unique_key.name);
+                else
+                    throw Exception("UNIQUE NOT ENFORCED constraint name duplicated with " + unique_key.name, ErrorCodes::ILLEGAL_COLUMN);
+
+                auto check_res = contains_columns(unique_key.column_names->as<ASTExpressionList &>(), columns);
+                if (!check_res.empty())
+                    throw Exception("UNIQUE NOT ENFORCED not exists -- " + check_res, ErrorCodes::ILLEGAL_COLUMN);
+            }
+        }
+    }
+
     /// Temporary tables are created out of databases.
     if (create.temporary && !create.database.empty())
         throw Exception("Temporary tables cannot be inside a database. You should not specify a database for a temporary table.",
             ErrorCodes::BAD_DATABASE_FOR_TEMPORARY_TABLE);
 
-    if (create.storage && create.storage->unique_key && create.storage->cluster_by)
-        throw Exception("`CLUSTER BY` cannot be used together with `UNIQUE KEY`", ErrorCodes::BAD_ARGUMENTS);
+    if (create.storage && create.storage->unique_key && create.columns_list->projections)
+        throw Exception("`Projection` cannot be used together with `UNIQUE KEY`", ErrorCodes::BAD_ARGUMENTS);
 
     String current_database = getContext()->getCurrentDatabase();
     auto database_name = create.database.empty() ? current_database : create.database;
@@ -954,7 +1189,7 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
     // If this is a stub ATTACH query, read the query definition from the database
     if (create.attach && !create.storage && !create.columns_list)
     {
-        auto database = DatabaseCatalog::instance().getDatabase(database_name);
+        auto database = DatabaseCatalog::instance().getDatabase(database_name, getContext());
 
         if (database->getEngineName() == "Replicated")
         {
@@ -1049,7 +1284,7 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
     bool need_add_to_database = !create.temporary;
     if (need_add_to_database)
     {
-        database = DatabaseCatalog::instance().tryGetDatabase(database_name);
+        database = DatabaseCatalog::instance().tryGetDatabase(database_name, getContext());
         if (!database)
         {
             if (getContext()->getServerType() != ServerType::cnch_worker)
@@ -1060,7 +1295,7 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
             create_database.if_not_exists = true;
 
             createDatabase(create_database);
-            database = DatabaseCatalog::instance().getDatabase(database_name);
+            database = DatabaseCatalog::instance().getDatabase(database_name, getContext());
         }
     }
 
@@ -1089,7 +1324,7 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
 
     /// CnchKafka table should be allowed to be created on worker
     if (create.storage && startsWith(create.storage->engine->name, "Cnch")
-        && !startsWith(create.storage->engine->name, "CnchKafka") && database->getEngineName() != "Cnch")
+        && !startsWith(create.storage->engine->name, "CnchKafka") && database->getEngineName() != "Cnch" && database->getEngineName() != "CnchMaterializedMySQL")
     {
         throw Exception(
             ErrorCodes::SUPPORT_IS_DISABLED,
@@ -1130,7 +1365,7 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
           */
         guard = DatabaseCatalog::instance().getDDLGuard(create.database, create.table);
 
-        database = DatabaseCatalog::instance().getDatabase(create.database);
+        database = DatabaseCatalog::instance().getDatabase(create.database, getContext());
         if (database->getEngineName().starts_with("Cnch"))
         {
             auto txn = getContext()->getCurrentTransaction();
@@ -1189,7 +1424,7 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
             return false;
 
         String temporary_table_name = create.table;
-        auto temporary_table = TemporaryTableHolder(getContext(), properties.columns, properties.constraints, query_ptr);
+        auto temporary_table = TemporaryTableHolder(getContext(), properties.columns, properties.constraints, properties.foreign_keys, properties.unique, query_ptr);
         getContext()->getSessionContext()->addExternalTable(temporary_table_name, std::move(temporary_table));
         return true;
     }
@@ -1236,10 +1471,12 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
             getContext()->getGlobalContext(),
             properties.columns,
             properties.constraints,
+            properties.foreign_keys,
+            properties.unique,
             false);
     }
 
-    auto * merge_tree_storage = dynamic_cast<MergeTreeData *>(res.get());
+    auto * merge_tree_storage = dynamic_cast<MergeTreeMetaBase *>(res.get());
     if (merge_tree_storage)
     {
         try
@@ -1361,6 +1598,15 @@ BlockIO InterpreterCreateQuery::fillTableIfNeeded(const ASTCreateQuery & create)
             auto insert_context = Context::createCopy(getContext()->getSessionContext());
             insert_context->makeQueryContext();
             insert_context->setSettings(getContext()->getSettingsRef());
+
+            // TODO @wangtao.2077: review this when internal queries are fully supported by optimizer
+            if (insert_context->getSettingsRef().enable_optimizer && insert_context->getSettingsRef().enable_optimizer_for_create_select)
+            {
+                insert_context->setCurrentQueryId("");
+                CurrentThread::attachQueryContext(insert_context);
+                return executeQuery(insert->formatForErrorMessage(), insert_context, /*internal=*/false);
+            }
+
             return executeQuery(insert->formatForErrorMessage(), insert_context, /*internal=*/true);
         }
     }
@@ -1429,8 +1675,12 @@ BlockIO InterpreterCreateQuery::execute()
 
     ASTQueryWithOutput::resetOutputASTIfExist(create);
 
+    if (!create.catalog.empty() && create.database.empty() && create.table.empty())
+        return createExternalCatalog(create);
+    else if (!create.catalog.empty() && (!create.database.empty() || !create.table.empty()))
+        throw Exception("create database or table in externcal catalog is not supported", ErrorCodes::INCORRECT_QUERY );
     /// CREATE|ATTACH DATABASE
-    if (!create.database.empty() && create.table.empty())
+    else if (!create.database.empty() && create.table.empty())
         return createDatabase(create);
     else
         return createTable(create);
@@ -1496,6 +1746,46 @@ void InterpreterCreateQuery::extendQueryLogElemImpl(QueryLogElement & elem, cons
         elem.query_databases.insert(database);
         elem.query_tables.insert(database + "." + backQuoteIfNeed(as_table_saved));
     }
+}
+
+size_t InterpreterCreateQuery::processIgnoreBitEngineEncode(ColumnsDescription & columns) const
+{
+    size_t changed_column_cnt{0};
+    for (const auto & column : columns)
+    {
+        if (column.type->isBitEngineEncode())
+        {
+            auto bitmap_type = std::make_shared<DataTypeBitMap64>();
+            bitmap_type->setFlags(column.type->getFlags());
+            bitmap_type->resetFlags(TYPE_BITENGINE_ENCODE_FLAG);
+            const_cast<ColumnDescription &>(column).type = std::move(bitmap_type);
+            ++changed_column_cnt;
+        }
+    }
+
+    return changed_column_cnt;
+}
+
+ASTPtr convertMergeTreeToCnchEngine(ASTPtr query_ptr)
+{
+    auto & create = query_ptr->as<ASTCreateQuery &>();
+    if (create.attach)
+        return query_ptr;
+    ASTStorage * storage = create.storage;
+    if (!storage)
+        return query_ptr;
+    ASTFunction * engine = storage->engine;
+    if (!engine)
+        return query_ptr;
+    const String & engine_name = engine->name;
+    bool found_cnch = (engine_name.find("Cnch") != std::string::npos);
+    bool found_merge_tree = (engine_name.find("MergeTree") != std::string::npos);
+    if (found_cnch || (!found_merge_tree))
+        return query_ptr;
+
+    String new_engine_name = "Cnch" + engine_name;
+    engine->name = new_engine_name;
+    return query_ptr;
 }
 
 }

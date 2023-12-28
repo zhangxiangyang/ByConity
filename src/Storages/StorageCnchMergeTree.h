@@ -30,11 +30,14 @@ struct PrepareContextResult;
 class StorageCnchMergeTree final : public shared_ptr_helper<StorageCnchMergeTree>, public MergeTreeMetaBase, public CnchStorageCommonHelper
 {
     friend struct shared_ptr_helper<StorageCnchMergeTree>;
+    friend class InterpreterAlterDiskCacheQuery;
 
 public:
     ~StorageCnchMergeTree() override;
 
     std::string getName() const override { return "Cnch" + merging_params.getModeName() + "MergeTree"; }
+
+    void loadMutations();
 
     bool supportsSampling() const override { return true; }
     bool supportsFinal() const override { return true; }
@@ -42,6 +45,9 @@ public:
     bool supportsIndexForIn() const override { return true; }
     bool supportsMapImplicitColumn() const override { return true; }
     bool supportsTrivialCount() const override { return true; }
+
+    /// Whether support DELETE FROM. We only support for Unique MergeTree for now.
+    bool supportsLightweightDelete() const override { return getInMemoryMetadataPtr()->hasUniqueKey(); }
 
     std::optional<UInt64> totalRows(const ContextPtr &) const override;
     std::optional<UInt64> totalRowsByPartitionPredicate(const SelectQueryInfo &, ContextPtr) const override;
@@ -79,7 +85,11 @@ public:
     PrepareContextResult prepareReadContext(
         const Names & column_names, const StorageMetadataPtr & metadata_snapshot, SelectQueryInfo & query_info, ContextPtr & local_context);
 
+    std::pair<String, const Cluster::ShardInfo *> prepareLocalTableForWrite(ASTInsertQuery * insert_query, ContextPtr local_context, bool enable_staging_area, bool send_query);
+
     BlockOutputStreamPtr write(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, ContextPtr local_context) override;
+
+    BlockInputStreamPtr writeInWorker(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, ContextPtr local_context);
 
     HostWithPortsVec getWriteWorkers(const ASTPtr & query, ContextPtr local_context) override;
 
@@ -94,25 +104,35 @@ public:
 
     CheckResults checkData(const ASTPtr & query, ContextPtr local_context) override;
 
+    CheckResults autoRemoveData(const ASTPtr & query, ContextPtr local_context) override;
+
     time_t getTTLForPartition(const MergeTreePartition & partition) const;
 
+    /**
+     * @param snapshot_ts If not zero, specify the snapshot to use
+     */
     ServerDataPartsVector
-    selectPartsToRead(const Names & column_names_to_return, ContextPtr local_context, const SelectQueryInfo & query_info) const;
+    selectPartsToRead(const Names & column_names_to_return, ContextPtr local_context, const SelectQueryInfo & query_info, UInt64 snapshot_ts = 0) const;
 
     /// Return all base parts and delete bitmap metas in the given partitions.
     /// If `partitions` is empty, return meta for all partitions.
-    MergeTreeDataPartsCNCHVector getUniqueTableMeta(TxnTimestamp ts, const Strings & partitions = {});
+    MergeTreeDataPartsCNCHVector getUniqueTableMeta(TxnTimestamp ts, const Strings & partitions = {}, bool force_bitmap = true);
 
     /// return table's committed staged parts (excluding deleted ones).
     /// if partitions != null, ignore staged parts not belong to `partitions`.
     MergeTreeDataPartsCNCHVector
     getStagedParts(const TxnTimestamp & ts, const NameSet * partitions = nullptr, bool skip_delete_bitmap = false);
 
-    /// Pre-condition: "parts" should have been sorted in part info order
-    void getDeleteBitmapMetaForParts(const MergeTreeDataPartsCNCHVector & parts, ContextPtr context, TxnTimestamp start_time);
+    /**
+     * @param parts input parts, must be sorted in PartComparator order
+     * @param snapshot_ts If not zero, specify the snapshot to use
+     */
+    void getDeleteBitmapMetaForServerParts(const ServerDataPartsVector & parts, ContextPtr local_context, UInt64 snapshot_ts = 0) const;
+    /// TODO: unify into one methods
+    void getDeleteBitmapMetaForCnchParts(const MergeTreeDataPartsCNCHVector & parts, ContextPtr context, TxnTimestamp start_time, bool force_found = true);
+    void getDeleteBitmapMetaForParts(IMergeTreeDataPartsVector & parts, ContextPtr context, TxnTimestamp start_time, bool force_found = true);
     /// For staged parts, delete bitmap represents delete_flag info which is optional, it's valid if it doesn't have delete_bitmap metadata.
     void getDeleteBitmapMetaForStagedParts(const MergeTreeDataPartsCNCHVector & parts, ContextPtr context, TxnTimestamp start_time);
-    void getDeleteBitmapMetaForParts(const ServerDataPartsVector & parts, ContextPtr context, TxnTimestamp start_time) const;
 
     /// Used by the "SYSTEM DEDUP" command to repair unique table by removing duplicate keys in visible parts.
     void executeDedupForRepair(const ASTPtr & partition, ContextPtr context);
@@ -121,19 +141,14 @@ public:
     void waitForStagedPartsToPublish(ContextPtr context);
 
     // Allocate parts to workers before we want to do some calculation on the parts, support non-select query.
-    void allocateParts(ContextPtr local_context, ServerDataPartsVector & parts, WorkerGroupHandle & worker_group);
-
-    UInt64 getTimeTravelRetention();
-
-    void addCheckpoint(const Protos::Checkpoint & checkpoint);
-    void removeCheckpoint(const Protos::Checkpoint & checkpoint);
+    void allocateParts(ContextPtr local_context, ServerDataPartsVector & parts);
 
     ColumnSizeByName getColumnSizes() const override { return {}; }
-
 
     void checkAlterIsPossible(const AlterCommands & commands, ContextPtr local_context) const override;
     void alter(const AlterCommands & commands, ContextPtr local_context, TableLockHolder & table_lock_holder) override;
     void checkAlterSettings(const AlterCommands & commands) const;
+    void checkAlterVW(const String & vw_name) const;
 
     void checkAlterPartitionIsPossible(
         const PartitionCommands & commands, const StorageMetadataPtr & metadata_snapshot, const Settings & settings) const override;
@@ -167,14 +182,32 @@ public:
     };
     using PartitionDropInfos = std::unordered_map<String, PartitionDropInfo>;
     MutableDataPartsVector createDropRangesFromPartitions(const PartitionDropInfos & partition_infos, const TransactionCnchPtr & txn);
-    MutableDataPartsVector createDropRangesFromParts(const ServerDataPartsVector & parts_to_drop, const TransactionCnchPtr & txn);
+    MutableDataPartsVector createDropRangesFromParts(ContextPtr query_context, const ServerDataPartsVector & parts_to_drop, const TransactionCnchPtr & txn);
+    LocalDeleteBitmaps createDeleteBitmapTombstones(const IMutableMergeTreeDataPartsVector & drop_range_parts, UInt64 txnID);
 
-    StorageCnchMergeTree * checkStructureAndGetCnchMergeTree(const StoragePtr & source_table) const;
+    StorageCnchMergeTree * checkStructureAndGetCnchMergeTree(const StoragePtr & source_table, ContextPtr local_context) const;
 
     const String & getLocalStorePath() const;
 
+    void reclusterPartition(const PartitionCommand & command, ContextPtr query_context);
+
     String genCreateTableQueryForWorker(const String & suffix);
 
+    Strings getPartitionsByPredicate(const ASTPtr & predicate, ContextPtr local_context);
+
+    ServerDataPartsVector
+    getServerPartsByPredicate(const ASTPtr & predicate, const std::function<ServerDataPartsVector()> & get_parts, ContextPtr local_context);
+
+    void sendPreloadTasks(ContextPtr local_context, ServerDataPartsVector parts, bool enable_parts_sync_preload = true, UInt64 parts_preload_level = 0, UInt64 ts = {});
+    void sendDropDiskCacheTasks(ContextPtr local_context, const ServerDataPartsVector & parts, bool sync = false, bool drop_vw_disk_cache = false);
+
+    PrunedPartitions getPrunedPartitions(const SelectQueryInfo & query_info, const Names & column_names_to_return, ContextPtr local_context) const ;
+
+    /// parse bucket number set from where clause, only works for single-key cluster by
+    std::set<Int64> getRequiredBucketNumbers(const SelectQueryInfo & query_info, ContextPtr context) const;
+
+    // get all Visible Parts
+    ServerDataPartsVector getAllParts(ContextPtr local_context) const;
 protected:
     StorageCnchMergeTree(
         const StorageID & table_id_,
@@ -187,15 +220,17 @@ protected:
         std::unique_ptr<MergeTreeSettings> settings_);
 
 private:
+    friend class DB::Catalog::Catalog;
     // Relative path to auxility storage disk root
     String relative_auxility_storage_path;
 
     CheckResults checkDataCommon(const ASTPtr & query, ContextPtr local_context, ServerDataPartsVector & parts) const;
 
-    ServerDataPartsVector getAllParts(ContextPtr local_context) const;
-
+    /**
+     * @param snapshot_ts If not zero, specify the snapshot to use
+     */
     ServerDataPartsVector
-    getAllPartsInPartitions(const Names & column_names_to_return, ContextPtr local_context, const SelectQueryInfo & query_info) const;
+    getAllPartsInPartitions(const Names & column_names_to_return, ContextPtr local_context, const SelectQueryInfo & query_info, UInt64 snapshot_ts = 0) const;
 
     Strings selectPartitionsByPredicate(
         const SelectQueryInfo & query_info,
@@ -218,17 +253,16 @@ private:
         const String & local_table_name,
         const std::set<Int64> & required_bucket_numbers = {});
 
+    /// NOTE: No need to implement this for CnchMergeTree as data processing is on CloudMergeTree.
     MutationCommands getFirstAlterMutationCommandsForPart(const DataPartPtr &) const override { return {}; }
 
     /// For select in interactive transaction session
-    void filterPartsInExplicitTransaction(ServerDataPartsVector & data_parts, ContextPtr local_context) const;
+    ServerDataPartsVector filterPartsInExplicitTransaction(ServerDataPartsVector & data_parts, ContextPtr local_context) const;
 
     /// Generate view dependency create queries for materialized view writing
     Names genViewDependencyCreateQueries(const StorageID & storage_id, ContextPtr local_context, const String & table_suffix);
-    String extractTableSuffix(const String & gen_table_name);
-    std::set<Int64> getRequiredBucketNumbers(const SelectQueryInfo & query_info, ContextPtr context) const;
 
-    void ingestPartition(const struct PartitionCommand & command, const ContextPtr local_context);
+    Pipe ingestPartition(const struct PartitionCommand & command, const ContextPtr local_context);
 
     /// Check if the ALTER can be performed:
     /// - all needed columns are present.
@@ -236,12 +270,19 @@ private:
     /// - columns corresponding to primary key, indices, sign, sampling expression and date are not affected.
     /// If something is wrong, throws an exception.
     void checkAlterInCnchServer(const AlterCommands & commands, ContextPtr local_context) const;
+
+
+    /// *********** START OF BitEngine-related members *********** ///
+
+    /// check whether bitengine table and dictionary table has same CLUSTER BY clause
+    /// only CnChMergeTree use it when creating table, CloudMergeTree doesn't need it because it's more difficult
+    /// to get underlying dict table.
+    void checkSchemaForBitEngineTable(const ContextPtr & context_) const override;
+
+    void checkUnderlyingDictionaryTable(const BitEngineHelper::DictionaryDatabaseAndTable & dict_table) override;
+
+    /// *********** END OF BitEngine-related members *********** ///
 };
 
-struct PrepareContextResult
-{
-    String local_table_name;
-    ServerDataPartsVector parts;
-};
-
+using StorageCnchMergeTreePtr = std::shared_ptr<StorageCnchMergeTree>;
 }

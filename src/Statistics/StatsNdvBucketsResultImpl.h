@@ -14,10 +14,10 @@
  */
 
 #pragma once
-#include <Optimizer/Dump/Json2Pb.h>
+#include <Optimizer/Dump/ProtoEnumUtils.h>
 #include <Statistics/BucketBoundsImpl.h>
 #include <Statistics/SerdeUtils.h>
-#include <Statistics/StatsCpcSketch.h>
+#include <Statistics/StatsHllSketch.h>
 #include <Statistics/StatsNdvBucketsResult.h>
 
 namespace DB::Statistics

@@ -1,4 +1,3 @@
-
 # Put all targets defined here and in added subfolders under "contrib/" folder in GUI-based IDEs by default.
 # Some of third-party projects may override CMAKE_FOLDER or FOLDER property of their targets, so they will
 # appear not in "contrib/" as originally planned here.
@@ -14,6 +13,34 @@ unset (_current_dir_name)
 # Also remove a possible source of nondeterminism.
 set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -D__DATE__= -D__TIME__= -D__TIMESTAMP__=")
 set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -D__DATE__= -D__TIME__= -D__TIMESTAMP__=")
+
+# add_contrib cmake_folder[ base_folder1[, ...base_folderN]]
+function(add_contrib cmake_folder)
+    if (ARGN)
+        set(base_folders ${ARGN})
+    else()
+        set(base_folders ${cmake_folder})
+    endif()
+
+    foreach (base_folder ${base_folders})
+        # some typos in the code
+        if (NOT IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${base_folder}")
+            message(FATAL_ERROR "No such base folder '${base_folder}' (for '${cmake_folder}' cmake folder). Typo in the base folder name?")
+        endif()
+
+        file(GLOB contrib_files "${base_folder}/*")
+        if (NOT contrib_files)
+            # Checking out *all* submodules takes > 5 min. Therefore, the smoke build ("FastTest") in CI initializes only the set of
+            # submodules minimally needed for a build and we cannot assume here that all submodules are populated.
+            message(STATUS "submodule ${base_folder} is missing or empty. to fix try run:")
+            message(STATUS "    git submodule update --init")
+            return()
+        endif()
+    endforeach()
+
+    message(STATUS "Adding contrib module ${base_folders} (configuring with ${cmake_folder})")
+    add_subdirectory (${cmake_folder})
+endfunction()
 
 if (WITH_COVERAGE)
   set (WITHOUT_COVERAGE_LIST ${WITHOUT_COVERAGE})
@@ -209,12 +236,14 @@ endif()
 if(USE_INTERNAL_GTEST_LIBRARY)
     set(GOOGLETEST_VERSION 1.10.0) # master
     # Google Test from sources
-    add_subdirectory(${ClickHouse_SOURCE_DIR}/contrib/googletest/googletest ${CMAKE_CURRENT_BINARY_DIR}/googletest)
+    add_subdirectory(${ClickHouse_SOURCE_DIR}/contrib/googletest ${CMAKE_CURRENT_BINARY_DIR}/googletest)
     # avoid problems with <regexp.h>
     target_compile_definitions (gtest INTERFACE GTEST_HAS_POSIX_RE=0)
+    target_compile_definitions (gmock INTERFACE)
 elseif(GTEST_SRC_DIR)
-    add_subdirectory(${GTEST_SRC_DIR}/googletest ${CMAKE_CURRENT_BINARY_DIR}/googletest)
+    add_subdirectory(${GTEST_SRC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/googletest)
     target_compile_definitions(gtest INTERFACE GTEST_HAS_POSIX_RE=0)
+    target_compile_definitions(gmock INTERFACE)
 endif()
 
 if (USE_EMBEDDED_COMPILER)
@@ -265,14 +294,30 @@ if (USE_INTERNAL_GRPC_LIBRARY)
     add_subdirectory(grpc-cmake)
 endif ()
 
-if (USE_INTERNAL_AWS_S3_LIBRARY)
-    add_subdirectory(aws-s3-cmake)
+if (ENABLE_MSGPACK)
+    add_library(_msgpack INTERFACE)
+    target_include_directories(_msgpack SYSTEM BEFORE INTERFACE "${ClickHouse_SOURCE_DIR}/contrib/msgpack-c/include")
+    add_library(ch_contrib::msgpack ALIAS _msgpack)
+endif()
 
-    # The library is large - avoid bloat.
-    target_compile_options (aws_s3 PRIVATE -g0)
-    target_compile_options (aws_s3_checksums PRIVATE -g0)
+add_contrib (aws-cmake
+    aws
+    aws-c-auth
+    aws-c-cal
+    aws-c-common
+    aws-c-compression
+    aws-c-event-stream
+    aws-c-http
+    aws-c-io
+    aws-c-mqtt
+    aws-c-s3
+    aws-c-sdkutils
+    aws-s2n-tls
+    aws-checksums
+    aws-crt-cpp
+    aws-cmake
+)
 
-endif ()
 
 if (USE_BASE64)
     add_subdirectory (base64-cmake)
@@ -357,5 +402,18 @@ if (ENABLE_BENCHMARK)
     add_subdirectory(benchmark)
 endif()
 
-add_subdirectory(numactl-cmake)
 add_subdirectory(hivemetastore-cmake)
+
+set(BUILD_SHARED_LIBS_BEFORE_MSGPACK ${BUILD_SHARED_LIBS})
+unset (BUILD_SHARED_LIBS)
+add_subdirectory(msgpack-c)
+set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_BEFORE_MSGPACK})
+unset(BUILD_SHARED_LIBS_BEFORE_MSGPACK)
+
+if (USE_CPP_JIEBA)
+    add_subdirectory(cppjieba-cmake)
+endif()
+
+if (USE_TSQUERY)
+    add_subdirectory(TSQuery-cmake)
+endif()

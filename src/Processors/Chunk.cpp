@@ -67,7 +67,11 @@ Chunk::Chunk(MutableColumns columns_, UInt64 num_rows_, ChunkInfoPtr chunk_info_
 
 Chunk Chunk::clone() const
 {
-    return Chunk(getColumns(), getNumRows(), chunk_info);
+    Chunk res(getColumns(), getNumRows(), chunk_info);
+    if (owned_side_block && owned_side_block->columns() > 0)
+    for (auto column : *owned_side_block)
+        res.addColumnToSideBlock(std::move(column));
+    return res;
 }
 
 void Chunk::setColumns(Columns columns_, UInt64 num_rows_)
@@ -125,7 +129,9 @@ Columns Chunk::detachColumns()
 
 void Chunk::addColumn(ColumnPtr column)
 {
-    if (column->size() != num_rows)
+    if (empty())
+        num_rows = column->size();
+    else if (column->size() != num_rows)
         throw Exception("Invalid number of rows in Chunk column " + column->getName()+ ": expected " +
                         toString(num_rows) + ", got " + toString(column->size()), ErrorCodes::LOGICAL_ERROR);
 
@@ -187,6 +193,22 @@ std::string Chunk::dumpStructure() const
     return out.str();
 }
 
+void Chunk::append(const Chunk & chunk)
+{
+    append(chunk, 0, chunk.getNumRows());
+}
+
+void Chunk::append(const Chunk & chunk, size_t from, size_t length)
+{
+    MutableColumns mutable_columns = mutateColumns();
+    for (size_t position = 0; position < mutable_columns.size(); ++position)
+    {
+        auto column = chunk.getColumns()[position];
+        mutable_columns[position]->insertRangeFrom(*column, from, length);
+    }
+    size_t rows = mutable_columns[0]->size();
+    setColumns(std::move(mutable_columns), rows);
+}
 
 void ChunkMissingValues::setBit(size_t column_idx, size_t row_idx)
 {
@@ -202,6 +224,14 @@ const ChunkMissingValues::RowsBitMask & ChunkMissingValues::getDefaultsBitmask(s
     if (it != rows_mask_by_column_id.end())
         return it->second;
     return none;
+}
+
+void Chunk::addColumnToSideBlock(ColumnWithTypeAndName && col)
+{
+    if (!owned_side_block)
+        owned_side_block = std::make_unique<Block>();
+    if (!owned_side_block->has(col.name))
+        owned_side_block->insert(std::move(col));
 }
 
 }

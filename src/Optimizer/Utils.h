@@ -15,6 +15,9 @@
 
 #pragma once
 
+#include <Core/NameToType.h>
+#include <Core/Names.h>
+#include <Interpreters/Context_fwd.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -23,6 +26,8 @@
 #include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTWindowDefinition.h>
 #include <QueryPlan/Assignment.h>
+#include <QueryPlan/PlanNode.h>
+#include <Storages/IStorage_fwd.h>
 
 #include <unordered_map>
 
@@ -42,8 +47,15 @@ namespace Utils
     bool isIdentity(const Assignment & assignment);
     bool isIdentity(const Assignments & assignments);
     bool isIdentity(const ProjectionStep & project);
+
+    bool isIdentifierOrIdentifierCast(const ConstASTPtr & ast);
+    // return inside expression if cast don't affect the data in the bound column, such as cast to Nullable(column_name), int8 to int32.
+    ConstASTPtr tryUnwrapCast(const ConstASTPtr & expression, ContextMutablePtr context, const NamesAndTypes & names_and_types);
+
+    NameToNameMap extractIdentities(const ProjectionStep & project);
     std::unordered_map<String, String> computeIdentityTranslations(Assignments & assignments);
     ASTPtr extractAggregateToFunction(const AggregateDescription & agg_descr);
+    bool containsAggregateFunction(const ASTPtr & ast);
 
     // this method is used to deal with function names which are case-insensitive or have an alias to.
     // should be called after `registerFunctions`
@@ -96,6 +108,20 @@ namespace Utils
         return power_set;
     }
 
+    bool canChangeOutputRows(const Assignments & assignments, ContextPtr context);
+    bool canChangeOutputRows(const ProjectionStep & project, ContextPtr context);
+
+    // return nullopt if ambiguous symbol exists(rarely)
+    std::optional<NameToType> extractNameToType(const PlanNodeBase & node);
+
+    template <template <typename, typename...> typename Map, typename K, typename V>
+    Map<V, K> reverseMap(const Map<K, V> & map)
+    {
+        Map<V, K> reversed;
+        for (const auto & entry : map)
+            reversed.emplace(entry.second, entry.first);
+        return reversed;
+    }
 }
 
 }

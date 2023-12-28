@@ -63,6 +63,8 @@ struct TreeRewriterResult
 
     std::vector<const ASTFunction *> window_function_asts;
 
+    std::vector<const ASTFunction *> expressions_with_window_function;
+
     /// Which column is needed to be ARRAY-JOIN'ed to get the specified.
     /// For example, for `SELECT s.v ... ARRAY JOIN a AS s` will get "s.v" -> "a.v".
     NameToNameMap array_join_result_to_source;
@@ -94,6 +96,9 @@ struct TreeRewriterResult
     /// Results of scalar sub queries
     Scalars scalars;
 
+    /// Rewrite columns for compatibility.
+    TablesWithColumns join_tables_to_rewrite;
+
     TreeRewriterResult(
         const NamesAndTypesList & source_columns_,
         ConstStoragePtr storage_ = {},
@@ -101,12 +106,14 @@ struct TreeRewriterResult
         bool add_special = true);
 
     void collectSourceColumns(bool add_special);
-    void collectUsedColumns(const ASTPtr & query, bool is_select);
+    void collectUsedColumns(const ContextPtr & context, ASTPtr & query, bool is_select);
     Names requiredSourceColumns() const { return required_source_columns.getNames(); }
     const Names & requiredSourceColumnsForAccessCheck() const { return required_source_columns_before_expanding_alias_columns; }
     NameSet getArrayJoinSourceNameSet() const;
     Names getExpandedAliases() const { return {expanded_aliases.begin(), expanded_aliases.end()}; }
     const Scalars & getScalars() const { return scalars; }
+    void collectJoinTableAndAlias(const ContextPtr & context, const ASTPtr & select);
+    void rewriteUnknownLeftJoinIdentifier(ASTPtr & query, NameSet & available_columns, NameSet & required, NameSet & unknown_identifier_set, bool check_identifier_begin_valid);
 };
 
 using TreeRewriterResultPtr = std::shared_ptr<const TreeRewriterResult>;

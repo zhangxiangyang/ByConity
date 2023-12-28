@@ -13,12 +13,14 @@
  * limitations under the License.
  */
 
-#include <DataTypes/DataTypeEnum.h>
+#include <optional>
 #include <Storages/StorageCnchMergeTree.h>
 
 #include <Catalog/Catalog.h>
+#include <CloudServices/CnchBGThreadCommon.h>
 #include <CloudServices/CnchCreateQueryHelper.h>
 #include <CloudServices/CnchMergeMutateThread.h>
+#include <CloudServices/CnchPartGCThread.h>
 #include <CloudServices/CnchPartsHelper.h>
 #include <CloudServices/CnchServerResource.h>
 #include <CloudServices/CnchWorkerClient.h>
@@ -26,12 +28,14 @@
 #include <Core/Settings.h>
 #include <DaemonManager/DaemonManagerClient.h>
 #include <DataStreams/RemoteBlockInputStream.h>
+#include <DataTypes/DataTypeEnum.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <Databases/DatabaseOnDisk.h>
 #include <IO/ConnectionTimeoutsContext.h>
 #include <Interpreters/ClusterProxy/SelectStreamFactory.h>
 #include <Interpreters/ClusterProxy/executeQuery.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/IdentifierSemantic.h>
 #include <Interpreters/InterpreterSelectQuery.h>
 #include <Interpreters/SelectQueryOptions.h>
 #include <Interpreters/TranslateQualifiedNamesVisitor.h>
@@ -49,6 +53,9 @@
 #include <Storages/MergeTree/CloudMergeTreeBlockOutputStream.h>
 #include <Storages/MergeTree/CnchAttachProcessor.h>
 #include <Storages/MergeTree/PartitionPruner.h>
+#include <Storages/MergeTree/Index/MergeTreeBitmapIndex.h>
+#include <Storages/MergeTree/Index/MergeTreeSegmentBitmapIndex.h>
+#include <Storages/MutationCommands.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/StorageMaterializedView.h>
 #include <Storages/VirtualColumnUtils.h>
@@ -56,7 +63,7 @@
 #include <Transaction/getCommitted.h>
 
 #include <Catalog/DataModelPartWrapper_fwd.h>
-#include <CloudServices/commitCnchParts.h>
+#include <CloudServices/CnchDataWriter.h>
 #include <Core/NamesAndTypes.h>
 #include <Core/QueryProcessingStage.h>
 #include <Interpreters/TreeRewriter.h>
@@ -73,8 +80,10 @@
 #include <Storages/MergeTree/MergeTreePartition.h>
 #include <Storages/SelectQueryInfo.h>
 #include <Transaction/Actions/DDLAlterAction.h>
+#include <Transaction/Actions/S3DetachMetaAction.h>
 #include <brpc/controller.h>
 #include <Common/Exception.h>
+#include <Common/RowExistsColumnInfo.h>
 #include <Common/parseAddress.h>
 #include <common/logger_useful.h>
 
@@ -82,6 +91,7 @@
 namespace ProfileEvents
 {
 extern const Event CatalogTime;
+extern const Event PrunePartsTime;
 extern const Event TotalPartitions;
 extern const Event PrunedPartitions;
 extern const Event SelectedParts;
@@ -102,6 +112,8 @@ namespace ErrorCodes
     extern const int CNCH_LOCK_ACQUIRE_FAILED;
     extern const int ALTER_OF_COLUMN_IS_FORBIDDEN;
     extern const int READONLY_SETTING;
+    extern const int UNKNOWN_CNCH_SNAPSHOT;
+    extern const int INVALID_CNCH_SNAPSHOT;
 }
 
 /// Get basic select query to read from prepared pipe: remove prewhere, sampling, offset, final
@@ -151,19 +163,62 @@ StorageCnchMergeTree::StorageCnchMergeTree(
     std::unique_ptr<MergeTreeSettings> settings_)
     : MergeTreeMetaBase(
         table_id_,
-        relative_data_path_.empty() ? UUIDHelpers::UUIDToString(table_id_.uuid) : relative_data_path_,
+        relative_data_path_,
         metadata_,
         context_,
         date_column_name_,
         merging_params_,
         std::move(settings_),
+        table_id_.getNameForLogs() + " (CnchMergeTree)",
         false,
         attach_,
         [](const String &) {})
     , CnchStorageCommonHelper(table_id_, getDatabaseName(), getTableName())
 {
-    relative_auxility_storage_path = fs::path("auxility_store") / UUIDHelpers::UUIDToString(table_id_.uuid) / "";
+    String relative_table_path = getStoragePolicy(IStorage::StorageLocation::MAIN)
+                                     ->getAnyDisk()
+                                     ->getTableRelativePathOnDisk(UUIDHelpers::UUIDToString(table_id_.uuid));
+
+    if (relative_data_path_.empty() || relative_table_path.empty())
+    {
+        MergeTreeMetaBase::setRelativeDataPath(IStorage::StorageLocation::MAIN, relative_table_path);
+    }
+    relative_auxility_storage_path = fs::path("auxility_store") / relative_table_path / "";
     format_version = MERGE_TREE_CHCH_DATA_STORAGTE_VERSION;
+
+    /// check cluster by keys, for BitEngine, only when creating table first time
+    if (isBitEngineTable() && !attach_)
+        checkSchemaForBitEngineTable(context_);
+
+    const auto & all_columns = getInMemoryMetadataPtr()->getColumns();
+    MergeTreeBitmapIndex::checkValidBitmapIndexType(all_columns);
+    MergeTreeSegmentBitmapIndex::checkSegmentBitmapStorageGranularity(all_columns, getSettings());
+
+    registerBitEngineDictionaries();
+}
+
+/// NOTE: it involve a RPC. We have a CnchStorageCache to avoid invoking this RPC frequently.
+void StorageCnchMergeTree::loadMutations()
+{
+    try
+    {
+        getContext()->getCnchCatalog()->fillMutationsByStorage(getStorageID(), mutations_by_version);
+
+        auto mutations_debug_str = [&]() -> String {
+            String res;
+            for (auto const & [_, mutation] : mutations_by_version)
+            {
+                res += mutation.toString() + "\n";
+            }
+            return res;
+        };
+
+        LOG_TRACE(log, "All mutations:\n{}", mutations_debug_str());
+    }
+    catch(...)
+    {
+        LOG_WARNING(log, "Failed to fill mutations_by_version.");
+    }
 }
 
 QueryProcessingStage::Enum StorageCnchMergeTree::getQueryProcessingStage(
@@ -246,15 +301,12 @@ void StorageCnchMergeTree::read(
     LOG_TRACE(log, "Original query before rewrite: {}", queryToString(query_info.query));
     auto modified_query_ast = rewriteSelectQuery(query_info.query, getDatabaseName(), prepare_result.local_table_name);
 
+    LOG_TRACE(log, "After query rewrite: {}", queryToString(modified_query_ast));
+
     const Scalars & scalars = local_context->hasQueryContext() ? local_context->getQueryContext()->getScalars() : Scalars{};
 
     ClusterProxy::SelectStreamFactory select_stream_factory = ClusterProxy::SelectStreamFactory(
-        header,
-        processed_stage,
-        StorageID::createEmpty(), /// Don't check whether table exists in cnch-worker
-        scalars,
-        false,
-        local_context->getExternalTables());
+        header, processed_stage, StorageID{"system", "one"}, scalars, false, local_context->getExternalTables());
 
     ClusterProxy::executeQuery(query_plan, select_stream_factory, log, modified_query_ast, local_context, worker_group);
 
@@ -274,23 +326,37 @@ PrepareContextResult StorageCnchMergeTree::prepareReadContext(
     auto worker_group = local_context->getCurrentWorkerGroup();
     healthCheckForWorkerGroup(local_context, worker_group);
 
-    auto parts = selectPartsToRead(column_names, local_context, query_info);
+    UInt64 snapshot_ts = 0;
+    if (String snapshot_name = local_context->getSettingsRef().use_snapshot.value; !snapshot_name.empty())
+    {
+        DatabasePtr database = DatabaseCatalog::instance().getDatabase(getDatabaseName(), local_context);
+        if (!database->supportSnapshot())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Cannot query using snapshot {} because database of {} doesn't support snapshot",
+                snapshot_name, getStorageID().getFullTableName());
+
+        auto snapshot = database->tryGetSnapshot(snapshot_name);
+        if (!snapshot)
+            throw Exception(ErrorCodes::UNKNOWN_CNCH_SNAPSHOT,
+                "Snapshot {} doesn't exists in db {}", snapshot_name, getDatabaseName());
+        if (snapshot->has_table_uuid() && RPCHelpers::createUUID(snapshot->table_uuid()) != getStorageUUID())
+            throw Exception(ErrorCodes::INVALID_CNCH_SNAPSHOT, "Snapshot {} doesn't bind to {}", snapshot_name, getStorageID().getNameForLogs());
+        snapshot_ts = snapshot->commit_time();
+    }
+
+    auto parts = selectPartsToRead(column_names, local_context, query_info, snapshot_ts);
     LOG_INFO(log, "Number of parts to read: {}", parts.size());
 
     if (metadata_snapshot->hasUniqueKey() && !parts.empty())
     {
-        // Previous, we need to sort parts since the partial part and base part are not guarantee to be together,
-        // the getDeleteBitmapMetaForParts function needs to handle the partial->base chain.
-        // Now, we can remove sort logic since we don't expand the partial->base part chain after chain construction,
-        // only partial part is useful in getDeleteBitmapMetaForParts for unique table.
-        getDeleteBitmapMetaForParts(parts, local_context, local_context->getCurrentTransactionID());
+        getDeleteBitmapMetaForServerParts(parts, local_context, snapshot_ts);
     }
 
     String local_table_name = getCloudTableName(local_context);
     auto bucket_numbers = getRequiredBucketNumbers(query_info, local_context);
     collectResource(local_context, parts, local_table_name, bucket_numbers);
 
-    return {std::move(local_table_name), std::move(parts)};
+    return {std::move(local_table_name), std::move(parts), {}, {}};
 }
 
 Strings StorageCnchMergeTree::selectPartitionsByPredicate(
@@ -299,7 +365,7 @@ Strings StorageCnchMergeTree::selectPartitionsByPredicate(
     const Names & column_names_to_return,
     ContextPtr local_context) const
 {
-    /// Coarse grained partition prunner: filter out the partition which will definately not sastify the query predicate. The benefit
+    /// Coarse grained partition pruner: filter out the partition which will definately not sastify the query predicate. The benefit
     /// is 2-folded: (1) we can prune data parts and (2) we can reduce numbers of calls to catalog to get parts 's metadata.
     /// Note that this step still leaves false-positive parts. For example, the partition key is `toMonth(date)` and the query
     /// condition is `date > '2022-02-22' and date < '2022-03-22'` then this step won't eliminate any partition.
@@ -311,7 +377,7 @@ Strings StorageCnchMergeTree::selectPartitionsByPredicate(
 
     /// (1) Prune partition by partition level TTL
     TTLTableDescription table_ttl = getInMemoryMetadata().getTableTTLs();
-    if (table_ttl.definition_ast)
+    if (getInMemoryMetadata().hasPartitionLevelTTL() && table_ttl.definition_ast && local_context->getCurrentTransaction())
     {
         TxnTimestamp start_ts = local_context->getCurrentTransactionID();
         time_t query_time = start_ts.toSecond();
@@ -358,7 +424,7 @@ Strings StorageCnchMergeTree::selectPartitionsByPredicate(
             return !res;
         });
         if (partition_list.size() < prev_sz)
-            LOG_DEBUG(log, "Query predicates on physical columns droped {} partitions", prev_sz - partition_list.size());
+            LOG_DEBUG(log, "Query predicates on physical columns dropped {} partitions", prev_sz - partition_list.size());
 
         /// (3) Prune partitions if there's `_partition_id` or `_partition_value` in query predicate
         bool has_partition_column = std::any_of(column_names_to_return.begin(), column_names_to_return.end(), [](const auto & name) {
@@ -399,6 +465,123 @@ Strings StorageCnchMergeTree::selectPartitionsByPredicate(
     return res_partitions;
 }
 
+Strings StorageCnchMergeTree::getPartitionsByPredicate(const ASTPtr & predicate, ContextPtr local_context)
+{
+    auto partition_list = local_context->getCnchCatalog()->getPartitionList(shared_from_this(), local_context.get());
+    if (partition_list.empty())
+    {
+        LOG_TRACE(log, "Return 0 partitions by predicate");
+        return {};
+    }
+
+    auto where_expr = predicate->clone();
+    ASTPtr actual_where_expr;
+    const auto & partition_key_sample = MergeTreePartition::adjustPartitionKey(getInMemoryMetadataPtr(), local_context).sample_block;
+
+    /// Extract the partition-related expressions before executing.
+    MutableColumns columns_for_filter = partition_key_sample.cloneEmptyColumns();
+    const auto & one_partition_key = partition_list[0]->value;
+    for (size_t i = 0; i < one_partition_key.size(); ++i)
+        columns_for_filter[i]->insert(one_partition_key[i]);
+
+    auto filter_block = partition_key_sample.cloneWithColumns(std::move(columns_for_filter));
+    auto unmodified = VirtualColumnUtils::prepareFilterBlockByPredicates({where_expr}, local_context, filter_block, actual_where_expr);
+
+    /// If we can't extract related expressions, it means all partitions should be processed.
+    if (unmodified || !actual_where_expr)
+    {
+        LOG_TRACE(log, "Return all partitions by predicate");
+        Names all_partition_ids;
+        for (const auto & partition : partition_list)
+            all_partition_ids.emplace_back(partition->getID(partition_key_sample));
+        return all_partition_ids;
+    }
+
+    auto syntax_result = TreeRewriter(local_context).analyze(actual_where_expr, partition_key_sample.getNamesAndTypesList());
+    auto actions = ExpressionAnalyzer(actual_where_expr, syntax_result, local_context).getActions(true);
+
+    MutableColumns partition_columns = partition_key_sample.cloneEmptyColumns();
+    for (const auto & partition : partition_list)
+    {
+        const auto & partition_key = partition->value;
+
+        if (partition_key.size() != partition_key_sample.columns())
+            throw Exception(
+                fmt::format("Partition size({}) is different with partition key(size = {})", toString(partition_key.size()), toString(partition_key_sample.columns())),
+                ErrorCodes::ILLEGAL_COLUMN);
+
+        for (size_t i = 0; i < partition_key.size(); ++i)
+        {
+            partition_columns[i]->insert(partition_key[i]);
+        }
+    }
+
+    auto block = partition_key_sample.cloneWithColumns(std::move(partition_columns));
+    actions->execute(block);
+
+    /// Check the result
+    if (1 != block.columns())
+        throw Exception("Wrong column number of WHERE clause's calculation result", ErrorCodes::LOGICAL_ERROR);
+
+    if (block.getNamesAndTypesList().front().type->getName() != "UInt8")
+        throw Exception("Wrong column type of WHERE clause's calculation result", ErrorCodes::LOGICAL_ERROR);
+
+    Names filtered_partition_ids;
+    const auto & res_column = block.getColumnsWithTypeAndName().front().column;
+    for (size_t i = 0; i < partition_list.size(); ++i)
+    {
+        if (res_column->getBool(i))
+            filtered_partition_ids.emplace_back(partition_list[i]->getID(partition_key_sample));
+    }
+
+    LOG_TRACE(log, fmt::format("Return partitions by predicate:{}", fmt::join(filtered_partition_ids, ",")));
+    return filtered_partition_ids;
+}
+
+ServerDataPartsVector StorageCnchMergeTree::getServerPartsByPredicate(
+    const ASTPtr & predicate_, const std::function<ServerDataPartsVector()> & get_parts, ContextPtr local_context)
+{
+    const auto partition_key = MergeTreePartition::adjustPartitionKey(getInMemoryMetadataPtr(), local_context);
+    const auto & partition_key_sample = partition_key.sample_block;
+
+    /// Execute expr on block
+    auto predicate = predicate_->clone();
+    auto syntax_result = TreeRewriter(local_context).analyze(predicate, partition_key_sample.getNamesAndTypesList());
+    ExpressionActionsPtr actions = ExpressionAnalyzer{predicate, syntax_result, local_context}.getActions(true);
+
+    auto parts = get_parts();
+    MutableColumns name_columns = partition_key_sample.cloneEmptyColumns();
+    for (const auto & part : parts)
+    {
+        const auto & current_partition_key = part->partition().value;
+        for (size_t c = 0; c < current_partition_key.size(); ++c)
+        {
+            name_columns[c]->insert(current_partition_key[c]);
+        }
+    }
+
+    auto block = partition_key_sample.cloneWithColumns(std::move(name_columns));
+    actions->execute(block);
+
+    /// Check the result
+    if (1 != block.columns())
+        throw Exception("Wrong column number of WHERE clause's calculation result", ErrorCodes::LOGICAL_ERROR);
+
+    if (block.getNamesAndTypesList().front().type->getName() != "UInt8")
+        throw Exception("Wrong column type of WHERE clause's calculation result", ErrorCodes::LOGICAL_ERROR);
+
+    /// Got the candidate parts
+    ServerDataPartsVector candidate_parts;
+    const auto & res_column = block.getColumnsWithTypeAndName().front().column;
+    for (size_t i = 0; i < parts.size(); ++i)
+    {
+        if (res_column->getBool(i))
+            candidate_parts.emplace_back(parts[i]);
+    }
+    return candidate_parts;
+}
+
+
 static Block getBlockWithPartColumn(ServerDataPartsVector & parts)
 {
     auto column = ColumnString::create();
@@ -412,39 +595,33 @@ static Block getBlockWithPartColumn(ServerDataPartsVector & parts)
 time_t StorageCnchMergeTree::getTTLForPartition(const MergeTreePartition & partition) const
 {
     auto metadata_snapshot = getInMemoryMetadataPtr();
-    TTLTableDescription table_ttl = metadata_snapshot->getTableTTLs();
-    if (!table_ttl.definition_ast)
+    if (!metadata_snapshot->hasRowsTTL())
         return 0;
+
+    /// make a copy of rows_ttl, we may rewrite it later.
+    auto rows_ttl = metadata_snapshot->table_ttl.rows_ttl;
 
     /// Construct a block consists of partition keys then compute ttl values according to this block
     const auto & partition_key_sample = metadata_snapshot->getPartitionKey().sample_block;
     MutableColumns columns = partition_key_sample.cloneEmptyColumns();
-    const auto & partition_key = partition.value;
     /// This can happen when ALTER query is implemented improperly; finish ALTER query should bypass this check.
-    if (columns.size() != partition_key.size())
+    if (columns.size() != partition.value.size())
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
             "Partition key columns definition missmatch between inmemory and metastore, this is a bug, expect block ({}), got values "
             "({})\n",
             partition_key_sample.dumpNames(),
-            fmt::join(partition_key, ", "));
-    for (size_t i = 0; i < partition_key.size(); ++i)
-        columns[i]->insert(partition_key[i]);
+            fmt::join(partition.value, ", "));
+    for (size_t i = 0; i < partition.value.size(); ++i)
+        columns[i]->insert(partition.value[i]);
 
-    auto names_and_types_list = partition_key_sample.getNamesAndTypesList();
-    Block block;
-    auto nt_iter = names_and_types_list.begin();
-    auto column_iter = columns.begin();
-    while (nt_iter != names_and_types_list.end() && column_iter != columns.end())
-    {
-        block.insert({std::move(*column_iter), nt_iter->type, nt_iter->name});
-        nt_iter++;
-        column_iter++;
-    }
+    auto block = partition_key_sample.cloneWithColumns(std::move(columns));
 
-    table_ttl.rows_ttl.expression->execute(block);
+    TTLDescription::tryRewriteTTLWithPartitionKey(
+        rows_ttl, metadata_snapshot->columns, metadata_snapshot->partition_key, metadata_snapshot->primary_key, getContext());
+    rows_ttl.expression->execute(block);
 
-    const auto & current = block.getByName(table_ttl.rows_ttl.result_column);
+    const auto & current = block.getByName(rows_ttl.result_column);
 
     const IColumn * column = current.column.get();
 
@@ -576,10 +753,8 @@ static void touchActiveTimestampForInsertSelectQuery(const ASTInsertQuery & inse
 
     ASTs related_tables;
     bool has_table_func = false;
-    if (auto * select_query = insert_query.select->as<ASTSelectQuery>())
-        select_query->collectAllTables(related_tables, has_table_func);
-    else if (auto * select_with_union = insert_query.select->as<ASTSelectWithUnionQuery>())
-        select_with_union->collectAllTables(related_tables, has_table_func);
+    if (const auto * select = insert_query.select.get())
+        ASTSelectQuery::collectAllTables(select, related_tables, has_table_func);
 
     for (auto & db_and_table_ast : related_tables)
     {
@@ -592,6 +767,11 @@ static void touchActiveTimestampForInsertSelectQuery(const ASTInsertQuery & inse
     }
 }
 
+static String extractTableSuffix(const String & gen_table_name)
+{
+    return gen_table_name.substr(gen_table_name.find_last_of('_') + 1);
+}
+
 static String replaceMaterializedViewQuery(StorageMaterializedView * mv, const String & table_suffix)
 {
     auto query = mv->getCreateTableSql();
@@ -599,8 +779,18 @@ static String replaceMaterializedViewQuery(StorageMaterializedView * mv, const S
     ParserCreateQuery parser;
     ASTPtr ast = parseQuery(parser, query.data(), query.data() + query.size(), "", 0, DBMS_DEFAULT_MAX_PARSER_DEPTH);
 
+
     auto & create_query = ast->as<ASTCreateQuery &>();
+    create_query.to_inner_uuid = UUIDHelpers::Nil;
     create_query.table += "_" + table_suffix;
+    /// If creating MV is `CREATE MATERIALIZED VIEW AS SELECT ... ENGINE = CnchMergeTree()...`
+    /// Then we change the query to CREATE MATERIALIZED VIEW TO `mv_db.`.inner.mv_name`` AS SELECT ...
+    if (create_query.to_table_id.empty())
+    {
+        create_query.to_table_id.table_name = generateInnerTableName(mv->getStorageID());
+        create_query.to_table_id.database_name = mv->getDatabaseName();
+        create_query.storage = nullptr;
+    }
     create_query.to_table_id.table_name += "_" + table_suffix;
 
     auto & inner_query = create_query.select->list_of_selects->children.at(0);
@@ -612,13 +802,7 @@ static String replaceMaterializedViewQuery(StorageMaterializedView * mv, const S
         mv->getInMemoryMetadataPtr()->select.select_table_id.database_name,
         mv->getInMemoryMetadataPtr()->select.select_table_id.table_name + "_" + table_suffix);
 
-    /// Remark: this `getObjectDefinitionFromCreateQuery` may cause issue, refer to `getTableDefinitionFromCreateQuery` in cnch-dev branch if issue happens
-    return getObjectDefinitionFromCreateQuery(ast, false);
-}
-
-String StorageCnchMergeTree::extractTableSuffix(const String & gen_table_name)
-{
-    return gen_table_name.substr(gen_table_name.find_last_of('_') + 1);
+    return getTableDefinitionFromCreateQuery(ast, false);
 }
 
 Names StorageCnchMergeTree::genViewDependencyCreateQueries(
@@ -684,51 +868,35 @@ Names StorageCnchMergeTree::genViewDependencyCreateQueries(
     return create_view_sqls;
 }
 
-BlockOutputStreamPtr
-StorageCnchMergeTree::write(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, ContextPtr local_context)
+std::pair<String, const Cluster::ShardInfo *> StorageCnchMergeTree::prepareLocalTableForWrite(
+    ASTInsertQuery * insert_query, ContextPtr local_context, bool enable_staging_area, bool send_query_in_normal_mode)
 {
-    bool enable_staging_area = metadata_snapshot->hasUniqueKey() && bool(local_context->getSettingsRef().enable_staging_area_for_write);
-    if (enable_staging_area)
-        LOG_DEBUG(log, "enable staging area for write");
+    auto generated_tb_name = getCloudTableName(local_context);
+    auto local_table_name = generated_tb_name + "_write";
+    if (insert_query)
+        insert_query->table_id.table_name = local_table_name;
 
-    auto modified_query_ast = query->clone();
-    auto & insert_query = modified_query_ast->as<ASTInsertQuery &>();
+    auto create_local_tb_query = getCreateQueryForCloudTable(getCreateTableSql(), local_table_name, local_context, enable_staging_area);
 
-    if (insert_query.table_id.database_name.empty())
-        insert_query.table_id.database_name = local_context->getCurrentDatabase();
+    WorkerGroupHandle worker_group = local_context->getCurrentWorkerGroup();
 
-    if (insert_query.select)
-        touchActiveTimestampForInsertSelectQuery(insert_query, local_context);
+    /// TODO: currently use only one write worker to do insert, use multiple write workers when distributed write is support
+    const Settings & settings = local_context->getSettingsRef();
+    int max_retry = 2, retry = 0;
+    auto num_of_workers = worker_group->getShardsInfo().size();
+    if (!num_of_workers)
+        throw Exception("No heathy worker available", ErrorCodes::VIRTUAL_WAREHOUSE_NOT_FOUND);
 
-    if (insert_query.select || insert_query.in_file)
+    std::vector<CnchWorkerClientPtr> worker_clients_for_send;
+    std::size_t index = std::hash<String>{}(local_context->getCurrentQueryId() + std::to_string(retry)) % num_of_workers;
+    const auto * write_shard_ptr = &(worker_group->getShardsInfo().at(index));
+
+    if (!send_query_in_normal_mode)
     {
-        if (insert_query.select && local_context->getSettingsRef().restore_table_expression_in_distributed)
-        {
-            RestoreTableExpressionsVisitor::Data data;
-            data.database = local_context->getCurrentDatabase();
-            RestoreTableExpressionsVisitor(data).visit(insert_query.select);
-        }
-
-        auto generated_tb_name = getCloudTableName(local_context);
-        auto local_table_name = generated_tb_name + "_write";
-        insert_query.table_id.table_name = local_table_name;
-
-        auto create_local_tb_query = getCreateQueryForCloudTable(getCreateTableSql(), local_table_name, local_context, enable_staging_area);
-
-        String query_statement = queryToString(insert_query);
-
-        WorkerGroupHandle worker_group = local_context->getCurrentWorkerGroup();
-
-        /// TODO: currently use only one write worker to do insert, use multiple write workers when distributed write is support
-        const Settings & settings = local_context->getSettingsRef();
-        int max_retry = 2, retry = 0;
-        auto num_of_workers = worker_group->getShardsInfo().size();
-        if (!num_of_workers)
-            throw Exception("No heathy worker available", ErrorCodes::VIRTUAL_WAREHOUSE_NOT_FOUND);
-
-        std::size_t index = std::hash<String>{}(local_context->getCurrentQueryId() + std::to_string(retry)) % num_of_workers;
-        const auto * write_shard_ptr = &(worker_group->getShardsInfo().at(index));
-
+        worker_clients_for_send = worker_group->getWorkerClients();
+    }
+    else
+    {
         // TODO: healthy check by rpc
         if (settings.query_worker_fault_tolerance)
         {
@@ -738,7 +906,6 @@ StorageCnchMergeTree::write(const ASTPtr & query, const StorageMetadataPtr & met
             while (true)
             {
                 LOG_TRACE(log, "Health check for worker: {}", write_shard_ptr->worker_id);
-
                 try
                 {
                     // The checking task checks whether the current connection is connected or can connect.
@@ -761,8 +928,17 @@ StorageCnchMergeTree::write(const ASTPtr & query, const StorageMetadataPtr & met
             }
         }
 
-        LOG_DEBUG(log, "Will send create query: {} to target worker: {}", create_local_tb_query, write_shard_ptr->worker_id);
         auto worker_client = worker_group->getWorkerClients().at(index);
+        worker_clients_for_send.emplace_back(worker_client);
+    }
+
+    for (auto & worker_client : worker_clients_for_send)
+    {
+        LOG_DEBUG(
+            log,
+            "Will send create query: {} to target worker: {}",
+            create_local_tb_query,
+            worker_client->getHostWithPorts().toDebugString());
 
         worker_client->sendCreateQueries(local_context, {create_local_tb_query});
 
@@ -773,7 +949,10 @@ StorageCnchMergeTree::write(const ASTPtr & query, const StorageMetadataPtr & met
             LOG_DEBUG(log, "Will send create query {}", dependency_create_query);
         }
         worker_client->sendCreateQueries(local_context, dependency_create_queries);
+    }
 
+    if (send_query_in_normal_mode)
+    {
         /// Ensure worker session local_context resource could be released
         if (auto session_resource = local_context->tryGetCnchServerResource())
         {
@@ -781,16 +960,65 @@ StorageCnchMergeTree::write(const ASTPtr & query, const StorageMetadataPtr & met
             session_resource->setWorkerGroup(std::make_shared<WorkerGroupHandleImpl>(*worker_group, index_values));
         }
 
-        LOG_DEBUG(log, "Prepare execute insert query: {}", query_statement);
-        /// TODO: send insert query by rpc.
-        sendQueryPerShard(local_context, query_statement, *write_shard_ptr, true);
+        if (insert_query)
+        {
+            String query_statement = queryToString(*insert_query);
 
-        return nullptr;
+            LOG_DEBUG(log, "Prepare execute insert query: {}", query_statement);
+            /// TODO: send insert query by rpc.
+            sendQueryPerShard(local_context, query_statement, *write_shard_ptr, true);
+        }
     }
-    else
+
+    return std::make_pair(local_table_name, write_shard_ptr);
+}
+
+BlockOutputStreamPtr
+StorageCnchMergeTree::write(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, ContextPtr local_context)
+{
+    bool enable_staging_area = metadata_snapshot->hasUniqueKey() && bool(local_context->getSettingsRef().enable_staging_area_for_write);
+    if (enable_staging_area)
+        LOG_DEBUG(log, "enable staging area for write");
+
+    auto modified_query_ast = query->clone();
+    auto & insert_query = modified_query_ast->as<ASTInsertQuery &>();
+
+    if (insert_query.table_id.database_name.empty())
+        insert_query.table_id.database_name = local_context->getCurrentDatabase();
+
+    return std::make_shared<CloudMergeTreeBlockOutputStream>(*this, metadata_snapshot, local_context, enable_staging_area);
+}
+
+/// for insert select and insert infile
+BlockInputStreamPtr
+StorageCnchMergeTree::writeInWorker(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, ContextPtr local_context)
+{
+    bool enable_staging_area = metadata_snapshot->hasUniqueKey() && bool(local_context->getSettingsRef().enable_staging_area_for_write);
+    if (enable_staging_area)
+        LOG_DEBUG(log, "enable staging area for write");
+
+    auto modified_query_ast = query->clone();
+    auto & insert_query = modified_query_ast->as<ASTInsertQuery &>();
+
+    if (insert_query.table_id.database_name.empty())
+        insert_query.table_id.database_name = local_context->getCurrentDatabase();
+
+    if (insert_query.select)
+        touchActiveTimestampForInsertSelectQuery(insert_query, local_context);
+
+    if (insert_query.select && local_context->getSettingsRef().restore_table_expression_in_distributed)
     {
-        return std::make_shared<CloudMergeTreeBlockOutputStream>(*this, metadata_snapshot, local_context, enable_staging_area);
+        RestoreTableExpressionsVisitor::Data data;
+        data.database = local_context->getCurrentDatabase();
+        RestoreTableExpressionsVisitor(data).visit(insert_query.select);
     }
+
+    std::pair<String, const Cluster::ShardInfo *> write_shard_info
+        = prepareLocalTableForWrite(&insert_query, local_context, enable_staging_area, true);
+    String query_statement = queryToString(insert_query);
+
+    LOG_DEBUG(log, "Prepare execute insert query: {}", query_statement);
+    return sendQueryPerShard(local_context, query_statement, *write_shard_info.second, true);
 }
 
 HostWithPortsVec StorageCnchMergeTree::getWriteWorkers(const ASTPtr & /**/, ContextPtr local_context)
@@ -805,7 +1033,7 @@ HostWithPortsVec StorageCnchMergeTree::getWriteWorkers(const ASTPtr & /**/, Cont
     // No fixed workers for insertion, pick one randomly from worker pool
     auto vw_handle = local_context->getVirtualWarehousePool().get(vw_name);
     HostWithPortsVec res;
-    for (const auto & [_, wg] : vw_handle->getAll())
+    for (const auto & [_, wg] : vw_handle->getAll(VirtualWarehouseHandleImpl::TryUpdate))
     {
         auto wg_hosts = wg->getHostWithPortsVec();
         res.insert(res.end(), wg_hosts.begin(), wg_hosts.end());
@@ -818,7 +1046,7 @@ bool StorageCnchMergeTree::optimize(
 {
     auto & optimize_query = query->as<ASTOptimizeQuery &>();
     auto enable_try = optimize_query.enable_try;
-    if (optimize_query.final)
+    if (optimize_query.final && query_context->getSettingsRef().disable_optimize_final)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "FINAL is disabled because it is dangerous");
 
     auto bg_thread = query_context->tryGetCnchBGThread(CnchBGThreadType::MergeMutate, getStorageID());
@@ -852,6 +1080,14 @@ bool StorageCnchMergeTree::optimize(
 
     if (query_context->getSettingsRef().mutations_sync != 0)
         merge_mutate_thread->waitTasksFinish(task_ids, timeout_ms);
+
+    auto bg_gc_thread = query_context->tryGetCnchBGThread(CnchBGThreadType::PartGC, getStorageID());
+    if (bg_gc_thread)
+    {
+        auto * gc_thread = dynamic_cast<CnchPartGCThread *>(bg_gc_thread.get());
+        for (const auto & partition_id : partition_ids)
+            gc_thread->addCandidatePartition(partition_id);
+    }
 
     return true;
 }
@@ -888,7 +1124,7 @@ CheckResults StorageCnchMergeTree::checkDataCommon(const ASTPtr & query, Context
     ThreadPool pool(std::min(16UL, cnch_parts.size()));
     for (size_t i = 0; i < cnch_parts.size(); ++i)
     {
-        pool.scheduleOrThrow([i, &cnch_parts, &results] {
+        pool.scheduleOrThrowOnError([i, &cnch_parts, &results] {
             String message;
             bool is_passed = false;
             try
@@ -902,7 +1138,12 @@ CheckResults StorageCnchMergeTree::checkDataCommon(const ASTPtr & query, Context
                 is_passed = false;
                 message = e.message();
             }
-            results[i].fs_path = cnch_parts[i]->getFullPath();
+            catch (const Poco::Exception & e)
+            {
+                is_passed = false;
+                message = e.message();
+            }
+            results[i].fs_path = cnch_parts[i]->name;
             results[i].success = is_passed;
             results[i].failure_message = std::move(message);
         });
@@ -918,6 +1159,30 @@ CheckResults StorageCnchMergeTree::checkData(const ASTPtr & query, ContextPtr lo
     return checkDataCommon(query, local_context, parts);
 }
 
+CheckResults StorageCnchMergeTree::autoRemoveData(const ASTPtr & query, ContextPtr local_context)
+{
+    ServerDataPartsVector error_server_parts;
+    CheckResults check_results =  checkDataCommon(query, local_context, error_server_parts);
+
+    MergeTreeDataPartsCNCHVector error_parts;
+    CheckResults error_results;
+    for (size_t i=0; i<check_results.size(); i++)
+    {
+        if (check_results[i].success)
+            continue;
+        error_parts.push_back(error_server_parts[i]->toCNCHDataPart(*this));
+        error_results.push_back(check_results[i]);
+    }
+
+    if (error_parts.size())
+    {
+        if (auto catalog = local_context->getCnchCatalog())
+            catalog->clearDataPartsMeta(shared_from_this(), error_parts);
+    }
+
+    return error_results;
+}
+
 ServerDataPartsVector StorageCnchMergeTree::getAllParts(ContextPtr local_context) const
 {
     // TEST_START(testlog);
@@ -931,7 +1196,7 @@ ServerDataPartsVector StorageCnchMergeTree::getAllParts(ContextPtr local_context
             LOG_DEBUG(log, "Current transaction is secondary transaction, result may include uncommited data");
             all_parts = local_context->getCnchCatalog()->getAllServerDataParts(shared_from_this(), {0}, local_context.get());
             /// Fillter by commited parts and parts written by same explicit transaction
-            filterPartsInExplicitTransaction(all_parts, local_context);
+            all_parts = filterPartsInExplicitTransaction(all_parts, local_context);
         }
         else
         {
@@ -946,40 +1211,53 @@ ServerDataPartsVector StorageCnchMergeTree::getAllParts(ContextPtr local_context
 }
 
 ServerDataPartsVector StorageCnchMergeTree::getAllPartsInPartitions(
-    const Names & column_names_to_return, ContextPtr local_context, const SelectQueryInfo & query_info) const
+    const Names & column_names_to_return, ContextPtr local_context, const SelectQueryInfo & query_info, UInt64 snapshot_ts) const
 {
     ServerDataPartsVector all_parts;
 
-    // TEST_START(testlog);
-
-    if (local_context->getCnchCatalog())
+    if (auto catalog = local_context->getCnchCatalog())
     {
         TransactionCnchPtr cur_txn = local_context->getCurrentTransaction();
+        if (!cur_txn)
+            throw Exception("current txn is not set.", ErrorCodes::LOGICAL_ERROR);
+
         Stopwatch watch;
-        auto partition_list = local_context->getCnchCatalog()->getPartitionList(shared_from_this(), local_context.get());
-        // TEST_LOG(testlog, "get partition list.");
-        Strings pruned_partitions = selectPartitionsByPredicate(query_info, partition_list, column_names_to_return, local_context);
-        // TEST_LOG(testlog, "select partitions by predicate.");
+
+        /// ignoring snapshot because partition infos are not cleaned right now
+        auto pruned_res = getPrunedPartitions(query_info, column_names_to_return, local_context);
+        Strings & pruned_partitions = pruned_res.partitions;
+        UInt64 total_partition_number = pruned_res.total_partition_number;
+
         if (cur_txn->isSecondary())
         {
+            /// TODO: snapshot read in interactive txn?
             /// Get all parts in the partition list
             LOG_DEBUG(log, "Current transaction is secondary transaction, result may include uncommited data");
-            all_parts = local_context->getCnchCatalog()->getServerDataPartsInPartitions(
+            all_parts = catalog->getServerDataPartsInPartitions(
                 shared_from_this(), pruned_partitions, {0}, local_context.get());
             /// Fillter by commited parts and parts written by same explicit transaction
-            filterPartsInExplicitTransaction(all_parts, local_context);
+            all_parts = filterPartsInExplicitTransaction(all_parts, local_context);
         }
         else
         {
-            all_parts = local_context->getCnchCatalog()->getServerDataPartsInPartitions(
-                shared_from_this(), pruned_partitions, local_context->getCurrentTransactionID(), local_context.get());
+            all_parts = catalog->getServerDataPartsInPartitions(
+                shared_from_this(), pruned_partitions,
+                snapshot_ts ? TxnTimestamp(snapshot_ts) : local_context->getCurrentTransactionID(),
+                local_context.get());
+            if (snapshot_ts)
+            {
+                auto trashed_parts = catalog->getTrashedPartsInPartitions(shared_from_this(), pruned_partitions, snapshot_ts);
+                std::move(trashed_parts.begin(), trashed_parts.end(), std::back_inserter(all_parts));
+            }
         }
         // TEST_LOG(testlog, "get dataparts in partitions.");
         LOG_DEBUG(log, "Total number of parts get from bytekv: {}", all_parts.size());
-        all_parts = CnchPartsHelper::calcVisibleParts(all_parts, false, CnchPartsHelper::getLoggingOption(*local_context));
+        auto catalog_time_ms = watch.elapsedMilliseconds();
+        all_parts = CnchPartsHelper::calcVisibleParts(all_parts, false, CnchPartsHelper::getLoggingOption(*local_context), true);
 
-        ProfileEvents::increment(ProfileEvents::CatalogTime, watch.elapsedMilliseconds());
-        ProfileEvents::increment(ProfileEvents::TotalPartitions, partition_list.size());
+        ProfileEvents::increment(ProfileEvents::CatalogTime, catalog_time_ms);
+        ProfileEvents::increment(ProfileEvents::PrunePartsTime, watch.elapsedMilliseconds() - catalog_time_ms);
+        ProfileEvents::increment(ProfileEvents::TotalPartitions, total_partition_number);
         ProfileEvents::increment(ProfileEvents::PrunedPartitions, pruned_partitions.size());
         ProfileEvents::increment(ProfileEvents::SelectedParts, all_parts.size());
     }
@@ -991,14 +1269,14 @@ ServerDataPartsVector StorageCnchMergeTree::getAllPartsInPartitions(
 
 
 ServerDataPartsVector StorageCnchMergeTree::selectPartsToRead(
-    const Names & column_names_to_return, ContextPtr local_context, const SelectQueryInfo & query_info) const
+    const Names & column_names_to_return, ContextPtr local_context, const SelectQueryInfo & query_info, UInt64 snapshot_ts) const
 {
-    auto parts = getAllPartsInPartitions(column_names_to_return, local_context, query_info);
+    auto parts = getAllPartsInPartitions(column_names_to_return, local_context, query_info, snapshot_ts);
     filterPartsByPartition(parts, local_context, query_info, column_names_to_return);
     return parts;
 }
 
-MergeTreeDataPartsCNCHVector StorageCnchMergeTree::getUniqueTableMeta(TxnTimestamp ts, const Strings & input_partitions)
+MergeTreeDataPartsCNCHVector StorageCnchMergeTree::getUniqueTableMeta(TxnTimestamp ts, const Strings & input_partitions, bool force_bitmap)
 {
     auto catalog = getContext()->getCnchCatalog();
     auto storage = shared_from_this();
@@ -1017,7 +1295,7 @@ MergeTreeDataPartsCNCHVector StorageCnchMergeTree::getUniqueTableMeta(TxnTimesta
     for (auto & part : parts)
         res.emplace_back(dynamic_pointer_cast<const MergeTreeDataPartCNCH>(part->getBasePart()->toCNCHDataPart(*this)));
 
-    getDeleteBitmapMetaForParts(res, getContext(), ts);
+    getDeleteBitmapMetaForCnchParts(res, getContext(), ts, force_bitmap);
     return res;
 }
 
@@ -1034,7 +1312,16 @@ StorageCnchMergeTree::getStagedParts(const TxnTimestamp & ts, const NameSet * pa
 }
 
 void StorageCnchMergeTree::getDeleteBitmapMetaForParts(
-    const MergeTreeDataPartsCNCHVector & parts, ContextPtr local_context, TxnTimestamp start_time)
+    IMergeTreeDataPartsVector & parts, ContextPtr local_context, TxnTimestamp start_time, bool force_found)
+{
+    MergeTreeDataPartsCNCHVector cnch_parts;
+    cnch_parts.reserve(parts.size());
+    for (auto & part : parts)
+        cnch_parts.emplace_back(dynamic_pointer_cast<const MergeTreeDataPartCNCH>(part));
+    getDeleteBitmapMetaForCnchParts(cnch_parts, local_context, start_time, force_found);
+}
+
+void StorageCnchMergeTree::getDeleteBitmapMetaForCnchParts(const MergeTreeDataPartsCNCHVector & parts, ContextPtr local_context, TxnTimestamp start_time, bool force_found)
 {
     auto catalog = local_context->getCnchCatalog();
     if (!catalog)
@@ -1062,20 +1349,37 @@ void StorageCnchMergeTree::getDeleteBitmapMetaForParts(
     DeleteBitmapMetaPtrVector bitmaps;
     CnchPartsHelper::calcVisibleDeleteBitmaps(all_bitmaps, bitmaps);
 
-    /// Both the parts and bitmaps are sorted in (partitioin_id, min_block, max_block, commit_time) order
+    /// Both the parts and bitmaps are sorted in (partition_id, min_block, max_block, commit_time) order
     auto bitmap_it = bitmaps.begin();
     for (auto & part : parts)
     {
-        /// search for the first bitmap
-        while (bitmap_it != bitmaps.end() && !(*bitmap_it)->sameBlock(part->info))
+        if (force_found)
+        {
+            /// search for the first bitmap
+            while (bitmap_it != bitmaps.end() && !(*bitmap_it)->sameBlock(part->info))
+                bitmap_it++;
+
+            if (bitmap_it == bitmaps.end())
+                throw Exception("Delete bitmap metadata of " + part->name + " is not found", ErrorCodes::LOGICAL_ERROR);
+
+            /// add all visible bitmaps (from new to old) part
+            part->setDeleteBitmapMeta(*bitmap_it);
             bitmap_it++;
-
-        if (bitmap_it == bitmaps.end())
-            throw Exception("Delete bitmap metadata of " + part->name + " is not found", ErrorCodes::LOGICAL_ERROR);
-
-        /// add all visible bitmaps (from new to old) part
-        part->setDeleteBitmapMeta(*bitmap_it);
-        bitmap_it++;
+        }
+        else
+        {
+            while (bitmap_it != bitmaps.end() && (*(*bitmap_it)) <= part->info)
+            {
+                if (!(*bitmap_it)->sameBlock(part->info))
+                    bitmap_it++;
+                else
+                {
+                    /// add all visible bitmaps (from new to old) part
+                    part->setDeleteBitmapMeta(*bitmap_it, /*force_set*/ false);
+                    bitmap_it++;
+                }
+            }
+        }
     }
 }
 
@@ -1126,38 +1430,52 @@ void StorageCnchMergeTree::getDeleteBitmapMetaForStagedParts(
     }
 }
 
-void StorageCnchMergeTree::getDeleteBitmapMetaForParts(
-    const ServerDataPartsVector & parts, ContextPtr local_context, TxnTimestamp start_time) const
+void StorageCnchMergeTree::getDeleteBitmapMetaForServerParts(
+    const ServerDataPartsVector & parts, ContextPtr local_context, UInt64 snapshot_ts) const
 {
     auto catalog = local_context->getCnchCatalog();
-    if (!catalog)
-        return;
 
-    std::set<String> request_partitions;
+    std::set<String> partitions_set;
     for (const auto & part : parts)
     {
         const auto & partition_id = part->part_model_wrapper->info->partition_id;
-        request_partitions.insert(partition_id);
+        partitions_set.insert(partition_id);
+    }
+    Strings request_partitions {partitions_set.begin(), partitions_set.end()};
+
+    Stopwatch watch;
+    DeleteBitmapMetaPtrVector all_bitmaps;
+    if (snapshot_ts)
+    {
+        auto bitmaps1 = catalog->getDeleteBitmapsInPartitions(shared_from_this(), request_partitions, snapshot_ts);
+        auto bitmaps2 = catalog->getTrashedDeleteBitmapsInPartitions(shared_from_this(), request_partitions, snapshot_ts);
+        LOG_DEBUG(
+            log,
+            "Get {} delete bitmaps and {} trashed delete bitmaps for {} partitions from catalog, snapshot={}",
+            bitmaps1.size(), bitmaps2.size(), request_partitions.size(), snapshot_ts);
+        std::move(bitmaps1.begin(), bitmaps1.end(), std::back_inserter(all_bitmaps));
+        std::move(bitmaps2.begin(), bitmaps2.end(), std::back_inserter(all_bitmaps));
+    }
+    else
+    {
+        /// NOTE: Get all the bitmap meta needed only once from kv instead of getting many times for every partition to save time.
+        all_bitmaps = catalog->getDeleteBitmapsInPartitions(shared_from_this(), request_partitions, local_context->getCurrentTransactionID());
     }
 
-    /// NOTE: Get all the bitmap meta needed only once from kv instead of getting many times for every partition to save time.
-    Stopwatch watch;
-    auto all_bitmaps
-        = catalog->getDeleteBitmapsInPartitions(shared_from_this(), {request_partitions.begin(), request_partitions.end()}, start_time);
     ProfileEvents::increment(ProfileEvents::CatalogTime, watch.elapsedMilliseconds());
     LOG_DEBUG(
         log,
-        "Get delete bitmap meta for total {} parts, take {} ms and read {} number of bitmap metas",
+        "Get {} delete bitmap metas for {} parts, took {} ms",
+        all_bitmaps.size(),
         parts.size(),
-        watch.elapsedMilliseconds(),
-        all_bitmaps.size());
+        watch.elapsedMilliseconds());
 
     DeleteBitmapMetaPtrVector bitmaps;
     CnchPartsHelper::calcVisibleDeleteBitmaps(all_bitmaps, bitmaps);
 
     /// Both the parts and bitmaps are sorted in (partitioin_id, min_block, max_block, commit_time) order
     auto bitmap_it = bitmaps.begin();
-    for (auto & part : parts)
+    for (const auto & part : parts)
     {
         /// search for the first bitmap
         while (bitmap_it != bitmaps.end() && !(*bitmap_it)->sameBlock(part->info()))
@@ -1193,29 +1511,27 @@ void StorageCnchMergeTree::executeDedupForRepair(const ASTPtr & partition, Conte
     if (partition && !getSettings()->partition_level_unique_keys)
         throw Exception("SYSTEM DEDUP PARTITION can only be used on table with partition_level_unique_keys=1", ErrorCodes::BAD_ARGUMENTS);
 
-    auto txn = getContext()->getCurrentTransaction();
+    auto txn = local_context->getCurrentTransaction();
     if (!txn)
         throw Exception("Transaction is not set", ErrorCodes::LOGICAL_ERROR);
     txn->setMainTableUUID(getStorageUUID());
 
-    auto catalog = getContext()->getCnchCatalog();
+    auto catalog = local_context->getCnchCatalog();
 
-    CnchDedupHelper::DedupScope scope = CnchDedupHelper::DedupScope::Table();
+    CnchDedupHelper::DedupScope scope = CnchDedupHelper::DedupScope::TableDedup();
     if (partition)
     {
         NameOrderedSet partitions;
         partitions.insert(getPartitionIDFromQuery(partition, local_context));
-        scope = CnchDedupHelper::DedupScope::Partitions(partitions);
+        scope = CnchDedupHelper::DedupScope::PartitionDedup(partitions);
     }
 
-    CnchLockHolder cnch_lock(
-        *getContext(),
-        CnchDedupHelper::getLocksToAcquire(
-            scope, txn->getTransactionID(), *this, getSettings()->dedup_acquire_lock_timeout.value.totalMilliseconds()));
-    cnch_lock.lock();
+    auto cnch_lock = txn->createLockHolder(CnchDedupHelper::getLocksToAcquire(
+        scope, txn->getTransactionID(), *this, getSettings()->unique_acquire_write_lock_timeout.value.totalMilliseconds()));
+    cnch_lock->lock();
 
-    TxnTimestamp ts = getContext()->getTimestamp();
-    MergeTreeDataPartsCNCHVector visible_parts = CnchDedupHelper::getVisiblePartsToDedup(scope, *this, ts);
+    TxnTimestamp ts = local_context->getTimestamp();
+    MergeTreeDataPartsCNCHVector visible_parts = CnchDedupHelper::getVisiblePartsToDedup(scope, *this, ts, /*force_bitmap*/ false);
     MergeTreeDataDeduper deduper(*this, local_context);
     LocalDeleteBitmaps bitmaps_to_dump
         = deduper.repairParts(txn->getTransactionID(), CnchPartsHelper::toIMergeTreeDataPartsVector(visible_parts));
@@ -1245,6 +1561,12 @@ void StorageCnchMergeTree::waitForStagedPartsToPublish(ContextPtr local_context)
         "There are still " + toString(staged_parts_cnt) + " staged parts to be published after " + toString(wait_timeout_seconds) + "s.");
 }
 
+void StorageCnchMergeTree::allocateParts(ContextPtr local_context, ServerDataPartsVector & parts)
+{
+    String local_table_name = getCloudTableName(local_context);
+    collectResource(local_context, parts, local_table_name);
+}
+
 void StorageCnchMergeTree::collectResource(
     ContextPtr local_context,
     ServerDataPartsVector & parts,
@@ -1254,7 +1576,7 @@ void StorageCnchMergeTree::collectResource(
     auto cnch_resource = local_context->getCnchServerResource();
     auto create_table_query = getCreateQueryForCloudTable(getCreateTableSql(), local_table_name, local_context);
 
-    cnch_resource->addCreateQuery(local_context, shared_from_this(), create_table_query, local_table_name);
+    cnch_resource->addCreateQuery(local_context, shared_from_this(), create_table_query, local_table_name, false);
 
     // if (local_context.getSettingsRef().enable_virtual_part)
     //     setVirtualPartSize(local_context, parts, worker_group->getReadWorkers().size());
@@ -1262,30 +1584,108 @@ void StorageCnchMergeTree::collectResource(
     cnch_resource->addDataParts(getStorageUUID(), parts, required_bucket_numbers);
 }
 
-UInt64 StorageCnchMergeTree::getTimeTravelRetention()
+void StorageCnchMergeTree::sendPreloadTasks(ContextPtr local_context, ServerDataPartsVector parts, bool enable_parts_sync_preload, UInt64 parts_preload_level, UInt64 ts)
 {
-    return getSettings()->time_travel_retention_days;
+    auto worker_group = getWorkerGroupForTable(*this, local_context);
+    local_context->setCurrentWorkerGroup(worker_group);
+
+    TxnTimestamp txn_id = local_context->getCurrentTransactionID();
+    String create_table_query = genCreateTableQueryForWorker(txn_id.toString());
+
+    /// reuse server resource for part allocation
+    /// no worker session context is created
+    auto server_resource = std::make_shared<CnchServerResource>(txn_id);
+    server_resource->skipCleanWorker();
+    /// all bucket numbers are required
+    std::set<Int64> bucket_numbers;
+    if (isBucketTable())
+    {
+        std::transform(parts.begin(), parts.end(), std::inserter(bucket_numbers, bucket_numbers.end()), [](const auto & part) {
+            return part->part_model().bucket_number();
+        });
+    }
+    server_resource->addCreateQuery(local_context, shared_from_this(), create_table_query, "");
+    server_resource->addDataParts(getStorageUUID(), parts, bucket_numbers);
+
+    server_resource->sendResources(
+        local_context, [&](CnchWorkerClientPtr client, const auto & resources, const ExceptionHandlerPtr & handler) {
+            std::vector<brpc::CallId> ids;
+            for (const auto & resource : resources)
+            {
+                brpc::CallId id = client->preloadDataParts(
+                    local_context,
+                    txn_id,
+                    *this,
+                    create_table_query,
+                    resource.server_parts,
+                    handler,
+                    enable_parts_sync_preload,
+                    parts_preload_level,
+                    ts);
+                ids.emplace_back(id);
+                LOG_TRACE(
+                    log,
+                    "send preload data parts size = {}, enable_parts_sync_preload = {}, enable_parts_sync_preload = {}, submit_ts = {}",
+                    resource.server_parts.size(),
+                    enable_parts_sync_preload,
+                    parts_preload_level,
+                    ts);
+            }
+            return ids;
+        });
 }
 
-void StorageCnchMergeTree::addCheckpoint(const Protos::Checkpoint & /*checkpoint*/)
+void StorageCnchMergeTree::sendDropDiskCacheTasks(ContextPtr local_context, const ServerDataPartsVector & parts, bool sync, bool drop_vw_disk_cache)
 {
-    /// FIXME: add after it was supported
-    // getContext()->getCnchCatalog()->addCheckpoint(shared_from_this(), checkpoint);
+    TxnTimestamp txn_id = local_context->getCurrentTransactionID();
+    String create_table_query = genCreateTableQueryForWorker(txn_id.toString());
+
+    auto worker_group = getWorkerGroupForTable(*this, local_context);
+    local_context->setCurrentWorkerGroup(worker_group);
+
+    /// reuse server resource for part allocation
+    /// no worker session context is created
+    auto server_resource = std::make_shared<CnchServerResource>(txn_id);
+    server_resource->skipCleanWorker();
+    /// all bucket numbers are required
+    std::set<Int64> bucket_numbers;
+    if (isBucketTable())
+    {
+        std::transform(parts.begin(), parts.end(), std::inserter(bucket_numbers, bucket_numbers.end()), [](const auto & part) {
+            return part->part_model().bucket_number();
+        });
+    }
+    server_resource->addCreateQuery(local_context, shared_from_this(), create_table_query, "");
+    server_resource->addDataParts(getStorageUUID(), parts, bucket_numbers);
+    /// TODO: async rpc?
+    auto worker_action =  [&](const CnchWorkerClientPtr & client, const std::vector<AssignedResource> & resources, const ExceptionHandlerPtr &)->std::vector<brpc::CallId> {
+        std::vector<brpc::CallId> ids;
+        for (const auto & resource : resources)
+        {
+            auto data_parts = std::move(resource.server_parts);
+            CnchPartsHelper::flattenPartsVector(data_parts);
+            ids.emplace_back(client->dropPartDiskCache(local_context, txn_id, *this, create_table_query, data_parts, sync, drop_vw_disk_cache));
+        }
+        return ids;
+    };
+    server_resource->sendResources(local_context, worker_action);
 }
 
-void StorageCnchMergeTree::removeCheckpoint(const Protos::Checkpoint & checkpoint)
+PrunedPartitions StorageCnchMergeTree::getPrunedPartitions(
+    const SelectQueryInfo & query_info, const Names & column_names_to_return, ContextPtr local_context) const
 {
-    Protos::Checkpoint new_checkpoint(checkpoint);
-    new_checkpoint.set_status(Protos::Checkpoint::Removing);
-    /// FIXME: add after it was supported
-    // getContext()->getCnchCatalog()->markCheckpoint(shared_from_this(), new_checkpoint);
+    PrunedPartitions pruned_partitions;
+    if (local_context->getCnchCatalog())
+        pruned_partitions = local_context->getCnchCatalog()->getPartitionsByPredicate(local_context, shared_from_this(), query_info, column_names_to_return);
+    return pruned_partitions;
 }
 
-void StorageCnchMergeTree::filterPartsInExplicitTransaction(ServerDataPartsVector & data_parts, ContextPtr local_context) const
+ServerDataPartsVector
+StorageCnchMergeTree::filterPartsInExplicitTransaction(ServerDataPartsVector & data_parts, ContextPtr local_context) const
 {
     Int64 primary_txn_id = local_context->getCurrentTransaction()->getPrimaryTransactionID().toUInt64();
     TxnTimestamp start_time = local_context->getCurrentTransaction()->getStartTime();
-
+    ServerDataPartsVector target_parts;
     std::map<TxnTimestamp, bool> success_secondary_txns;
     auto check_success_txn = [&success_secondary_txns, this](const TxnTimestamp & txn_id) -> bool {
         if (auto it = success_secondary_txns.find(txn_id); it != success_secondary_txns.end())
@@ -1294,17 +1694,18 @@ void StorageCnchMergeTree::filterPartsInExplicitTransaction(ServerDataPartsVecto
         success_secondary_txns.emplace(txn_id, record.status() == CnchTransactionStatus::Finished);
         return record.status() == CnchTransactionStatus::Finished;
     };
-    std::erase_if(data_parts, [&](const auto & part) {
-        return !(
-            part->info().mutation == primary_txn_id && part->part_model_wrapper->part_model->has_secondary_txn_id()
-            && check_success_txn(part->part_model_wrapper->part_model->secondary_txn_id()));
+    std::for_each(data_parts.begin(), data_parts.end(), [&](const auto & part) {
+        if (part->info().mutation == primary_txn_id && part->part_model_wrapper->part_model->has_secondary_txn_id()
+            && check_success_txn(part->part_model_wrapper->part_model->secondary_txn_id()))
+            target_parts.push_back(part);
     });
-    getCommittedServerDataParts(data_parts, start_time, &(*local_context->getCnchCatalog()));
+    getVisibleServerDataParts(data_parts, start_time, &(*local_context->getCnchCatalog()));
+    std::move(data_parts.begin(), data_parts.end(), std::back_inserter(target_parts));
+    return target_parts;
 }
 
 namespace
 {
-
     /// Conversion that is allowed for serializable key (primary key, sorting key).
     /// Key should be serialized in the same way after conversion.
     /// NOTE: The list is not complete.
@@ -1545,6 +1946,10 @@ void StorageCnchMergeTree::checkAlterInCnchServer(const AlterCommands & commands
         {
             throw Exception("ALTER ADD INDEX is not supported for tables with the old syntax", ErrorCodes::BAD_ARGUMENTS);
         }
+        if (command.type == AlterCommand::ADD_PROJECTION && old_metadata.hasUniqueKey())
+        {
+            throw Exception("ALTER ADD PROJECTION is not supported for tables with the unique index", ErrorCodes::BAD_ARGUMENTS);
+        }
         if (command.type == AlterCommand::ADD_PROJECTION && !is_custom_partitioned)
         {
             throw Exception("ALTER ADD PROJECTION is not supported for tables with the old syntax", ErrorCodes::BAD_ARGUMENTS);
@@ -1708,9 +2113,6 @@ Pipe StorageCnchMergeTree::alterPartition(
     if (unlikely(!query_context->getCurrentTransaction()))
         throw Exception("Transaction is not set", ErrorCodes::LOGICAL_ERROR);
 
-    if (forwardQueryToServerIfNeeded(query_context, getStorageUUID()))
-        return {};
-
     auto current_query_context = Context::createCopy(query_context);
 
     for (auto & command : commands)
@@ -1747,7 +2149,12 @@ Pipe StorageCnchMergeTree::alterPartition(
                 break;
 
             case PartitionCommand::INGEST_PARTITION:
-                ingestPartition(command, current_query_context);
+                return ingestPartition(command, current_query_context);
+
+
+            case PartitionCommand::RECLUSTER_PARTITION:
+            case PartitionCommand::RECLUSTER_PARTITION_WHERE:
+                reclusterPartition(command, current_query_context);
                 break;
 
             default:
@@ -1757,6 +2164,46 @@ Pipe StorageCnchMergeTree::alterPartition(
     return {};
 }
 
+void StorageCnchMergeTree::reclusterPartition(const PartitionCommand & command, ContextPtr query_context)
+{
+    if (getInMemoryMetadataPtr()->hasUniqueKey())
+        throw Exception("Table with UNIQUE KEY doesn't support recluster partition commands.", ErrorCodes::SUPPORT_IS_DISABLED);
+
+    if (getInMemoryMetadataPtr()->getIsUserDefinedExpressionFromClusterByKey())
+        throw Exception("Table with user defined CLUSTER BY expression doesn't support recluster partition commands.", ErrorCodes::SUPPORT_IS_DISABLED);
+
+    // create mutation command with partition or predicate attribute
+    MutationCommand mutation_command;
+    mutation_command.type = MutationCommand::Type::RECLUSTER;
+    mutation_command.ast = command.ast->clone();
+    mutation_command.predicate = command.type == PartitionCommand::RECLUSTER_PARTITION_WHERE ? command.partition : nullptr;
+    mutation_command.partition = command.type == PartitionCommand::RECLUSTER_PARTITION ? command.partition : nullptr;
+
+    if (mutation_command.predicate)
+    {
+        // if there are columns in the predicate, they must be a subset of partition key columns
+        NameSet columns;
+        auto idents = IdentifiersCollector::collect(mutation_command.predicate);
+        for (const auto * ident : idents)
+            columns.insert(ident->shortName());
+
+        auto partition_keys = getInMemoryMetadataPtr()->getColumnsRequiredForPartitionKey();
+        for (const auto & col : columns)
+            if (std::find(partition_keys.begin(), partition_keys.end(), col) == partition_keys.end())
+                throw Exception("Only partition key columns are allowed for reclustering partitions", ErrorCodes::BAD_ARGUMENTS);
+    }
+
+    // create mutation entry
+    CnchMergeTreeMutationEntry mutation_entry;
+    MutationCommands mutation_commands;
+    mutation_commands.emplace_back(mutation_command);
+    mutation_entry.commands = mutation_commands;
+    mutation_entry.txn_id = query_context->getCurrentTransaction()->getPrimaryTransactionID().toUInt64();
+    mutation_entry.commit_time = commit_time;
+    mutation_entry.columns_commit_time = commit_time;
+    query_context->getCnchCatalog()->createMutation(getStorageID(), mutation_entry.txn_id.toString(), mutation_entry.toString());
+}
+
 void StorageCnchMergeTree::alter(const AlterCommands & commands, ContextPtr local_context, TableLockHolder & /*table_lock_holder*/)
 {
     auto table_id = getStorageID();
@@ -1764,7 +2211,7 @@ void StorageCnchMergeTree::alter(const AlterCommands & commands, ContextPtr loca
     StorageInMemoryMetadata old_metadata = getInMemoryMetadata();
 
     TransactionCnchPtr txn = local_context->getCurrentTransaction();
-    auto action = txn->createAction<DDLAlterAction>(shared_from_this());
+    auto action = txn->createAction<DDLAlterAction>(shared_from_this(), local_context->getSettingsRef(), local_context->getCurrentQueryId());
     auto & alter_act = action->as<DDLAlterAction &>();
     alter_act.setMutationCommands(commands.getMutationCommands(old_metadata, false, local_context));
 
@@ -1794,6 +2241,16 @@ void StorageCnchMergeTree::alter(const AlterCommands & commands, ContextPtr loca
 
     txn->commitV1();
     LOG_TRACE(log, "Updated shared metadata in Catalog.");
+
+    auto mutation_entry = alter_act.getMutationEntry();
+    if (!mutation_entry.has_value())
+    {
+        if (!alter_act.getMutationCommands().empty())
+            LOG_ERROR(log, "DDLAlterAction didn't generated mutation entry for commands.");
+        return;
+    }
+    addMutationEntry(*mutation_entry);
+    LOG_TRACE(log, "Added mutation entry {} to mutations_by_version", mutation_entry->txn_id);
 }
 
 void StorageCnchMergeTree::checkAlterSettings(const AlterCommands & commands) const
@@ -1803,6 +2260,7 @@ void StorageCnchMergeTree::checkAlterSettings(const AlterCommands & commands) co
         "cnch_vw_read",
         "cnch_vw_write",
         "cnch_vw_task",
+        "cnch_server_vw",
 
         /// Setting for memory buffer
         "cnch_enable_memory_buffer",
@@ -1818,9 +2276,18 @@ void StorageCnchMergeTree::checkAlterSettings(const AlterCommands & commands) co
         "enable_flush_buffer_with_multi_threads",
         "max_flush_threads_num",
 
+        "gc_remove_bitmap_batch_size",
+        "gc_remove_bitmap_thread_pool_size",
+
         "insertion_label_ttl",
         "enable_local_disk_cache",
         "enable_preload_parts",
+        "enable_parts_sync_preload",
+        "parts_preload_level",
+        "cnch_parallel_prefetching",
+        "enable_prefetch_checksums",
+        "cnch_parallel_preloading",
+        "disk_cache_stealing_mode",
 
         "enable_addition_bg_task",
         "max_addition_bg_task_num",
@@ -1831,8 +2298,17 @@ void StorageCnchMergeTree::checkAlterSettings(const AlterCommands & commands) co
         "cnch_merge_parts_cache_min_count",
         "cnch_merge_enable_batch_select",
         "cnch_merge_max_total_rows_to_merge",
+        "cnch_merge_max_total_bytes_to_merge",
+        "cnch_merge_max_parts_to_merge",
         "cnch_merge_only_realtime_partition",
+        "cnch_merge_select_nonadjacent_parts",
         "cnch_merge_pick_worker_algo",
+        "cnch_merge_round_robin_partitions_interval",
+        "cnch_gc_round_robin_partitions_interval",
+        "cnch_gc_round_robin_partitions_number",
+        "gc_remove_part_thread_pool_size",
+        "gc_remove_part_batch_size",
+        "cluster_by_hint",
     };
 
     /// Check whether the value is legal for Setting.
@@ -1848,15 +2324,31 @@ void StorageCnchMergeTree::checkAlterSettings(const AlterCommands & commands) co
 
         for (auto & change : command.settings_changes)
         {
-            if (!supported_settings.count(change.name))
+            if (MergeTreeSettings::isReadonlySetting(change.name))
                 throw Exception("Setting " + change.name + " cannot be modified", ErrorCodes::SUPPORT_IS_DISABLED);
 
             if (getInMemoryMetadataPtr()->hasUniqueKey() && change.name == "cnch_enable_memory_buffer" && change.value.get<Int64>() == 1)
                 throw Exception("Table with UNIQUE KEY doesn't support memory buffer", ErrorCodes::SUPPORT_IS_DISABLED);
 
+            /// Prevent set partition_level_unique_keys to 0
+            if (getInMemoryMetadataPtr()->hasUniqueKey() && change.name == "partition_level_unique_keys" && change.value.get<UInt8>() == 0)
+                throw Exception("Setting 'partition_level_unique_keys' can not change to table_level.", ErrorCodes::SUPPORT_IS_DISABLED);
+
+            if (change.name.find("cnch_vw_") == 0)
+                checkAlterVW(change.value.get<String>());
+
             settings_copy.set(change.name, change.value);
         }
     }
+}
+
+void StorageCnchMergeTree::checkAlterVW(const String & vw_name) const
+{
+    if (vw_name == "vw_default" || vw_name == "vw_write")
+        return;
+
+    /// Will throw VIRTUAL_WAREHOUSE_NOT_FOUND if vw not found.
+    getContext()->getVirtualWarehousePool().get(vw_name);
 }
 
 void StorageCnchMergeTree::truncate(
@@ -1869,16 +2361,14 @@ void StorageCnchMergeTree::truncate(
     dropPartitionOrPart(command, local_context);
 }
 
-void StorageCnchMergeTree::dropPartitionOrPart(const PartitionCommand & command,
-    ContextPtr local_context, IMergeTreeDataPartsVector* dropped_parts, size_t max_threads)
+void StorageCnchMergeTree::dropPartitionOrPart(
+    const PartitionCommand & command, ContextPtr local_context, IMergeTreeDataPartsVector * dropped_parts, size_t max_threads)
 {
     auto svr_parts = selectPartsByPartitionCommand(local_context, command);
     if (svr_parts.empty())
     {
         if (command.part)
             throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No part found");
-        else
-            return;
     }
 
     auto parts = createPartVectorFromServerParts(*this, svr_parts);
@@ -1890,57 +2380,140 @@ void StorageCnchMergeTree::dropPartitionOrPart(const PartitionCommand & command,
     }
 }
 
-void StorageCnchMergeTree::dropPartsImpl(ServerDataPartsVector& svr_parts_to_drop,
-    IMergeTreeDataPartsVector& parts_to_drop, bool detach, ContextPtr local_context,
+void StorageCnchMergeTree::dropPartsImpl(
+    ServerDataPartsVector & svr_parts_to_drop,
+    IMergeTreeDataPartsVector & parts_to_drop,
+    bool detach,
+    ContextPtr local_context,
     size_t max_threads)
 {
     auto txn = local_context->getCurrentTransaction();
+    if (svr_parts_to_drop.empty())
+    {
+        /// Note that it doesn't matter if we commit or rollback here, because there's no data anyway. But commit is more
+        /// semantically correct, because there's no exception, so client side expect that the transaction is success.
+        txn->commitV2();
+        return;
+    }
 
     if (detach)
     {
         auto metadata_snapshot = getInMemoryMetadataPtr();
-        if (metadata_snapshot->hasUniqueKey())
-            throw Exception("detach partition command is not supported on unique table", ErrorCodes::NOT_IMPLEMENTED);
 
-        /// XXX: Detach parts will break MVCC: queries and tasks which reference those parts will fail.
-        // VolumePtr hdfs_volume = getStoragePolicy(IStorage::StorageLocation::MAIN)->local_store_volume();
+        DiskType::Type remote_storage_type = getStoragePolicy(IStorage::StorageLocation::MAIN)->getAnyDisk()->getType();
 
-        // Create detached directory first
-        Disks disks = getStoragePolicy(IStorage::StorageLocation::MAIN)->getDisks();
-        for (DiskPtr & disk : disks)
+        switch (remote_storage_type)
         {
-            disk->createDirectories(getRelativeDataPath(IStorage::StorageLocation::MAIN) + "/detached");
-        }
+            case DiskType::Type::ByteHDFS: {
+                /// XXX: Detach parts will break MVCC: queries and tasks which reference those parts will fail.
+                // VolumePtr hdfs_volume = getStoragePolicy(IStorage::StorageLocation::MAIN)->local_store_volume();
 
-        UndoResources undo_resources;
-        auto write_undo_callback = [&](const DataPartPtr& part) {
-            UndoResource ub(txn->getTransactionID(), UndoResourceType::FileSystem, part->getFullRelativePath(),
-                part->getRelativePathForDetachedPart(""));
-            ub.setDiskName(part->volume->getDisk()->getName());
-            undo_resources.push_back(ub);
-        };
-        for (const auto& data_part : parts_to_drop)
-        {
-            data_part->enumeratePreviousParts(write_undo_callback);
-        }
-        local_context->getCnchCatalog()->writeUndoBuffer(UUIDHelpers::UUIDToString(getStorageUUID()),
-            txn->getTransactionID(), undo_resources);
+                // Create detached directory first
+                Disks disks = getStoragePolicy(IStorage::StorageLocation::MAIN)->getDisks();
+                for (DiskPtr & disk : disks)
+                {
+                    String detached_rel_path = fs::path(getRelativeDataPath(IStorage::StorageLocation::MAIN)) / "detached";
+                    if (metadata_snapshot->hasUniqueKey())
+                        detached_rel_path = fs::path(detached_rel_path) / DeleteBitmapMeta::delete_files_dir;
+                    disk->createDirectories(detached_rel_path);
+                }
 
-        ThreadPool pool(std::min(parts_to_drop.size(), max_threads));
-        auto callback = [&pool] (const DataPartPtr& part) {
-            pool.scheduleOrThrowOnError([part]() {
-                part->renameToDetached("");
-            });
-        };
-        for (const auto& part : parts_to_drop)
-        {
-            part->enumeratePreviousParts(callback);
+                UndoResources undo_resources;
+                auto write_undo_callback = [&](const DataPartPtr & part) {
+                    UndoResource ub(
+                        txn->getTransactionID(),
+                        UndoResourceType::FileSystem,
+                        part->getFullRelativePath(),
+                        part->getRelativePathForDetachedPart(""));
+                    ub.setDiskName(part->volume->getDisk()->getName());
+                    undo_resources.push_back(ub);
+                };
+                for (const auto & data_part : parts_to_drop)
+                {
+                    data_part->enumeratePreviousParts(write_undo_callback);
+                }
+                local_context->getCnchCatalog()->writeUndoBuffer(
+                    UUIDHelpers::UUIDToString(getStorageUUID()), txn->getTransactionID(), undo_resources);
+
+                if (metadata_snapshot->hasUniqueKey() && !local_context->getSettingsRef().enable_unique_table_detach_ignore_delete_bitmap)
+                    getDeleteBitmapMetaForParts(
+                        parts_to_drop, local_context, local_context->getCurrentCnchStartTime(), /*force_found*/ false);
+
+                ThreadPool pool(std::min(parts_to_drop.size(), max_threads));
+                auto callback = [&pool, &metadata_snapshot, &local_context](const DataPartPtr & part) {
+                    bool create_delete_bitmap = metadata_snapshot->hasUniqueKey()
+                        && !local_context->getSettingsRef().enable_unique_table_detach_ignore_delete_bitmap;
+                    pool.scheduleOrThrowOnError([part, create_delete_bitmap]() {
+                        part->renameToDetached("");
+                        if (create_delete_bitmap)
+                            part->createDeleteBitmapForDetachedPart();
+                    });
+                };
+                for (const auto & part : parts_to_drop)
+                {
+                    part->enumeratePreviousParts(callback);
+                }
+                pool.wait();
+                /// NOTE: we still need create DROP_RANGE part for detached parts,
+                break;
+            }
+            case DiskType::Type::ByteS3: {
+                MergeTreeDataPartsCNCHVector parts;
+                UndoResources resources;
+                for (const auto & part_to_drop : parts_to_drop)
+                {
+                    for (IMergeTreeDataPartPtr curr_part = part_to_drop; curr_part != nullptr; curr_part = curr_part->tryGetPreviousPart())
+                    {
+                        auto part = dynamic_pointer_cast<const MergeTreeDataPartCNCH>(curr_part);
+                        if (part == nullptr)
+                        {
+                            throw Exception("Unexpected part type when detach", ErrorCodes::LOGICAL_ERROR);
+                        }
+                        UndoResource ub(txn->getTransactionID(), UndoResourceType::S3DetachPart, part->info.getPartName());
+                        resources.push_back(ub);
+
+                        parts.push_back(part);
+                    }
+                }
+
+                LocalDeleteBitmaps new_bitmaps;
+                if (metadata_snapshot->hasUniqueKey() && !local_context->getSettingsRef().enable_unique_table_detach_ignore_delete_bitmap)
+                {
+                    /// Create new base delete bitmap, it will be convenient to handle only one necessary bitmap meta.
+                    getDeleteBitmapMetaForCnchParts(parts, local_context, local_context->getCurrentCnchStartTime(), /*force_found*/ false);
+                    for (size_t i = 0; i < parts.size(); ++i)
+                    {
+                        IMergeTreeDataPartPtr curr_part = parts[i];
+                        while (curr_part)
+                        {
+                            auto new_bitmap = curr_part->createNewBaseDeleteBitmap(txn->getTransactionID());
+                            if (new_bitmap)
+                            {
+                                resources.push_back(
+                                    new_bitmap->getUndoResource(txn->getTransactionID(), UndoResourceType::S3DetachDeleteBitmap));
+                                new_bitmaps.push_back(std::move(new_bitmap));
+                            }
+                            curr_part = curr_part->tryGetPreviousPart();
+                        }
+                    }
+                }
+
+                // Write undo buffer first
+                local_context->getCnchCatalog()->writeUndoBuffer(
+                    UUIDHelpers::UUIDToString(getStorageUUID()), txn->getTransactionID(), resources);
+
+                DeleteBitmapMetaPtrVector bitmap_metas = dumpDeleteBitmaps(*this, new_bitmaps);
+                auto action = txn->createAction<S3DetachMetaAction>(shared_from_this(), parts, bitmap_metas);
+                txn->appendAction(action);
+                break;
+            }
+            default:
+                throw Exception(
+                    fmt::format("Unknown storage type {} when detach", DiskType::toString(remote_storage_type)), ErrorCodes::LOGICAL_ERROR);
         }
-        pool.wait();
-        /// NOTE: we still need create DROP_RANGE part for detached parts,
     }
 
-    MutableDataPartsVector drop_ranges;
+    MutableDataPartsVector drop_parts;
 
     if (svr_parts_to_drop.size() == 1)
     {
@@ -1952,49 +2525,109 @@ void StorageCnchMergeTree::dropPartsImpl(ServerDataPartsVector& svr_parts_to_dro
         auto disk = getStoragePolicy(IStorage::StorageLocation::AUXILITY)->getAnyDisk();
         auto single_disk_volume = std::make_shared<SingleDiskVolume>("volume_" + drop_part_info.getPartName(), disk);
         String drop_part_name = drop_part_info.getPartName();
-        auto drop_part = createPart(
-            drop_part_name,
-            MergeTreeDataPartType::WIDE,
-            drop_part_info,
-            single_disk_volume,
-            drop_part_name,
-            nullptr,
-            StorageLocation::AUXILITY);
+        auto drop_part = createPart(drop_part_name, MergeTreeDataPartType::WIDE, drop_part_info, single_disk_volume, drop_part_name, nullptr, StorageLocation::AUXILITY);
         drop_part->partition.assign(part->partition());
         drop_part->deleted = true;
+        /// Get parts chain and update `coverd_xxx` fields for metrics.
+        {
+            drop_part->covered_parts_rows += part->rowsCount();
+            auto cur_part = part;
+            do
+            {
+                drop_part->covered_parts_size += cur_part->part_model().size();
+                drop_part->covered_parts_count += 1;
+            } while ((cur_part = cur_part->tryGetPreviousPart()));
+        }
 
         if (txn->isSecondary())
         {
             drop_part->secondary_txn_id = txn->getTransactionID();
         }
 
-        drop_ranges.emplace_back(std::move(drop_part));
+        drop_parts.emplace_back(std::move(drop_part));
     }
     else
     {
         // drop_range parts should belong to the primary transaction
-        drop_ranges = createDropRangesFromParts(svr_parts_to_drop, txn);
+        drop_parts = createDropRangesFromParts(local_context, svr_parts_to_drop, txn);
     }
 
+    auto bitmap_tombstones = createDeleteBitmapTombstones(drop_parts, txn->getPrimaryTransactionID());
+
     CnchDataWriter cnch_writer(*this, local_context, ManipulationType::Drop);
-    cnch_writer.dumpAndCommitCnchParts(drop_ranges);
+    cnch_writer.dumpAndCommitCnchParts(drop_parts, bitmap_tombstones);
+    txn->commitV2();
 }
 
-StorageCnchMergeTree::MutableDataPartsVector
-StorageCnchMergeTree::createDropRangesFromParts(const ServerDataPartsVector & parts_to_drop, const TransactionCnchPtr & txn)
+StorageCnchMergeTree::MutableDataPartsVector StorageCnchMergeTree::createDropRangesFromParts(
+    ContextPtr query_context, const ServerDataPartsVector & parts_to_drop, const TransactionCnchPtr & txn)
 {
     PartitionDropInfos partition_infos;
+    std::unordered_set<String> partitions;
 
     for (const auto & part : parts_to_drop)
     {
+        partitions.insert(part->info().partition_id);
         auto [iter, inserted] = partition_infos.try_emplace(part->info().partition_id);
         if (inserted)
             iter->second.value.assign(part->partition());
 
         iter->second.max_block = std::max(iter->second.max_block, part->info().max_block);
-        iter->second.rows_count += part->rowsCount();
-        iter->second.size += part->part_model().size();
-        iter->second.parts_count += 1;
+
+        /// Get parts chain and update `coverd_xxx` fields for metrics.
+        {
+            iter->second.rows_count += part->rowsCount();
+            auto cur_part = part;
+            do
+            {
+                iter->second.size += cur_part->part_model().size();
+                iter->second.parts_count += 1;
+            } while ((cur_part = cur_part->tryGetPreviousPart()));
+        }
+    }
+
+    /// Remove related merge mutate tasks before creating DropRange to avoid merged parts become visible.
+    auto cur_txn = query_context->getCurrentTransaction();
+    TxnTimestamp txn_id = cur_txn->getTransactionID();
+    LockInfoPtr partition_lock = std::make_shared<LockInfo>(txn_id);
+    partition_lock->setMode(LockMode::X);
+    partition_lock->setTimeout(query_context->getSettingsRef().drop_range_memory_lock_timeout.value.totalMilliseconds()); // default 5s
+    partition_lock->setUUID(getStorageUUID());
+    if (partitions.size() == 1)
+        partition_lock->setPartition(*partitions.begin());
+
+    Stopwatch lock_watch;
+    auto cnch_lock = cur_txn->createLockHolder({std::move(partition_lock)});
+    cnch_lock->lock();
+    LOG_DEBUG(log, "DropRanges qcquired lock in {} ms", lock_watch.elapsedMilliseconds());
+
+    auto daemon_manager_client_ptr = query_context->getDaemonManagerClient();
+    if (!daemon_manager_client_ptr)
+        throw Exception("Failed to get daemon manager client", ErrorCodes::SYSTEM_ERROR);
+
+    const StorageID target_storage_id = getStorageID();
+    std::optional<DaemonManager::BGJobInfo> merge_job_info
+        = daemon_manager_client_ptr->getDMBGJobInfo(target_storage_id.uuid, CnchBGThreadType::MergeMutate, query_context->getCurrentQueryId());
+
+    if (!merge_job_info || merge_job_info->host_port.empty())
+        LOG_DEBUG(
+            log,
+            "Will skip removing related merge tasks as there is no valid host server for table's merge job: {}",
+            target_storage_id.getNameForLogs());
+    else
+    {
+        auto server_client_ptr = query_context->getCnchServerClient(merge_job_info->host_port);
+        if (!server_client_ptr)
+            throw Exception("Failed to get server client with host port " + merge_job_info->host_port, ErrorCodes::SYSTEM_ERROR);
+        if (!server_client_ptr->removeMergeMutateTasksOnPartitions(target_storage_id, partitions))
+        {
+            auto msg = fmt::format(
+                "Failed to remove MergeMutateTasks for partitions: {}, table: {}.",
+                fmt::join(partitions, ","),
+                target_storage_id.getNameForLogs());
+
+            throw Exception(msg, ErrorCodes::SYSTEM_ERROR);
+        }
     }
 
     return createDropRangesFromPartitions(partition_infos, txn);
@@ -2034,6 +2667,30 @@ StorageCnchMergeTree::createDropRangesFromPartitions(const PartitionDropInfos & 
     }
 
     return drop_ranges;
+}
+
+LocalDeleteBitmaps StorageCnchMergeTree::createDeleteBitmapTombstones(const IMutableMergeTreeDataPartsVector & drop_ranges, UInt64 txnID)
+{
+    LocalDeleteBitmaps bitmap_tombstones;
+    if (getInMemoryMetadataPtr()->hasUniqueKey())
+    {
+        for (auto & part : drop_ranges)
+        {
+            if (part->isDropRangePart())
+            {
+                auto temp_bitmap = LocalDeleteBitmap::createRangeTombstone(part->info.partition_id, part->info.max_block, txnID);
+                bitmap_tombstones.push_back(std::move(temp_bitmap));
+                LOG_DEBUG(log, "Range tombstone of delete bitmap has been created for drop range part " + part->info.getPartName());
+            }
+            else
+            {
+                auto temp_bitmap = LocalDeleteBitmap::createTombstone(part->info, txnID);
+                bitmap_tombstones.push_back(std::move(temp_bitmap));
+                LOG_DEBUG(log, "Tombstone of delete bitmap has been created for part {}", part->info.getPartName());
+            }
+        }
+    }
+    return bitmap_tombstones;
 }
 
 StoragePolicyPtr StorageCnchMergeTree::getStoragePolicy(StorageLocation location) const
@@ -2146,7 +2803,8 @@ std::set<Int64> StorageCnchMergeTree::getRequiredBucketNumbers(const SelectQuery
                     metadata_snapshot->getSplitNumberFromClusterByKey(),
                     metadata_snapshot->getWithRangeFromClusterByKey(),
                     metadata_snapshot->getBucketNumberFromClusterByKey(),
-                    local_context);
+                    local_context,
+                    metadata_snapshot->getIsUserDefinedExpressionFromClusterByKey());
                 auto bucket_number
                     = block_copy.getByPosition(block_copy.columns() - 1).column->getInt(0); // this block only contains one row
                 bucket_numbers.insert(bucket_number);
@@ -2155,7 +2813,8 @@ std::set<Int64> StorageCnchMergeTree::getRequiredBucketNumbers(const SelectQuery
     }
     return bucket_numbers;
 }
-StorageCnchMergeTree * StorageCnchMergeTree::checkStructureAndGetCnchMergeTree(const StoragePtr & source_table) const
+StorageCnchMergeTree *
+StorageCnchMergeTree::checkStructureAndGetCnchMergeTree(const StoragePtr & source_table, ContextPtr local_context) const
 {
     StorageCnchMergeTree * src_data = dynamic_cast<StorageCnchMergeTree *>(source_table.get());
     if (!src_data)
@@ -2213,7 +2872,10 @@ StorageCnchMergeTree * StorageCnchMergeTree::checkStructureAndGetCnchMergeTree(c
     // If target table is a bucket table, ensure that source table is a bucket table
     // or if the source table is a bucket table, ensure the table_definition_hash is the same before proceeding to drop parts
     // Can remove this check if rollback has been implemented
-    if (isBucketTable() && (!src_data->isBucketTable() || getTableHashForClusterBy() != src_data->getTableHashForClusterBy()))
+    bool skip_table_definition_hash_check = local_context->getSettingsRef().allow_attach_parts_with_different_table_definition_hash
+                                                        && !getInMemoryMetadataPtr()->getIsUserDefinedExpressionFromClusterByKey();
+    if (isBucketTable() && !skip_table_definition_hash_check
+        && (!src_data->isBucketTable() || getTableHashForClusterBy() != src_data->getTableHashForClusterBy()))
     {
         LOG_DEBUG(
             log,
@@ -2321,88 +2983,116 @@ String StorageCnchMergeTree::genCreateTableQueryForWorker(const String & suffix)
     return getCreateQueryForCloudTable(getCreateTableSql(), worker_table_name);
 }
 
-std::optional<UInt64> StorageCnchMergeTree::totalRows(const ContextPtr & query_context) const
+std::optional<UInt64> StorageCnchMergeTree::totalRows([[maybe_unused]] const ContextPtr & query_context) const
 {
-    auto parts = getAllParts(query_context);
-    if (parts.empty())
-        return 0;
-    const auto & metadata_snapshot = getInMemoryMetadataPtr();
-    if (metadata_snapshot->hasUniqueKey())
-        getDeleteBitmapMetaForParts(parts, query_context, query_context->getCurrentTransactionID());
-    size_t rows = 0;
-    for (const auto & part : parts)
-    {
-        if (!part->isPartial())
-        {
-            if (const auto & delete_bitmap = part->getDeleteBitmap(*this, false))
-                rows += part->rowsCount() - delete_bitmap->cardinality();
-            else
-                rows += part->rowsCount();
-        }
-    }
-    return rows;
+    /// TODO: (zuochuang.zema) How to get the info of _row_exists on server?
+    return std::nullopt;
+
+    // auto parts = getAllParts(query_context);
+    // if (parts.empty())
+    //     return 0;
+    // const auto & metadata_snapshot = getInMemoryMetadataPtr();
+    // if (metadata_snapshot->hasUniqueKey())
+    //     getDeleteBitmapMetaForServerParts(parts, query_context);
+    // size_t rows = 0;
+    // for (const auto & part : parts)
+    // {
+    //     if (const auto & delete_bitmap = part->getDeleteBitmap(*this, false))
+    //         rows += part->rowsCount() - delete_bitmap->cardinality();
+    //     else
+    //         rows += part->rowsCount();
+    // }
+    // return rows;
 }
 
 std::optional<UInt64>
-StorageCnchMergeTree::totalRowsByPartitionPredicate(const SelectQueryInfo & query_info, ContextPtr local_context) const
+StorageCnchMergeTree::totalRowsByPartitionPredicate([[maybe_unused]] const SelectQueryInfo & query_info, [[maybe_unused]] ContextPtr local_context) const
 {
-    /// Similar to selectPartsToRead, but will return {} if the predicate is not a partition predicate or _part
-    auto column_names_to_return = query_info.syntax_analyzer_result->requiredSourceColumns();
-    auto parts = getAllPartsInPartitions(column_names_to_return, local_context, query_info);
-    if (parts.empty())
-        return 0;
-    const auto & metadata_snapshot = getInMemoryMetadataPtr();
-    if (metadata_snapshot->hasUniqueKey())
-        getDeleteBitmapMetaForParts(parts, local_context, local_context->getCurrentTransactionID());
+    /// TODO: (zuochuang.zema) How to get the info of _row_exists on server?
+    return std::nullopt;
 
-    bool partition_column_valid = std::any_of(column_names_to_return.begin(), column_names_to_return.end(), [](const auto & name) {
-        return name == "_partition_id" || name == "_partition_value";
-    });
+    // /// Similar to selectPartsToRead, but will return {} if the predicate is not a partition predicate or _part
+    // auto column_names_to_return = query_info.syntax_analyzer_result->requiredSourceColumns();
+    // auto parts = getAllPartsInPartitions(column_names_to_return, local_context, query_info);
+    // if (parts.empty())
+    //     return 0;
+    // const auto & metadata_snapshot = getInMemoryMetadataPtr();
+    // if (metadata_snapshot->hasUniqueKey())
+    //     getDeleteBitmapMetaForServerParts(parts, local_context);
 
-    if (partition_column_valid)
-    {
-        auto partition_list = local_context->getCnchCatalog()->getPartitionList(shared_from_this(), local_context.get());
-        Block partition_block = getBlockWithVirtualPartitionColumns(partition_list);
-        ASTPtr expression_ast;
+    // bool partition_column_valid = std::any_of(column_names_to_return.begin(), column_names_to_return.end(), [](const auto & name) {
+    //     return name == "_partition_id" || name == "_partition_value";
+    // });
 
-        /// Generate valid expressions for filtering
-        partition_column_valid = partition_column_valid
-            && VirtualColumnUtils::prepareFilterBlockWithQuery(query_info.query, local_context, partition_block, expression_ast);
-    }
+    // if (partition_column_valid)
+    // {
+    //     auto partition_list = local_context->getCnchCatalog()->getPartitionList(shared_from_this(), local_context.get());
+    //     Block partition_block = getBlockWithVirtualPartitionColumns(partition_list);
+    //     ASTPtr expression_ast;
 
-    PartitionPruner partition_pruner(metadata_snapshot, query_info, local_context, true /* strict */);
+    //     /// Generate valid expressions for filtering
+    //     partition_column_valid = partition_column_valid
+    //         && VirtualColumnUtils::prepareFilterBlockWithQuery(query_info.query, local_context, partition_block, expression_ast);
+    // }
 
-    if (!partition_column_valid && partition_pruner.isUseless())
-        return {};
+    // PartitionPruner partition_pruner(metadata_snapshot, query_info, local_context, true /* strict */);
 
-    Block virtual_columns_block = getBlockWithPartColumn(parts);
-    bool part_column_queried
-        = std::any_of(column_names_to_return.begin(), column_names_to_return.end(), [](const auto & name) { return name == "_part"; });
-    if (part_column_queried)
-        VirtualColumnUtils::filterBlockWithQuery(query_info.query, virtual_columns_block, local_context);
-    auto part_values = VirtualColumnUtils::extractSingleValueFromBlock<String>(virtual_columns_block, "_part");
-    if (part_values.empty())
-        return 0;
+    // if (!partition_column_valid && partition_pruner.isUseless())
+    //     return {};
 
-    size_t rows = 0;
-    for (const auto & part : parts)
-        if (!part->isPartial() && (part_values.empty() || part_values.find(part->name()) != part_values.end())
-            && !partition_pruner.canBePruned(*part))
-        {
-            if (const auto & delete_bitmap = part->getDeleteBitmap(*this, false))
-                rows += part->rowsCount() - delete_bitmap->cardinality();
-            else
-                rows += part->rowsCount();
-        }
-    return rows;
+    // Block virtual_columns_block = getBlockWithPartColumn(parts);
+    // bool part_column_queried
+    //     = std::any_of(column_names_to_return.begin(), column_names_to_return.end(), [](const auto & name) { return name == "_part"; });
+    // if (part_column_queried)
+    //     VirtualColumnUtils::filterBlockWithQuery(query_info.query, virtual_columns_block, local_context);
+    // auto part_values = VirtualColumnUtils::extractSingleValueFromBlock<String>(virtual_columns_block, "_part");
+    // if (part_values.empty())
+    //     return 0;
+
+    // size_t rows = 0;
+    // for (const auto & part : parts)
+    //     if (!part->isPartial() && (part_values.empty() || part_values.find(part->name()) != part_values.end())
+    //         && !partition_pruner.canBePruned(*part))
+    //     {
+    //         if (const auto & delete_bitmap = part->getDeleteBitmap(*this, false))
+    //             rows += part->rowsCount() - delete_bitmap->cardinality();
+    //         else
+    //             rows += part->rowsCount();
+    //     }
+    // return rows;
 }
 
 void StorageCnchMergeTree::checkMutationIsPossible(const MutationCommands & commands, const Settings & /*settings*/) const
 {
+    static std::unordered_set<MutationCommand::Type> supported_mutations =
+    {
+        MutationCommand::MATERIALIZE_INDEX,
+        MutationCommand::DELETE,
+        MutationCommand::FAST_DELETE,
+    };
+
+    bool contains_delete = false;
     for (const auto & command : commands)
     {
-        if (command.type != MutationCommand::MATERIALIZE_INDEX)
+        if(!supported_mutations.contains(command.type))
             throw Exception(ErrorCodes::NOT_IMPLEMENTED , "StorageCnchMergeTree doesn't support mutation of type {}\n", command.type);
+
+        if (command.column_name == RowExistsColumn::ROW_EXISTS_COLUMN.name
+            || (command.type == MutationCommand::RENAME_COLUMN && command.rename_to == RowExistsColumn::ROW_EXISTS_COLUMN.name))
+        {
+            throw Exception("Column `_row_exists` is not allowed to appears in any mutation command as it's reserved for DELETE mutation.", ErrorCodes::BAD_ARGUMENTS);
+        }
+
+        if (command.type == MutationCommand::DELETE || command.type == MutationCommand::FAST_DELETE)
+        {
+            if (contains_delete)
+                throw Exception("It's not allowed to execute multiple DELETE|FASTDELETE commands", ErrorCodes::NOT_IMPLEMENTED);
+            contains_delete = true;
+        }
+        else if (contains_delete)
+        {
+            throw Exception("It's not allowed to execute DELETE|FASTDELETE with other commands", ErrorCodes::NOT_IMPLEMENTED);
+        }
     }
 }
 
@@ -2412,20 +3102,80 @@ void StorageCnchMergeTree::mutate(const MutationCommands & commands, ContextPtr 
         return;
 
     auto txn = query_context->getCurrentTransaction();
-    auto action = txn->createAction<DDLAlterAction>(shared_from_this());
+    auto action = txn->createAction<DDLAlterAction>(shared_from_this(), query_context->getSettingsRef(), query_context->getCurrentQueryId());
     auto & alter_act = action->as<DDLAlterAction &>();
     alter_act.setMutationCommands(commands);
     txn->appendAction(std::move(action));
     txn->commitV1();
 
-    /// TODO: trigger sync mutation if mutation_sync = 1, this is only an ugly (mainly for CI test)
+    auto mutation_entry = alter_act.getMutationEntry();
+    if (!mutation_entry.has_value())
+    {
+        if (!commands.empty())
+            LOG_ERROR(log, "DDLAlterAction didn't generated mutation entry for commands.");
+        return;
+    }
+    addMutationEntry(*mutation_entry);
+
+    auto timeout_ms = query_context->getSettingsRef().max_execution_time.totalMilliseconds();
     auto bg_thread = query_context->tryGetCnchBGThread(CnchBGThreadType::MergeMutate, getStorageID());
     if (bg_thread)
     {
-        auto merge_mutate_thread = typeid_cast<CnchMergeMutateThread *>(bg_thread.get());
+        auto * merge_mutate_thread = typeid_cast<CnchMergeMutateThread *>(bg_thread.get());
         auto istorage = shared_from_this();
         merge_mutate_thread->triggerPartMutate(shared_from_this());
+
+        if (query_context->getSettingsRef().mutations_sync != 0)
+            merge_mutate_thread->waitMutationFinish(mutation_entry->commit_time, timeout_ms);
     }
+}
+
+void StorageCnchMergeTree::checkSchemaForBitEngineTable(const ContextPtr & context_) const
+{
+    if (context_->getServerType() != ServerType::cnch_server)
+        return;
+
+    MergeTreeMetaBase::checkSchemaForBitEngineTable(context_);
+}
+
+void StorageCnchMergeTree::checkUnderlyingDictionaryTable(const BitEngineHelper::DictionaryDatabaseAndTable & dict_table)
+{
+    /// 1. check the cluster_by clause, it should keep consistent with the BitEngine table
+    auto context_v = getContext();
+    auto dict_storage = DatabaseCatalog::instance().getTable(StorageID{dict_table.database, dict_table.table}, context_v);
+
+    if (!dict_storage)
+    {
+        throw Exception(fmt::format("Fail to get StoragePtr of table {}.{}",
+            dict_table.database, dict_table.table), ErrorCodes::LOGICAL_ERROR);
+    }
+
+    /// 2. check dictionary key type
+    auto dict_physical_columns = dict_storage->getInMemoryMetadataPtr()->getColumns().getAllPhysical();
+    NameAndTypePair key_column, value_column;
+    for (const auto & column : dict_physical_columns)
+    {
+        if (column.name == "key")
+            key_column = column;
+        else if (column.name == "value")
+            value_column = column;
+    }
+
+    if (key_column.name.empty())
+        throw Exception("You should specify a column named `key`.", ErrorCodes::ILLEGAL_COLUMN);
+    if (value_column.name.empty())
+        throw Exception("You should specify a column named `value`.", ErrorCodes::ILLEGAL_COLUMN);
+
+    if (dict_table.dict_key_type == BitEngineHelper::KeyType::KEY_INTEGER &&
+        !WhichDataType(key_column.type).isUInt64())
+        throw Exception("Key column type should be UInt64 for a Integer BitEngine field",
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+    else if (dict_table.dict_key_type == BitEngineHelper::KeyType::KEY_STRING &&
+        !isString(key_column.type))
+        throw Exception("Key column type should be String for a String BitEngine field", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+
+    if (!WhichDataType(value_column.type).isUInt64())
+        throw Exception("Value column type should be UInt64", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
 }
 
 } // end namespace DB

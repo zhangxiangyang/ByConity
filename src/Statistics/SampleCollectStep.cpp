@@ -19,7 +19,7 @@
 #include <Statistics/CollectStep.h>
 #include <Statistics/ParseUtils.h>
 #include <Statistics/ScaleAlgorithm.h>
-#include <Statistics/StatsCpcSketch.h>
+#include <Statistics/StatsHllSketch.h>
 #include <Statistics/StatsNdvBucketsExtend.h>
 #include <Statistics/TypeUtils.h>
 #include <boost/noncopyable.hpp>
@@ -28,14 +28,14 @@
 namespace DB::Statistics
 {
 
-static const String virtual_mark_id = "cityHash64(blockNumber(), _part_uuid), intDiv(rowNumberInBlock(), 8192)";
+static const String virtual_mark_id = "cityHash64(blockNumber(), _part_uuid, intDiv(rowNumberInBlock(), 8192))";
 
-// cpc is like HyperLogLog, kll is to calculate bucket bounds for equal-height histogram
+// hll is like HyperLogLog, kll is to calculate bucket bounds for equal-height histogram
 // this fetch data via the following sql:
 // select
-//      count(<col1>), cpc(<col1>), cpc(cityHash64(<col1>, __mark_id), kll(<col1>),
-//      count(<col2>), cpc(<col2>), cpc(cityHash64(<col2>, __mark_id), kll(<col2>),
-//      count(<col3>), cpc(<col3>), cpc(cityHash64(<col3>, __mark_id), kll(<col3>),
+//      count(<col1>), hll(<col1>), hll(cityHash64(<col1>, __mark_id), kll(<col1>),
+//      count(<col2>), hll(<col2>), hll(cityHash64(<col2>, __mark_id), kll(<col2>),
+//      count(<col3>), hll(<col3>), hll(cityHash64(<col3>, __mark_id), kll(<col3>),
 // from
 //      <table>
 class FirstSampleColumnHandler : public ColumnHandlerBase
@@ -46,61 +46,86 @@ public:
     {
         col_name = col_desc.name;
         data_type = decayDataType(col_desc.type);
-        config = get_column_config(handler_context.settings, data_type);
+        config = getColumnConfig(handler_context.settings, data_type);
+        generateSqls();
     }
 
-    std::vector<String> getSqls() override
+    void generateSqls()
     {
         auto quote_col_name = backQuoteIfNeed(col_name);
         auto wrapped_col_name = getWrappedColumnName(config, quote_col_name);
 
         auto count_sql = fmt::format(FMT_STRING("count({})"), quote_col_name);
-        auto ndv_sql = fmt::format(FMT_STRING("cpc({})"), wrapped_col_name);
-        auto block_ndv_sql = fmt::format(FMT_STRING("cpc(cityHash64({}, {}))"), wrapped_col_name, virtual_mark_id);
-        auto histogram_sql = fmt::format(FMT_STRING("kll({})"), wrapped_col_name);
+        auto ndv_sql = fmt::format(FMT_STRING("uniq({})"), wrapped_col_name);
+        auto block_ndv_sql = fmt::format(FMT_STRING("hll(cityHash64({}, {}))"), wrapped_col_name, virtual_mark_id);
+
+        sqls.emplace_back(count_sql);
+        sqls.emplace_back(ndv_sql);
+        sqls.emplace_back(block_ndv_sql);
+
+        if (config.need_histogram)
+        {
+            auto kll_log_k = handler_context.settings.kll_sketch_log_k;
+            auto kll_name = getKllFuncNameWithConfig(kll_log_k);
+            auto histogram_sql = fmt::format(FMT_STRING("{}({})"), kll_name, wrapped_col_name);
+            sqls.emplace_back(histogram_sql);
+        }
+
+        if (config.need_minmax)
+        {
+            auto min_sql = fmt::format(FMT_STRING("toFloat64(min({}))"), wrapped_col_name);
+            auto max_sql = fmt::format(FMT_STRING("toFloat64(max({}))"), wrapped_col_name);
+            sqls.emplace_back(min_sql);
+            sqls.emplace_back(max_sql);
+        }
         // to estimate ndv
         LOG_INFO(
             &Poco::Logger::get("FirstSampleColumnHandler"),
             fmt::format(
                 FMT_STRING("col info: col={} && "
-                           "sqls={},{},{},{}"),
+                           "sqls={}"),
                 col_name,
-                count_sql,
-                ndv_sql,
-                block_ndv_sql,
-                histogram_sql));
-
-        return {count_sql, ndv_sql, block_ndv_sql, histogram_sql};
+                fmt::join(sqls, ", ")));
     }
 
-    size_t size() override { return 4; }
+    const std::vector<String> & getSqls() override { return sqls; }
 
-    void parse(const Block & block, size_t index_offset) override
+    void parse(const Block & block, size_t index_offset_begin) override
     {
+        auto index_offset = index_offset_begin;
         auto wrapped_col_name = getWrappedColumnName(config, col_name);
 
         // count(col) SAMPLE
-        auto sample_nonnull_count = static_cast<double>(getSingleValue<UInt64>(block, index_offset + 0));
-        // cpc(col) SAMPLE
-        auto ndv_b64 = getSingleValue<std::string_view>(block, index_offset + 1);
-        // cpc(cityHash64(col, _mark_id)  SAMPLE
-        auto block_ndv_b64 = getSingleValue<std::string_view>(block, index_offset + 2);
-        // kll(col) SAMPLE
-        auto histogram_b64 = getSingleValue<std::string_view>(block, index_offset + 3);
+        auto sample_nonnull_count = static_cast<double>(getSingleValue<UInt64>(block, index_offset++));
+        // hll(col) SAMPLE
+        double sample_ndv = getSingleValue<UInt64>(block, index_offset++);
+        // hll(cityHash64(col, _mark_id)  SAMPLE
+        auto block_ndv_blob = getSingleValue<std::string_view>(block, index_offset++);
 
         // select count(*) SAMPLE
         double full_count = handler_context.full_count;
         // select count(*) FULL
         double sample_row_count = handler_context.query_row_count.value_or(0);
 
+        // due to snapshot is not implemented,
+        // and we get full_count from first sql and sample_row_count from second sql
+        // there are possiblity that full_count < sample_row_count when insertion happens between them
+        // then sample_ratio > 1, leading to unexpected exception
+        // dirty hack this by assign full_count to sample_row_count when this case occurs
+
+        /// TODO: remove this hack when snapshot is ready
+        if (full_count < sample_row_count)
+        {
+            handler_context.full_count = sample_row_count;
+            full_count = sample_row_count;
+        }
 
         HandlerColumnData result;
 
         // algorithm requires block_ndv as sample_nonnull
         if (sample_nonnull_count != 0)
         {
-            double sample_ndv = getNdvFromBase64(ndv_b64);
-            double block_ndv = getNdvFromBase64(block_ndv_b64);
+            double block_ndv = getNdvFromSketchBinary(block_ndv_blob);
             block_ndv = std::min(block_ndv, sample_nonnull_count);
 
             result.nonnull_count = scaleCount(full_count, sample_row_count, sample_nonnull_count);
@@ -143,21 +168,35 @@ public:
 
             if (!use_accurate)
             {
-                result.ndv_value_opt = estimated_ndv;
+                result.is_ndv_reliable = true;
+                result.ndv_value = estimated_ndv;
             }
             else
             {
-                result.ndv_value_opt = std::nullopt;
+                result.is_ndv_reliable = false;
             }
 
-            if (!histogram_b64.empty())
+            if (config.need_histogram)
             {
-                auto histogram = createStatisticsTyped<StatsKllSketch>(StatisticsTag::KllSketch, base64Decode(histogram_b64));
-                result.min_as_double = histogram->minAsDouble().value_or(std::nan(""));
-                result.max_as_double = histogram->maxAsDouble().value_or(std::nan(""));
+                // kll(col) SAMPLE
+                auto histogram_blob = getSingleValue<std::string_view>(block, index_offset++);
+                if (!histogram_blob.empty())
+                {
+                    auto histogram = createStatisticsTyped<StatsKllSketch>(StatisticsTag::KllSketch, histogram_blob);
 
-                result.bucket_bounds = histogram->getBucketBounds();
+                    result.min_as_double = histogram->minAsDouble().value_or(std::nan(""));
+                    result.max_as_double = histogram->maxAsDouble().value_or(std::nan(""));
+                    auto histogram_bucket_size = handler_context.settings.histogram_bucket_size;
+                    result.bucket_bounds = histogram->getBucketBounds(histogram_bucket_size);
+                }
             }
+
+            if (config.need_minmax)
+            {
+                result.min_as_double = getSingleValue<Float64>(block, index_offset++);
+                result.max_as_double = getSingleValue<Float64>(block, index_offset++);
+            }
+
             LOG_INFO(
                 &Poco::Logger::get("FirstSampleColumnHandler"),
                 fmt::format(
@@ -172,12 +211,13 @@ public:
                     block_ndv,
                     sample_ndv,
                     result.nonnull_count,
-                    result.ndv_value_opt.value_or(-1)));
+                    result.ndv_value));
         }
         else
         {
             result.nonnull_count = 0;
-            result.ndv_value_opt = 0;
+            result.is_ndv_reliable = true;
+            result.ndv_value = 0;
             // use NaN for min/max
             result.min_as_double = std::numeric_limits<double>::quiet_NaN();
             result.max_as_double = std::numeric_limits<double>::quiet_NaN();
@@ -193,6 +233,7 @@ private:
     String col_name;
     DataTypePtr data_type;
     ColumnCollectConfig config;
+    std::vector<String> sqls;
 };
 
 // ndv buckets extend contains count, ndv, block_ndv for each bucket
@@ -214,32 +255,43 @@ public:
     {
         col_name = col_desc.name;
         data_type = decayDataType(col_desc.type);
-        config = get_column_config(handler_context.settings, data_type);
+        config = getColumnConfig(handler_context.settings, data_type);
+        generateSqls();
     }
 
-    std::vector<String> getSqls() override
+    void generateSqls()
     {
         auto quote_col_name = backQuoteIfNeed(col_name);
         auto wrapped_col_name = getWrappedColumnName(config, quote_col_name);
 
         auto bounds_b64 = base64Encode(bucket_bounds->serialize());
 
-        auto block_value_sql = fmt::format(FMT_STRING("cityHash64({}, {})"), wrapped_col_name, virtual_mark_id);
         auto ndv_buckets_extend_sql
-            = fmt::format(FMT_STRING("ndv_buckets_extend('{}')({}, {})"), bounds_b64, wrapped_col_name, block_value_sql);
+            = fmt::format(FMT_STRING("ndv_buckets_extend('{}')({}, {})"), bounds_b64, wrapped_col_name, virtual_mark_id);
         // to estimate ndv
-        return {ndv_buckets_extend_sql};
+        sqls.emplace_back(ndv_buckets_extend_sql);
     }
 
-    size_t size() override { return 1; }
+    const std::vector<String> & getSqls() override { return sqls; }
 
     void parse(const Block & block, size_t index_offset) override
     {
-        auto ndv_buckets_extend_b64 = getSingleValue<std::string_view>(block, index_offset + 0);
+        auto ndv_buckets_extend_blob = getSingleValue<std::string_view>(block, index_offset + 0);
 
         double full_count = handler_context.full_count;
         double sample_row_count = handler_context.query_row_count.value_or(0);
+        // due to snapshot is not implemented,
+        // and we get full_count from first sql and sample_row_count from second sql
+        // there are possiblity that full_count < sample_row_count when insertion happens between them
+        // then sample_ratio > 1, leading to unexpected exception
+        // dirty hack this by assign full_count to sample_row_count when this case occurs
 
+        /// TODO: remove this hack when snapshot is ready
+        if (full_count < sample_row_count)
+        {
+            handler_context.full_count = sample_row_count;
+            full_count = sample_row_count;
+        }
 
         if (!handler_context.columns_data.count(col_name))
         {
@@ -247,8 +299,7 @@ public:
         }
 
         // write result to context
-        auto ndv_buckets_extend
-            = createStatisticsTyped<StatsNdvBucketsExtend>(StatisticsTag::NdvBucketsExtend, base64Decode(ndv_buckets_extend_b64));
+        auto ndv_buckets_extend = createStatisticsTyped<StatsNdvBucketsExtend>(StatisticsTag::NdvBucketsExtend, ndv_buckets_extend_blob);
         auto nonnull_counts = ndv_buckets_extend->getCounts();
         auto ndvs = ndv_buckets_extend->getNdvs();
         auto block_ndvs = ndv_buckets_extend->getBlockNdvs();
@@ -281,6 +332,7 @@ private:
     String col_name;
     DataTypePtr data_type;
     ColumnCollectConfig config;
+    std::vector<String> sqls;
 };
 
 
@@ -313,15 +365,26 @@ String constructThirdSql(
     const CollectorSettings & settings,
     const StatsTableIdentifier & table_info,
     const NameAndTypePair & col_desc,
-    const BucketBounds & bucket_bounds,
+    const std::shared_ptr<BucketBounds> & bucket_bounds,
     const String & sample_tail)
 {
     auto data_type = decayDataType(col_desc.type);
-    auto config = get_column_config(settings, data_type);
+    auto config = getColumnConfig(settings, data_type);
     auto wrapped_col_name = getWrappedColumnName(config, backQuoteIfNeed(col_desc.name));
-    auto bounds_b64 = base64Encode(bucket_bounds.serialize());
+    auto tag_sql = [&]() -> String {
+        if (bucket_bounds)
+        {
+            auto bounds_b64 = base64Encode(bucket_bounds->serialize());
+            return fmt::format(FMT_STRING("bucket_bounds_search('{}', {})"), bounds_b64, wrapped_col_name);
+        }
+        else
+        {
+            // when bucket_bounds not exists, possibly statistics_collect_histogram=false,
+            // we treat as if histogram has only one bucket, i.e., "group by 0"
+            return "0";
+        }
+    }();
 
-    auto tag_sql = fmt::format(FMT_STRING("bucket_bounds_search('{}', {})"), bounds_b64, wrapped_col_name);
     auto mark_sql = fmt::format(FMT_STRING("uniq(cityHash64({}))"), virtual_mark_id);
     auto inner_sql = fmt::format(
         FMT_STRING("select {} as __tmp_tag, {} as __tmp_mark_cnt, count(*) as __tmp_freq from {} {} group by {}"),
@@ -402,15 +465,17 @@ public:
         for (auto & col_desc : cols_desc)
         {
             auto & col_info = handler_context.columns_data.at(col_desc.name);
-            if (!col_info.ndv_value_opt.has_value())
+
+            // cannot handle col in second step whose total ndv is not reliable
+            if (!col_info.is_ndv_reliable)
             {
                 unhandled_cols.push_back(col_desc);
                 continue;
             }
 
-            auto ndv_value = col_info.ndv_value_opt.value();
+            auto ndv_value = col_info.ndv_value;
 
-            if (std::llround(ndv_value) >= 2)
+            if (std::llround(ndv_value) >= 2 && col_info.bucket_bounds)
             {
                 table_handler.registerHandler(
                     std::make_unique<SecondSampleColumnHandler>(handler_context, col_info.bucket_bounds, col_desc));
@@ -442,12 +507,14 @@ public:
         for (auto & col_desc : cols_desc)
         {
             auto & col_data = handler_context.columns_data.at(col_desc.name);
-            auto full_sql = constructThirdSql(handler_context.settings, table_info, col_desc, *col_data.bucket_bounds, getSampleTail());
+            auto full_sql = constructThirdSql(handler_context.settings, table_info, col_desc, col_data.bucket_bounds, getSampleTail());
             LOG_INFO(&Poco::Logger::get("thirdSampleColumnHandler"), full_sql);
             auto helper = SubqueryHelper::create(context, full_sql);
             Block block;
 
-            auto num_buckets = col_data.bucket_bounds->numBuckets();
+            // when bucket_bounds not exists, we will use 0 as bucket_id
+            // so there are always 1 buckets
+            auto num_buckets = col_data.bucket_bounds ? col_data.bucket_bounds->numBuckets() : 1;
             std::vector<double> sample_ndvs(num_buckets);
             std::vector<double> sample_block_ndvs(num_buckets);
             std::vector<double> sample_counts(num_buckets);
@@ -491,36 +558,65 @@ public:
             auto sample_nonnull_count = std::accumulate(sample_counts.begin(), sample_counts.end(), 0.0);
             auto sample_row_count = sample_nonnull_count + sample_null_count;
 
+            // due to snapshot is not implemented,
+            // and we get full_count from first sql and sample_row_count from second sql
+            // there are possiblity that full_count < sample_row_count when insertion happens between them
+            // then sample_ratio > 1, leading to unexpected exception
+            // dirty hack this by assign full_count to sample_row_count when this case occurs
+
+            /// TODO: remove this hack when snapshot is ready
+            if (full_count < sample_row_count)
+            {
+                handler_context.full_count = sample_row_count;
+                full_count = sample_row_count;
+            }
+
             {
                 // column level stats
                 auto sample_ndv = std::accumulate(sample_ndvs.begin(), sample_ndvs.end(), 0.0);
                 auto sample_block_ndv = std::accumulate(sample_block_ndvs.begin(), sample_block_ndvs.end(), 0.0);
                 col_data.nonnull_count = scaleCount(full_count, sample_row_count, sample_nonnull_count);
-                col_data.ndv_value_opt = scaleNdv(full_count, sample_row_count, sample_ndv, sample_block_ndv);
+                col_data.is_ndv_reliable = true;
+                col_data.ndv_value = scaleNdv(full_count, sample_row_count, sample_ndv, sample_block_ndv);
             }
 
-            std::vector<UInt64> res_counts(num_buckets);
-            std::vector<double> res_ndvs(num_buckets);
-            for (size_t index = 0; index < num_buckets; ++index)
+            if (col_data.bucket_bounds)
             {
-                res_counts[index] = std::llround(scaleCount(full_count, sample_row_count, sample_counts[index]));
-                res_ndvs[index] = scaleNdv(full_count, sample_row_count, sample_ndvs[index], sample_block_ndvs[index]);
+                std::vector<UInt64> res_counts(num_buckets);
+                std::vector<double> res_ndvs(num_buckets);
+                for (size_t index = 0; index < num_buckets; ++index)
+                {
+                    res_counts[index] = std::llround(scaleCount(full_count, sample_row_count, sample_counts[index]));
+                    res_ndvs[index] = scaleNdv(full_count, sample_row_count, sample_ndvs[index], sample_block_ndvs[index]);
+                }
+                col_data.ndv_buckets_result_opt
+                    = StatsNdvBucketsResult::create(*col_data.bucket_bounds, std::move(res_counts), std::move(res_ndvs));
             }
-            col_data.ndv_buckets_result_opt
-                = StatsNdvBucketsResult::create(*col_data.bucket_bounds, std::move(res_counts), std::move(res_ndvs));
         }
     }
 
     // exported symbol
-    void collect(const ColumnDescVector & cols_desc) override
+    void collect(const ColumnDescVector & all_cols_desc) override
     {
         // TODO: split them into several columns step
         collectTable();
 
-        firstCollectStep(cols_desc);
+        auto cols_desc_groups = split(all_cols_desc, context->getSettingsRef().statistics_batch_max_columns);
 
-        auto unhandled_cols = collectSecondStep(cols_desc);
-        collectThirdStep(unhandled_cols);
+        ColumnDescVector all_unhandled_cols;
+
+        for (auto & cols_desc_group : cols_desc_groups)
+        {
+            firstCollectStep(cols_desc_group);
+            auto unhandled_cols = collectSecondStep(cols_desc_group);
+            all_unhandled_cols.insert(all_unhandled_cols.end(), unhandled_cols.begin(), unhandled_cols.end());
+        }
+
+        auto unhandled_cols_groups = split(all_unhandled_cols, context->getSettingsRef().statistics_batch_max_columns);
+        for (auto & unhandled_cols_group : unhandled_cols_groups)
+        {
+            collectThirdStep(unhandled_cols_group);
+        }
     }
 
 private:

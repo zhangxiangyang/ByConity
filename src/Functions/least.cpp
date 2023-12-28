@@ -27,7 +27,7 @@ struct LeastBaseImpl
     {
         if (!left->getType()->isIntegerTy())
         {
-            /// Follows the IEEE-754 semantics for minNum, except for handling of signaling NaNs. This match’s the behavior of libc fmin.
+            /// Follows the IEEE-754 semantics for minNum, except for handling of signaling NaNs. This match's the behavior of libc fmin.
             return b.CreateMinNum(left, right);
         }
 
@@ -61,7 +61,7 @@ using LeastImpl = std::conditional_t<!NumberTraits::LeastGreatestSpecialCase<A, 
 struct NameLeast { static constexpr auto name = "least"; };
 using FunctionLeast = FunctionBinaryArithmetic<LeastImpl, NameLeast>;
 
-void registerFunctionLeast(FunctionFactory & factory)
+REGISTER_FUNCTION(Least)
 {
     factory.registerFunction<LeastGreatestOverloadResolver<LeastGreatest::Least, FunctionLeast>>(FunctionFactory::CaseInsensitive);
 }

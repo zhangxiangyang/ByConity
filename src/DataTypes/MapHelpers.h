@@ -83,10 +83,17 @@ String parseKeyNameFromImplicitColName(const String & implicit_col, const String
 // e.g. col.value --> col
 String parseMapNameFromImplicitKVName(const String & implicit_col);
 
+// Get map implicit column name from implicit file name
+// e.g __col__%27key%27.bin -> __col__'key'
+String parseImplicitColumnFromImplicitFileName(const String & implicit_file_name, const String & map_col);
+
 // Input parameter 'implicit_file_name' is from checksum, which has escaped by method escapeForFileName. For detail, please refer to ISerialization::getFileNameForStream.
 // In compact map version, all implicit columns are stored in the same file with different offsets, this method is extract the target file name which consist of map column name and extension.
 // e.g. __col1__%27key%27.bin --> col.bin, __col2__%27key%27.null.bin --> col2.null.bin
 String getMapFileNameFromImplicitFileName(const String & implicit_file_name);
+
+// Check if name contains map reserved keys, and return a name without the suffix
+std::pair<bool, String> mayBeMapKVReservedKeys(const String & name);
 
 bool isMapBaseFile(const String & file_name);
 
@@ -111,10 +118,5 @@ bool isMapImplicitDataFileNameNotBaseOfSpecialMapName(const String file_name, co
 // i.e. __col_base.bin, col -> true
 // i.e. __col__%271%27.mrk2, col -> true
 bool isMapImplicitFileNameOfSpecialMapName(const String file_name, const String map_col);
-
-/// For compact map type, check if it's the compacted file of target map column.
-// i.e. col.null.bin, co -> false(not belong to target map column)
-// i.e. col.bin, col -> true
-bool isMapCompactFileNameOfSpecialMapName(const String file_name, const String map_col);
 
 }

@@ -18,6 +18,7 @@
 #include <limits>
 #include <Disks/IDisk.h>
 #include <Disks/DiskType.h>
+#include <IO/HDFSRemoteFSReader.h>
 #include <Storages/HDFS/HDFSCommon.h>
 #include <Storages/HDFS/HDFSFileSystem.h>
 
@@ -70,8 +71,6 @@ public:
 
     virtual void replaceFile(const String& from_path, const String& to_path) override;
 
-    virtual void copy(const String & from_path, const std::shared_ptr<IDisk> & to_disk, const String & to_path) override;
-
     virtual void listFiles(const String & path, std::vector<String> & file_names) override;
 
     virtual std::unique_ptr<ReadBufferFromFileBase> readFile(
@@ -107,6 +106,9 @@ private:
     const String disk_path;
 
     HDFSConnectionParams hdfs_params;
+
+    std::shared_ptr<HDFSRemoteFSReaderOpts> pread_reader_opts;
+    std::shared_ptr<HDFSRemoteFSReaderOpts> read_reader_opts;
 
     HDFSFileSystem hdfs_fs;
 };

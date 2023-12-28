@@ -17,9 +17,10 @@
 
 #include <atomic>
 #include <filesystem>
+#include <Common/HashTable/Hash.h>
 #include <Storages/DiskCache/IDiskCache.h>
-#include <Storages/DiskCache/BucketLRUCache.h>
-#include <Storages/DiskCache/ShardCache.h>
+#include <Common/BucketLRUCache.h>
+#include <Common/ShardCache.h>
 #include <sys/types.h>
 #include <Poco/Logger.h>
 
@@ -66,20 +67,29 @@ class DiskCacheLRU: public IDiskCache
 public:
     using KeyType = UInt128;
 
-    DiskCacheLRU(Context & context_, const VolumePtr & volume, const DiskCacheSettings & settings);
+    DiskCacheLRU(
+        const String & name_,
+        const VolumePtr & volume,
+        const ThrottlerPtr & throttler,
+        const DiskCacheSettings & settings,
+        const IDiskCacheStrategyPtr & strategy_,
+        IDiskCache::DataType type_ = IDiskCache::DataType::ALL);
 
     void set(const String& seg_name, ReadBuffer& value, size_t weight_hint) override;
     std::pair<DiskPtr, String> get(const String& seg_name) override;
     void load() override;
+    size_t drop(const String & part_name) override;
 
     size_t getKeyCount() const override { return containers.count(); }
     size_t getCachedSize() const override { return containers.weight(); }
+    std::filesystem::path getRelativePath(const KeyType & key, const String & seg_name, const String & prefix = {}) { return getPath(key, latest_disk_cache_dir, seg_name, prefix);}
+
+    static std::filesystem::path getPath(const KeyType & key, const String & path, const String & seg_name, const String & prefix);
 
     /// for test
     static KeyType hash(const String & seg_name);
     static String hexKey(const KeyType & key);
     static std::optional<KeyType> unhexKey(const String & hex);
-    static std::filesystem::path getRelativePath(const KeyType & key);
 
 private:
     size_t writeSegment(const String& seg_name, ReadBuffer& buffer, ReservationPtr& reservation);
@@ -92,13 +102,14 @@ private:
     struct DiskIterator : private boost::noncopyable
     {
         explicit DiskIterator(
-            DiskCacheLRU & cache_, DiskPtr disk_, size_t worker_per_disk_, int min_depth_parallel_, int max_depth_parallel_);
+            const String & name_, DiskCacheLRU & cache_, DiskPtr disk_, size_t worker_per_disk_, int min_depth_parallel_, int max_depth_parallel_);
         virtual ~DiskIterator() = default;
 
-        void exec(std::filesystem::path entry_path);
+        virtual void exec(std::filesystem::path entry_path);
         virtual void iterateDirectory(std::filesystem::path rel_path, size_t depth);
         virtual void iterateFile(std::filesystem::path file_path, size_t file_size) = 0;
 
+        String name;
         // lifecycle shorter than disk cache
         DiskCacheLRU & disk_cache;
         DiskPtr disk;
@@ -114,7 +125,7 @@ private:
 
         std::unique_ptr<ThreadPool> pool;
         ExceptionHandler handler;
-        Poco::Logger * log {&Poco::Logger::get("DiskIterator")};
+        Poco::Logger * log;
     };
 
     /// Load from disk when Disk cache starts up
@@ -139,8 +150,19 @@ private:
         std::atomic_size_t total_migrated = 0;
     };
 
+    struct DiskCacheDeleter : DiskIterator
+    {
+        explicit DiskCacheDeleter(
+            DiskCacheLRU & cache_, DiskPtr disk_, size_t worker_per_disk, int min_depth_parallel, int max_depth_parallel);
+        ~DiskCacheDeleter() override;
+        void exec(std::filesystem::path entry_path) override;
+        void iterateFile(std::filesystem::path file_path, size_t file_size) override;
+
+        size_t delete_file_size {0};
+    };
+
     ThrottlerPtr set_rate_throttler;
-    Poco::Logger * log {&Poco::Logger::get("DiskCacheLRU")};
+    std::atomic<bool> is_droping{false};
     ShardCache<KeyType, UInt128Hash, BucketLRUCache<KeyType, DiskCacheMeta, UInt128Hash, DiskCacheWeightFunction>> containers;
 };
 

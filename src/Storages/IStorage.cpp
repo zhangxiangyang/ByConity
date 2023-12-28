@@ -49,6 +49,7 @@ namespace ErrorCodes
     extern const int PART_COLUMNS_NOT_FOUND_IN_TABLE_VERSIONS;
 }
 
+
 bool IStorage::isVirtualColumn(const String & column_name, const StorageMetadataPtr & metadata_snapshot) const
 {
     /// Virtual column maybe overridden by real column
@@ -186,7 +187,7 @@ void IStorage::alter(const AlterCommands & params, ContextPtr context, TableLock
     auto table_id = getStorageID();
     StorageInMemoryMetadata new_metadata = getInMemoryMetadata();
     params.apply(new_metadata, context);
-    DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(context, table_id, new_metadata);
+    DatabaseCatalog::instance().getDatabase(table_id.database_name, context)->alterTable(context, table_id, new_metadata);
     setInMemoryMetadata(new_metadata);
 }
 
@@ -255,21 +256,6 @@ NameDependencies IStorage::getDependentViewsByColumn(ContextPtr context) const
         }
     }
     return name_deps;
-}
-
-void IStorage::serialize(WriteBuffer & buf) const
-{
-    writeBinary(storage_id.database_name, buf);
-    writeBinary(storage_id.table_name, buf);
-}
-
-StoragePtr IStorage::deserialize(ReadBuffer & buf, const ContextPtr & context)
-{
-    String database_name;
-    String table_name;
-    readBinary(database_name, buf);
-    readBinary(table_name, buf);
-    return DatabaseCatalog::instance().getTable({database_name, table_name}, context);
 }
 
 NamesAndTypesListPtr IStorage::getPartColumns(const UInt64 &columns_commit_time) const

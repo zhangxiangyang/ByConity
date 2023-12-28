@@ -19,10 +19,13 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
+#include <algorithm>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
+#include <Storages/MergeTree/MergeTreePrefetchedReaderCNCH.h>
 #include <Interpreters/Context.h>
 #include <DataTypes/DataTypeFactory.h>
+#include "Core/Defines.h"
 
 namespace DB
 {
@@ -38,10 +41,11 @@ MergeTreeSequentialSource::MergeTreeSequentialSource(
     Names columns_to_read_,
     bool read_with_direct_io_,
     bool take_column_types_from_storage,
-    bool quiet)
+    bool quiet,
+    CnchMergePrefetcher::PartFutureFiles* future_files)
     : MergeTreeSequentialSource(storage_, metadata_snapshot_,
     data_part_, data_part_->getDeleteBitmap(), columns_to_read_, read_with_direct_io_,
-    take_column_types_from_storage, quiet) {}
+    take_column_types_from_storage, quiet, future_files) {}
 
 MergeTreeSequentialSource::MergeTreeSequentialSource(
     const MergeTreeMetaBase & storage_,
@@ -51,9 +55,11 @@ MergeTreeSequentialSource::MergeTreeSequentialSource(
     Names columns_to_read_,
     bool read_with_direct_io_,
     bool take_column_types_from_storage,
-    bool quiet)
+    bool quiet,
+    CnchMergePrefetcher::PartFutureFiles* future_files,
+    BitEngineReadType bitengine_read_type)
     : SourceWithProgress(metadata_snapshot_->getSampleBlockForColumns(
-            columns_to_read_, storage_.getVirtuals(), storage_.getStorageID()))
+            columns_to_read_, storage_.getVirtuals(), storage_.getStorageID(), bitengine_read_type))
     , storage(storage_)
     , metadata_snapshot(metadata_snapshot_)
     , data_part(std::move(data_part_))
@@ -67,16 +73,19 @@ MergeTreeSequentialSource::MergeTreeSequentialSource(
     addTotalRowsApprox(data_part->rows_count - num_deletes);
 
     /// Add columns because we don't want to read empty blocks
-    injectRequiredColumns(storage, metadata_snapshot, data_part, columns_to_read);
+    injectRequiredColumns(storage, metadata_snapshot, data_part, columns_to_read,
+        future_files == nullptr ? "" : future_files->getFixedInjectedColumn());
     NamesAndTypesList columns_for_reader;
     if (take_column_types_from_storage)
     {
         columns_for_reader = metadata_snapshot->getColumns().getByNames(ColumnsDescription::AllPhysical, columns_to_read, false);
+        if (bitengine_read_type != BitEngineReadType::ONLY_SOURCE)
+            columns_for_reader = columns_for_reader.addTypes(columns_for_reader.getNames(), bitengine_read_type);
     }
     else
     {
         /// take columns from data_part
-        columns_for_reader = data_part->getColumns().addTypes(columns_to_read);
+        columns_for_reader = data_part->getColumns().addTypes(columns_to_read, bitengine_read_type);
     }
 
     if (!quiet)
@@ -93,14 +102,31 @@ MergeTreeSequentialSource::MergeTreeSequentialSource(
     MergeTreeReaderSettings reader_settings =
     {
         /// bytes to use AIO (this is hack)
-        .min_bytes_to_use_direct_io = read_with_direct_io ? 1UL : std::numeric_limits<size_t>::max(),
-        .max_read_buffer_size = DBMS_DEFAULT_BUFFER_SIZE,
+        .read_settings = ReadSettings {
+            .buffer_size = DBMS_DEFAULT_BUFFER_SIZE,
+            .aio_threshold = read_with_direct_io ? 1UL : std::numeric_limits<size_t>::max(),
+        },
         .save_marks_in_cache = false,
+        .read_source_bitmap = true,
     };
 
-    reader = data_part->getReader(columns_for_reader, metadata_snapshot,
-        MarkRanges{MarkRange(0, data_part->getMarksCount())},
-        /* uncompressed_cache = */ nullptr, mark_cache.get(), reader_settings);
+    if (future_files)
+    {
+        /// need convert xx.xx to a subcolumn of nested column xx, this setting will be set at data_part->getReader()
+        reader_settings.convert_nested_to_subcolumns = true;
+
+        reader = std::make_unique<MergeTreePrefetchedReaderCNCH>(
+            data_part, columns_for_reader, metadata_snapshot, nullptr,
+            MarkRanges{MarkRange(0, data_part->getMarksCount())}, reader_settings,
+            future_files
+        );
+    }
+    else
+    {
+        reader = data_part->getReader(columns_for_reader, metadata_snapshot,
+            MarkRanges{MarkRange(0, data_part->getMarksCount())},
+            /* uncompressed_cache = */ nullptr, mark_cache.get(), reader_settings, nullptr, {}, {}, internal_progress_callback);
+    }
 }
 
 Chunk MergeTreeSequentialSource::generate()
@@ -114,7 +140,6 @@ try
         {
             current_row += data_part->index_granularity.getMarkRows(current_mark);
             current_mark++;
-            continue_reading = false;
         }
         if (current_mark >= marks_count)
         {
@@ -128,11 +153,12 @@ try
     if (!isCancelled() && current_row < data_part->rows_count)
     {
         size_t rows_to_read = data_part->index_granularity.getMarkRows(current_mark);
-        continue_reading = (current_mark != 0);
 
         const auto & sample = reader->getColumns();
         Columns columns(sample.size());
-        size_t rows_read = reader->readRows(current_mark, continue_reading, rows_to_read, columns);
+        size_t rows_read = reader->readRows(current_mark, data_part->getMarksCount(),
+            current_row - data_part->index_granularity.getMarkStartingRow(current_mark),
+            rows_to_read, columns);
 
         if (rows_read)
         {

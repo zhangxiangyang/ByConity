@@ -25,11 +25,13 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #include <Poco/Version.h>
 #include <Poco/Exception.h>
 
 #include <Common/StackTrace.h>
+#include <Common/WorkerId.h>
 
 #include <fmt/format.h>
 
@@ -38,6 +40,7 @@ namespace Poco { class Logger; }
 
 namespace DB
 {
+extern bool g_disable_abort_on_logical_error;
 
 void abortOnFailedAssertion(const String & description);
 
@@ -179,6 +182,9 @@ void tryLogCurrentException(Poco::Logger * logger, const std::string & start_of_
 void tryLogDebugCurrentException(const char * log_name, const std::string & start_of_message = "");
 void tryLogDebugCurrentException(Poco::Logger * logger, const std::string & start_of_message = "");
 
+void tryLogWarningCurrentException(const char * log_name, const std::string & start_of_message = "");
+void tryLogWarningCurrentException(Poco::Logger * logger, const std::string & start_of_message = "");
+
 /** Prints current exception in canonical format.
   * with_stacktrace - prints stack trace for DB::Exception.
   * check_embedded_stacktrace - if DB::Exception has embedded stacktrace then
@@ -248,10 +254,32 @@ class ExceptionHandler
 public:
     void setException(std::exception_ptr && exception);
     void throwIfException();
+    bool hasException() const;
+
+protected:
+    std::exception_ptr first_exception;
+    mutable std::mutex mutex;
+};
+
+class ExceptionHandlerWithFailedInfo : public ExceptionHandler
+{
+    using ErrorCode = int32_t;
+    using WorkerIdErrorCodeMap = std::unordered_map<DB::WorkerId, ErrorCode, DB::WorkerIdHash, DB::WorkerIdEqual>;
+
+public:
+    void addFailedRpc(const DB::WorkerId & worker_id, int32_t error_code)
+    {
+        std::unique_lock lock(mutex);
+        failed_rpc_info.emplace(worker_id, error_code);
+    }
+
+    const WorkerIdErrorCodeMap & getFailedRpcInfo() { return failed_rpc_info; }
 
 private:
-    std::exception_ptr first_exception;
-    std::mutex mutex;
+    WorkerIdErrorCodeMap failed_rpc_info;
 };
+
+using ExceptionHandlerWithFailedInfoPtr = std::shared_ptr<ExceptionHandlerWithFailedInfo>;
+using ExceptionHandlerPtr = std::shared_ptr<ExceptionHandler>;
 
 }

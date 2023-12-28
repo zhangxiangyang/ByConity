@@ -42,7 +42,8 @@ IMPLEMENT_SETTING_ENUM(LoadBalancing, ErrorCodes::UNKNOWN_LOAD_BALANCING,
      {"nearest_hostname", LoadBalancing::NEAREST_HOSTNAME},
      {"in_order",         LoadBalancing::IN_ORDER},
      {"first_or_random",  LoadBalancing::FIRST_OR_RANDOM},
-     {"round_robin",      LoadBalancing::ROUND_ROBIN}})
+     {"round_robin",      LoadBalancing::ROUND_ROBIN},
+     {"reverse_order",    LoadBalancing::REVERSE_ORDER}})
 
 
 IMPLEMENT_SETTING_ENUM(JoinStrictness, ErrorCodes::UNKNOWN_JOIN,
@@ -55,7 +56,10 @@ IMPLEMENT_SETTING_ENUM(JoinAlgorithm, ErrorCodes::UNKNOWN_JOIN,
     {{"auto",                 JoinAlgorithm::AUTO},
      {"hash",                 JoinAlgorithm::HASH},
      {"partial_merge",        JoinAlgorithm::PARTIAL_MERGE},
-     {"prefer_partial_merge", JoinAlgorithm::PREFER_PARTIAL_MERGE}})
+     {"prefer_partial_merge", JoinAlgorithm::PREFER_PARTIAL_MERGE},
+     {"nested_loop",          JoinAlgorithm::NESTED_LOOP_JOIN},
+     {"grace_hash",           JoinAlgorithm::GRACE_HASH},
+     {"parallel_hash",        JoinAlgorithm::PARALLEL_HASH}})
 
 
 IMPLEMENT_SETTING_ENUM(TotalsMode, ErrorCodes::UNKNOWN_TOTALS_MODE,
@@ -120,10 +124,10 @@ IMPLEMENT_SETTING_MULTI_ENUM(MySQLDataTypesSupport, ErrorCodes::UNKNOWN_MYSQL_DA
     {{"decimal",    MySQLDataTypesSupport::DECIMAL},
      {"datetime64", MySQLDataTypesSupport::DATETIME64}})
 
-IMPLEMENT_SETTING_ENUM(UnionMode, ErrorCodes::UNKNOWN_UNION,
-    {{"",         UnionMode::Unspecified},
-     {"ALL",      UnionMode::ALL},
-     {"DISTINCT", UnionMode::DISTINCT}})
+IMPLEMENT_SETTING_ENUM(SetOperationMode, ErrorCodes::UNKNOWN_UNION,
+    {{"",         SetOperationMode::Unspecified},
+     {"ALL",      SetOperationMode::ALL},
+     {"DISTINCT", SetOperationMode::DISTINCT}})
 
 IMPLEMENT_SETTING_ENUM(DistributedDDLOutputMode, ErrorCodes::BAD_ARGUMENTS,
     {{"none",         DistributedDDLOutputMode::NONE},
@@ -137,15 +141,38 @@ IMPLEMENT_SETTING_ENUM(HandleKafkaErrorMode, ErrorCodes::BAD_ARGUMENTS,
 
 IMPLEMENT_SETTING_ENUM(DialectType, ErrorCodes::BAD_ARGUMENTS,
     {{"CLICKHOUSE", DialectType::CLICKHOUSE},
-     {"ANSI",       DialectType::ANSI}})
+     {"ANSI",       DialectType::ANSI},
+     {"MYSQL",      DialectType::MYSQL}})
 
 IMPLEMENT_SETTING_ENUM(CTEMode, ErrorCodes::BAD_ARGUMENTS,
     {{"INLINED", CTEMode::INLINED},
      {"SHARED", CTEMode::SHARED},
-     {"AUTO", CTEMode::AUTO}})
+     {"AUTO", CTEMode::AUTO},
+     {"ENFORCED", CTEMode::ENFORCED}})
 
 IMPLEMENT_SETTING_ENUM(StatisticsAccurateSampleNdvMode, ErrorCodes::BAD_ARGUMENTS,
     {{"NEVER", StatisticsAccurateSampleNdvMode::NEVER},
      {"AUTO", StatisticsAccurateSampleNdvMode::AUTO},
      {"ALWAYS", StatisticsAccurateSampleNdvMode::ALWAYS}})
-}
+
+IMPLEMENT_SETTING_ENUM(DiskCacheMode, ErrorCodes::BAD_ARGUMENTS,
+    {{"AUTO", DiskCacheMode::AUTO},
+     {"USE_DISK_CACHE", DiskCacheMode::USE_DISK_CACHE},
+     {"SKIP_DISK_CACHE", DiskCacheMode::SKIP_DISK_CACHE},
+     {"FORCE_CHECKSUMS_DISK_CACHE", DiskCacheMode::FORCE_CHECKSUMS_DISK_CACHE},
+     {"FORCE_STEAL_DISK_CACHE", DiskCacheMode::FORCE_STEAL_DISK_CACHE}})
+
+IMPLEMENT_SETTING_ENUM(BackupVWMode, ErrorCodes::BAD_ARGUMENTS,
+    {{"backup", BackupVWMode::BACKUP},
+     {"round_robin", BackupVWMode::ROUND_ROBIN},
+     {"backup_only", BackupVWMode::BACKUP_ONLY}})
+
+IMPLEMENT_SETTING_ENUM(StatisticsCachePolicy, ErrorCodes::BAD_ARGUMENTS,
+    {{"default", StatisticsCachePolicy::Default},
+     {"cache", StatisticsCachePolicy::Cache},
+     {"catalog", StatisticsCachePolicy::Catalog}})
+
+IMPLEMENT_SETTING_ENUM(MaterializedViewConsistencyCheckMethod, ErrorCodes::BAD_ARGUMENTS,
+    {{"NONE", MaterializedViewConsistencyCheckMethod::NONE},
+     {"PARTITION", MaterializedViewConsistencyCheckMethod::PARTITION}})
+} // namespace DB

@@ -43,6 +43,9 @@ class MergeTreeData;
 struct StorageInMemoryMetadata;
 using StorageMetadataPtr = std::shared_ptr<const StorageInMemoryMetadata>;
 
+/// Push down where partition predicate to query info partition_filter
+void optimizePartitionPredicate(ASTPtr & query, StoragePtr storage, SelectQueryInfo & query_info, ContextPtr context);
+
 /** Identifies WHERE expressions that can be placed in PREWHERE by calculating respective
  *  sizes of columns used in particular expression and identifying "good" conditions of
  *  form "column_name = constant", where "constant" is outside some `threshold` specified in advance.
@@ -105,6 +108,10 @@ private:
 
     UInt64 getIdentifiersColumnSize(const NameSet & identifiers) const;
 
+    bool containsArraySetCheck(const ASTPtr & condition) const;
+
+    bool isArraySetCheck(const ASTPtr & condition, bool is_not = false) const;
+
     bool hasPrimaryKeyAtoms(const ASTPtr & ast) const;
 
     bool isPrimaryKeyAtom(const ASTPtr & ast) const;
@@ -137,6 +144,7 @@ private:
     UInt64 total_size_of_queried_columns = 0;
     NameSet array_joined_names;
     const StorageMetadataPtr & metadata_snapshot;
+    bool enable_ab_index_optimization;
 };
 
 

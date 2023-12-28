@@ -70,6 +70,7 @@ private:
 
     void restartReplicas(ContextMutablePtr system_context);
     void syncReplica(ASTSystemQuery & query);
+    void recalculateMetrics(ASTSystemQuery & query);
 
     void restoreReplica();
 
@@ -80,13 +81,17 @@ private:
 
     AccessRightsElements getRequiredAccessForDDLOnCluster() const;
     void startStopAction(StorageActionBlockType action_type, bool start);
-    void startOrStopConsume(ASTSystemQuery::Type type);
+    void controlConsume(ASTSystemQuery::Type type);
+    void resetConsumeOffset(ASTSystemQuery & query, ContextMutablePtr & system_context);
+
+    void executeMaterializedMyQLInCnchServer(const ASTSystemQuery & query);
 
     void executeMetastoreCmd(ASTSystemQuery & query) const;
-
+    void executeCleanTrashTable(const ASTSystemQuery & query);
+    void executeGc(const ASTSystemQuery & query);
     void executeDedup(const ASTSystemQuery & query);
 
-    void dumpCnchServerManagerStatus();
+    void dumpCnchServerStatus();
 
     void dropCnchPartCache(ASTSystemQuery & query);
 
@@ -108,6 +113,13 @@ private:
     void fetchParts(const ASTSystemQuery & query, const StorageID & table_id, ContextPtr local_context);
 
     void executeActionOnCNCHLog(const String & table, ASTSystemQuery::Type type);
+
+    void cleanTransaction(UInt64 txn_id);
+
+    void cleanFilesystemLock();
+
+    /// a command to test MemoryLock
+    void lockMemoryLock(const ASTSystemQuery & query, const StorageID & table_id, ContextPtr local_context);
 };
 
 

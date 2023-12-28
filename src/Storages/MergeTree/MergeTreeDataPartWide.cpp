@@ -71,8 +71,10 @@ IMergeTreeDataPart::MergeTreeReaderPtr MergeTreeDataPartWide::getReader(
     UncompressedCache * uncompressed_cache,
     MarkCache * mark_cache,
     const MergeTreeReaderSettings & reader_settings,
+    MergeTreeIndexExecutor * index_executor,
     const ValueSizeMap & avg_value_size_hints,
-    const ReadBufferFromFileBase::ProfileCallback & profile_callback) const
+    const ReadBufferFromFileBase::ProfileCallback & profile_callback,
+    [[maybe_unused]] const ProgressCallback & internal_progress_cb) const
 {
     auto new_settings = reader_settings;
     new_settings.convert_nested_to_subcolumns = true;
@@ -80,7 +82,7 @@ IMergeTreeDataPart::MergeTreeReaderPtr MergeTreeDataPartWide::getReader(
     auto ptr = std::static_pointer_cast<const MergeTreeDataPartWide>(shared_from_this());
     return std::make_unique<MergeTreeReaderWide>(
         ptr, columns_to_read, metadata_snapshot, uncompressed_cache,
-        mark_cache, mark_ranges, new_settings,
+        mark_cache, mark_ranges, new_settings, index_executor,
         avg_value_size_hints, profile_callback);
 }
 
@@ -90,12 +92,13 @@ IMergeTreeDataPart::MergeTreeWriterPtr MergeTreeDataPartWide::getWriter(
     const std::vector<MergeTreeIndexPtr> & indices_to_recalc,
     const CompressionCodecPtr & default_codec_,
     const MergeTreeWriterSettings & writer_settings,
-    const MergeTreeIndexGranularity & computed_index_granularity) const
+    const MergeTreeIndexGranularity & computed_index_granularity,
+    const BitmapBuildInfo & bitmap_build_info) const
 {
     return std::make_unique<MergeTreeDataPartWriterWide>(
         shared_from_this(), columns_list, metadata_snapshot, indices_to_recalc,
         index_granularity_info.marks_file_extension,
-        default_codec_, writer_settings, computed_index_granularity);
+        default_codec_, writer_settings, computed_index_granularity, bitmap_build_info);
 }
 
 
@@ -297,16 +300,8 @@ bool MergeTreeDataPartWide::hasColumnFiles(const NameAndTypePair & column) const
     {
         for (auto & [file, _] : getChecksums()->files)
         {
-            if (versions->enable_compact_map_data)
-            {
-                if (isMapCompactFileNameOfSpecialMapName(file, column.name))
-                    return true;
-            }
-            else
-            {
-                if (isMapImplicitFileNameOfSpecialMapName(file, column.name))
-                    return true;
-            }
+            if (isMapImplicitFileNameOfSpecialMapName(file, column.name))
+                return true;
         }
         return false;
     }
@@ -361,6 +356,11 @@ void MergeTreeDataPartWide::calculateEachColumnSizes(ColumnSizeByName & each_col
         }
 #endif
     }
+}
+
+bool MergeTreeDataPartWide::isStoredOnRemoteDisk() const
+{
+    return storage.isRemote();
 }
 
 }

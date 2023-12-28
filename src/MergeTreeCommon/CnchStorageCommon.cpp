@@ -33,6 +33,7 @@
 #include <Parsers/parseQuery.h>
 #include <Parsers/ParserCreateQuery.h>
 #include <Parsers/formatAST.h>
+#include <Common/StringUtils/StringUtils.h>
 #include <Core/Protocol.h>
 
 namespace DB
@@ -184,22 +185,20 @@ ASTs CnchStorageCommonHelper::getConditions(const ASTPtr & ast)
     return ret_conditions;
 }
 
-void CnchStorageCommonHelper::sendQueryPerShard(
+BlockInputStreamPtr CnchStorageCommonHelper::sendQueryPerShard(
     ContextPtr context,
     const String & query,
     const WorkerGroupHandleImpl::ShardInfo & shard_info,
     bool need_extended_profile_info)
 {
     Block empty_header{};
-    RemoteBlockInputStream remote_stream(shard_info.pool, query, empty_header, context);
-    remote_stream.setPoolMode(PoolMode::GET_ONE);
-    remote_stream.readPrefix();
-    while (Block block = remote_stream.read());
-    remote_stream.readSuffix();
+    std::shared_ptr<RemoteBlockInputStream> remote_stream = std::make_shared<RemoteBlockInputStream>(shard_info.pool, query, empty_header, context);
+    remote_stream->setPoolMode(PoolMode::GET_ONE);
 
     /// Get the extended profile info which is mainly for INSERT SELECT/INFILE
     if (need_extended_profile_info)
-        context->setExtendedProfileInfo(remote_stream.getExtendedProfileInfo());
+        context->setExtendedProfileInfo(remote_stream->getExtendedProfileInfo());
+    return remote_stream;
 }
 
 void CnchStorageCommonHelper::filterCondition(
@@ -306,13 +305,17 @@ String CnchStorageCommonHelper::getCreateQueryForCloudTable(
     const String & local_table_name,
     const ContextPtr & context,
     bool enable_staging_area,
-    const std::optional<StorageID> & cnch_storage_id) const
+    const std::optional<StorageID> & cnch_storage_id,
+    const Strings & engine_args,
+    const String & local_database_name) const
 {
     ParserCreateQuery parser;
     ASTPtr ast = parseQuery(parser, query.data(), query.data() + query.size(), "", 0, DBMS_DEFAULT_MAX_PARSER_DEPTH);
 
     auto & create_query = ast->as<ASTCreateQuery &>();
     create_query.table = local_table_name;
+    if (!local_database_name.empty())
+        create_query.database = local_database_name;
 
     auto * storage = create_query.storage;
 
@@ -321,20 +324,31 @@ String CnchStorageCommonHelper::getCreateQueryForCloudTable(
     engine->arguments = std::make_shared<ASTExpressionList>();
     engine->arguments->children.emplace_back(std::make_shared<ASTIdentifier>(cnch_storage_id.value_or(table_id).getDatabaseName()));
     engine->arguments->children.emplace_back(std::make_shared<ASTIdentifier>(cnch_storage_id.value_or(table_id).getTableName()));
+    if (!engine_args.empty())
+    {
+        for (const auto & arg : engine_args)
+        {
+            engine->arguments->children.emplace_back(std::make_shared<ASTIdentifier>(arg));
+        }
+    }
+    else if (storage->engine->arguments)
+    {
+        for (const auto & arg : storage->engine->arguments->children)
+        {
+            engine->arguments->children.push_back(arg);
+        }
+    }
 
-    /// NOTE: Used to pass the version column for unique table here.
-    if (storage->unique_key && storage->engine->arguments && !storage->engine->arguments->children.empty())
-        engine->arguments->children.push_back(storage->engine->arguments->children[0]);
     storage->set(storage->engine, engine);
 
-    if (engine->name == "CloudMergeTree")  /// table settings for *MergeTree engines
+    if (startsWith(engine->name, "Cloud"))  /// table settings for *MergeTree engines
     {
         modifyOrAddSetting(create_query, "cnch_temporary_table", Field(UInt64(1)));
 
         if (enable_staging_area)
             modifyOrAddSetting(create_query, "cloud_enable_staging_area", Field(UInt64(1)));
     }
-    else if(engine->name == "CnchHive")
+    else if(engine->name == "CnchHive" || engine->name == "CnchHDFS" || engine->name == "CnchS3")
     {
         modifyOrAddSetting(create_query, "cnch_temporary_table", Field(UInt64(1)));
     }
@@ -364,90 +378,25 @@ String CnchStorageCommonHelper::getCreateQueryForCloudTable(
     WriteBufferFromOwnString statement_buf;
     formatAST(create_query, statement_buf, false);
     writeChar('\n', statement_buf);
+    LOG_TRACE(
+        &Poco::Logger::get("getCreateQueryForCloudTable"), "create query for cloud table is {}", statement_buf.str());
     return statement_buf.str();
 }
 
-String CnchStorageCommonHelper::getCreateQueryForCloudTable(
-    const String & query,
-    const String & local_table_name,
-    const String & local_database_name,
-    const ContextPtr & context,
-    bool enable_staging_area,
-    const std::optional<StorageID> & cnch_storage_id) const
+bool CnchStorageCommonHelper::forwardQueryToServerIfNeeded(ContextPtr query_context, const StorageID & storage_id, const String & query_to_forward, bool need_process_entry) const
 {
-    ParserCreateQuery parser;
-    ASTPtr ast = parseQuery(parser, query.data(), query.data() + query.size(), "", 0, DBMS_DEFAULT_MAX_PARSER_DEPTH);
-
-    auto & create_query = ast->as<ASTCreateQuery &>();
-    create_query.table = local_table_name;
-    create_query.database = local_database_name;
-
-    auto * storage = create_query.storage;
-
-    auto engine = std::make_shared<ASTFunction>();
-    engine->name = storage->engine->name.replace(0, strlen("Cnch"), "Cloud");
-    engine->arguments = std::make_shared<ASTExpressionList>();
-    engine->arguments->children.emplace_back(std::make_shared<ASTIdentifier>(cnch_storage_id.value_or(table_id).getDatabaseName()));
-    engine->arguments->children.emplace_back(std::make_shared<ASTIdentifier>(cnch_storage_id.value_or(table_id).getTableName()));
-
-    /// NOTE: Used to pass the version column for unique table here.
-    if (storage->unique_key && storage->engine->arguments && !storage->engine->arguments->children.empty())
-        engine->arguments->children.push_back(storage->engine->arguments->children[0]);
-    storage->set(storage->engine, engine);
-
-    if (engine->name == "CloudMergeTree")  /// table settings for *MergeTree engines
-    {
-        modifyOrAddSetting(create_query, "cnch_temporary_table", Field(UInt64(1)));
-
-        if (enable_staging_area)
-            modifyOrAddSetting(create_query, "cloud_enable_staging_area", Field(UInt64(1)));
-    }
-    else if(engine->name == "CnchHive")
-    {
-        modifyOrAddSetting(create_query, "cnch_temporary_table", Field(UInt64(1)));
-    }
-
-    /// query settings
-    auto query_settings = std::make_shared<ASTSetQuery>();
-    query_settings->is_standalone = false;
-
-    if (context)
-        query_settings->changes = context->getSettingsRef().getChangedSettings();
-
-    if (create_query.settings_ast)
-    {
-        auto & settings_ast = create_query.settings_ast->as<ASTSetQuery &>();
-        if (!query_settings->changes.empty())
-        {
-            for (const auto & change: settings_ast.changes)
-                modifyOrAddSetting(*query_settings, change.name, std::move(change.value));
-        }
-        else
-            query_settings->changes = std::move(settings_ast.changes);
-    }
-
-    if (!query_settings->changes.empty())
-        create_query.setOrReplaceAST(create_query.settings_ast, query_settings);
-
-    WriteBufferFromOwnString statement_buf;
-    formatAST(create_query, statement_buf, false);
-    writeChar('\n', statement_buf);
-    return statement_buf.str();
-}
-
-bool CnchStorageCommonHelper::forwardQueryToServerIfNeeded(ContextPtr query_context, const UUID & storage_uuid) const
-{
-    auto host_port = query_context->getCnchTopologyMaster()->getTargetServer(UUIDHelpers::UUIDToString(storage_uuid), false);
+    if (query_context->getSettingsRef().force_execute_alter)
+        return false;
+    auto host_port = query_context->getCnchTopologyMaster()->getTargetServer(UUIDHelpers::UUIDToString(storage_id.uuid), storage_id.server_vw_name, false);
     if (isLocalServer(host_port.getRPCAddress(), std::to_string(query_context->getRPCPort())))
         return false;
 
     auto process_list_entry = query_context->getProcessListEntry().lock();
-    if (!process_list_entry)
+    if (!process_list_entry && need_process_entry)
         return false;
     // set current transaction as read_only to skip cleanTxn
     query_context->getCurrentTransaction()->setReadOnly(true);
     const auto & query_client_info = query_context->getClientInfo();
-    const auto query_status = process_list_entry->get().getInfo();
     auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithoutFailover(query_context->getSettingsRef());
     Connection connection(
         host_port.getHost(),
@@ -461,7 +410,12 @@ bool CnchStorageCommonHelper::forwardQueryToServerIfNeeded(ContextPtr query_cont
         Protocol::Compression::Disable,
         Protocol::Secure::Disable);
 
-    const String & query = query_status.query;
+    auto query = query_to_forward;
+    if (need_process_entry)
+    {
+        const auto query_status = process_list_entry->get().getInfo();
+        query = query_status.query;
+    }
     LOG_DEBUG(
         &Poco::Logger::get("CnchStorageCommonHelper"), "Send query `{}` to server {}", query, host_port.toDebugString());
     RemoteBlockInputStream stream(connection, query, {}, query_context);

@@ -55,10 +55,17 @@ ServerSelectPartsDecision selectPartsToMerge(
 
     size_t parts_selected_precondition = 0;
 
+    const auto & config = data.getContext()->getConfigRef();
+    size_t max_parts_to_break = config.getInt64("dance_merge_selector.max_parts_to_break", MERGE_MAX_PARTS_TO_BREAK);
+
     // split parts into buckets if current table is bucket table.
     std::unordered_map<Int64, ServerDataPartsVector> buckets;
     if (data.isBucketTable())
+    {
+        /// Do aggressive merge for bucket table. (try to merge all parts in the bucket to 1 part)
+        aggressive = true;
         groupPartsByBucketNumber(data, buckets, data_parts);
+    }
     else
         buckets.emplace(0, data_parts);
 
@@ -72,7 +79,9 @@ ServerSelectPartsDecision selectPartsToMerge(
         {
             const String & partition_id = part->info().partition_id;
 
-            if (!prev_partition_id || partition_id != *prev_partition_id)
+            if (!prev_partition_id
+                || partition_id != *prev_partition_id
+                || (!parts_ranges.empty() && parts_ranges.back().size() >= max_parts_to_break))
             {
                 if (parts_ranges.empty() || !parts_ranges.back().empty())
                     parts_ranges.emplace_back();
@@ -190,8 +199,7 @@ ServerSelectPartsDecision selectPartsToMerge(
     */
 
     std::unique_ptr<IMergeSelector> merge_selector;
-    const auto & config = data.getContext()->getConfigRef();
-    auto merge_selector_str = config.getString("merge_selector", "simple");
+    auto merge_selector_str = config.getString("merge_selector", "dance");
     if (merge_selector_str == "dance")
     {
         DanceMergeSelector::Settings merge_settings;
@@ -210,6 +218,7 @@ ServerSelectPartsDecision selectPartsToMerge(
         /// Override value from table settings
         merge_settings.max_parts_to_merge_at_once = data_settings->max_parts_to_merge_at_once;
         merge_settings.max_total_rows_to_merge = data_settings->cnch_merge_max_total_rows_to_merge;
+        merge_settings.enable_batch_select = enable_batch_select;
         if (aggressive)
             merge_settings.base = 1;
         merge_selector = std::make_unique<SimpleMergeSelector>(merge_settings);

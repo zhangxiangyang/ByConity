@@ -27,7 +27,7 @@
 namespace DB
 {
 
-void registerFunctionsHashing(FunctionFactory & factory)
+REGISTER_FUNCTION(Hashing)
 {
 #if USE_SSL
     factory.registerFunction<FunctionHalfMD5>();
@@ -39,6 +39,7 @@ void registerFunctionsHashing(FunctionFactory & factory)
     factory.registerFunction<FunctionSipHash64>();
     factory.registerFunction<FunctionSipHash128>();
     factory.registerFunction<FunctionCityHash64>();
+    factory.registerFunction<FunctionHiveCityHash64>();
     factory.registerFunction<FunctionFarmFingerprint64>();
     factory.registerFunction<FunctionFarmHash64>();
     factory.registerFunction<FunctionMetroHash64>();

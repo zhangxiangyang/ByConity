@@ -36,7 +36,7 @@
 #include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTWithAlias.h>
 #include <Parsers/ASTSerDerHelper.h>
-
+#include <Parsers/queryToString.h>
 
 namespace DB
 {
@@ -44,6 +44,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int UNEXPECTED_EXPRESSION;
+    extern const int UNEXPECTED_AST_STRUCTURE;
 }
 
 void ASTFunction::appendColumnNameImpl(WriteBuffer & ostr) const
@@ -96,6 +97,24 @@ void ASTFunction::appendColumnNameImpl(WriteBuffer & ostr) const
             window_definition->formatImpl(format_settings, state, frame);
             writeCString(")", ostr);
         }
+    }
+}
+
+void ASTFunction::finishFormatWithWindow(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
+{
+    if (!is_window_function)
+        return;
+
+    settings.ostr << " OVER ";
+    if (!window_name.empty())
+    {
+        settings.ostr << backQuoteIfNeed(window_name);
+    }
+    else
+    {
+        settings.ostr << "(";
+        window_definition->formatImpl(settings, state, frame);
+        settings.ostr << ")";
     }
 }
 
@@ -330,6 +349,8 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
                 "notIn",           " NOT IN ",
                 "globalIn",        " GLOBAL IN ",
                 "globalNotIn",     " GLOBAL NOT IN ",
+                "bitEquals",       " IS NOT DISTINCT FROM ",
+                "bitNotEquals",    " IS DISTINCT FROM ",
                 nullptr
             };
 
@@ -543,7 +564,7 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
 
     if (written)
     {
-        return;
+        return finishFormatWithWindow(settings, state, frame);
     }
 
     settings.ostr << (settings.hilite ? hilite_function : "") << name;
@@ -583,22 +604,7 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
 
     settings.ostr << (settings.hilite ? hilite_none : "");
 
-    if (!is_window_function)
-    {
-        return;
-    }
-
-    settings.ostr << " OVER ";
-    if (!window_name.empty())
-    {
-        settings.ostr << backQuoteIfNeed(window_name);
-    }
-    else
-    {
-        settings.ostr << "(";
-        window_definition->formatImpl(settings, state, frame);
-        settings.ostr << ")";
-    }
+    return finishFormatWithWindow(settings, state, frame);
 }
 
 void ASTFunction::serialize(WriteBuffer & buf) const
@@ -632,6 +638,35 @@ ASTPtr ASTFunction::deserialize(ReadBuffer & buf)
     auto function = std::make_shared<ASTFunction>();
     function->deserializeImpl(buf);
     return function;
+}
+
+String getFunctionName(const IAST * ast)
+{
+    String res;
+    if (tryGetFunctionNameInto(ast, res))
+        return res;
+    throw Exception(ast ? queryToString(*ast) + " is not an function" : "AST node is nullptr", ErrorCodes::UNEXPECTED_AST_STRUCTURE);
+}
+
+std::optional<String> tryGetFunctionName(const IAST * ast)
+{
+    String res;
+    if (tryGetFunctionNameInto(ast, res))
+        return res;
+    return {};
+}
+
+bool tryGetFunctionNameInto(const IAST * ast, String & name)
+{
+    if (ast)
+    {
+        if (const auto * node = ast->as<ASTFunction>())
+        {
+            name = node->name;
+            return true;
+        }
+    }
+    return false;
 }
 
 }

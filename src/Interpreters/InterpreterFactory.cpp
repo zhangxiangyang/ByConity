@@ -19,28 +19,34 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
+#include <Interpreters/Context.h>
+#include <Parsers/ASTAdviseQuery.h>
 #include <Parsers/ASTAlterQuery.h>
 #include <Parsers/ASTAlterWarehouseQuery.h>
 #include <Parsers/ASTCheckQuery.h>
 #include <Parsers/ASTCreateQuery.h>
-#include <Parsers/ASTCreateUserQuery.h>
-#include <Parsers/ASTCreateRoleQuery.h>
 #include <Parsers/ASTCreateQuotaQuery.h>
+#include <Parsers/ASTCreateRoleQuery.h>
 #include <Parsers/ASTCreateRowPolicyQuery.h>
 #include <Parsers/ASTCreateSettingsProfileQuery.h>
+#include <Parsers/ASTCreateUserQuery.h>
 #include <Parsers/ASTCreateWarehouseQuery.h>
 #include <Parsers/ASTCreateWorkerGroupQuery.h>
+#include <Parsers/ASTSQLBinding.h>
+#include <Parsers/ASTDeleteQuery.h>
 #include <Parsers/ASTDropAccessEntityQuery.h>
 #include <Parsers/ASTDropQuery.h>
-#include <Parsers/ASTUndropQuery.h>
 #include <Parsers/ASTDropWarehouseQuery.h>
 #include <Parsers/ASTDropWorkerGroupQuery.h>
+#include <Parsers/ASTExplainQuery.h>
+#include <Parsers/ASTGrantQuery.h>
 #include <Parsers/ASTInsertQuery.h>
 #include <Parsers/ASTKillQueryQuery.h>
 #include <Parsers/ASTOptimizeQuery.h>
 #include <Parsers/ASTRenameQuery.h>
-#include <Parsers/ASTSelectQuery.h>
+#include <Parsers/ASTReproduceQuery.h>
 #include <Parsers/ASTSelectIntersectExceptQuery.h>
+#include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTSetRoleQuery.h>
@@ -54,7 +60,7 @@
 #include <Parsers/ASTShowWarehousesQuery.h>
 #include <Parsers/ASTUseQuery.h>
 #include <Parsers/ASTExplainQuery.h>
-#include <Parsers/ASTDumpInfoQuery.h>
+#include <Parsers/ASTDumpQuery.h>
 #include <Parsers/ASTReproduceQuery.h>
 #include <Parsers/TablePropertiesQueriesASTs.h>
 #include <Parsers/ASTWatchQuery.h>
@@ -62,10 +68,11 @@
 #include <Parsers/MySQL/ASTCreateQuery.h>
 #include <Parsers/ASTRefreshQuery.h>
 #include <Parsers/ASTStatsQuery.h>
+#include <Parsers/ASTSwitchQuery.h>
+#include <Parsers/ASTUndropQuery.h>
+#include <Parsers/ASTUpdateQuery.h>
 
-#include <Interpreters/Context.h>
-#include <Interpreters/DistributedStages/InterpreterDistributedStages.h>
-
+#include <Interpreters/InterpreterAdviseQuery.h>
 #include <Interpreters/InterpreterAlterQuery.h>
 #include <Interpreters/InterpreterAlterWarehouseQuery.h>
 #include <Interpreters/InterpreterCheckQuery.h>
@@ -74,16 +81,18 @@
 #include <Interpreters/InterpreterCreateRoleQuery.h>
 #include <Interpreters/InterpreterCreateRowPolicyQuery.h>
 #include <Interpreters/InterpreterCreateSettingsProfileQuery.h>
+#include <Interpreters/InterpreterCreateSnapshotQuery.h>
 #include <Interpreters/InterpreterCreateUserQuery.h>
 #include <Interpreters/InterpreterCreateWarehouseQuery.h>
 #include <Interpreters/InterpreterCreateWorkerGroupQuery.h>
+#include <Interpreters/InterpreterDeleteQuery.h>
 #include <Interpreters/InterpreterDescribeQuery.h>
 #include <Interpreters/InterpreterDropAccessEntityQuery.h>
 #include <Interpreters/InterpreterDropWarehouseQuery.h>
 #include <Interpreters/InterpreterDropWorkerGroupQuery.h>
 #include <Interpreters/InterpreterDropQuery.h>
 #include <Interpreters/InterpreterUndropQuery.h>
-#include <Interpreters/InterpreterDumpInfoQueryUseOptimizer.h>
+#include <Interpreters/InterpreterDumpQuery.h>
 #include <Interpreters/InterpreterExistsQuery.h>
 #include <Interpreters/InterpreterExplainQuery.h>
 #include <Interpreters/InterpreterExternalDDLQuery.h>
@@ -94,9 +103,11 @@
 #include <Interpreters/InterpreterOptimizeQuery.h>
 #include <Interpreters/InterpreterRefreshQuery.h>
 #include <Interpreters/InterpreterRenameQuery.h>
+#include <Interpreters/InterpreterReproduceQuery.h>
 #include <Interpreters/InterpreterSelectQuery.h>
 #include <Interpreters/InterpreterSelectQueryUseOptimizer.h>
 #include <Interpreters/InterpreterSelectWithUnionQuery.h>
+#include <Interpreters/InterpreterSelectIntersectExceptQuery.h>
 #include <Interpreters/InterpreterSetQuery.h>
 #include <Interpreters/InterpreterSetRoleQuery.h>
 #include <Interpreters/InterpreterShowAccessEntitiesQuery.h>
@@ -109,21 +120,37 @@
 #include <Interpreters/InterpreterShowTablesQuery.h>
 #include <Interpreters/InterpreterShowWarehousesQuery.h>
 #include <Interpreters/InterpreterSystemQuery.h>
-#include <Interpreters/InterpreterReproduceQueryUseOptimizer.h>
+#include <Interpreters/InterpreterReproduceQuery.h>
 #include <Interpreters/InterpreterUseQuery.h>
 #include <Interpreters/InterpreterWatchQuery.h>
 #include <Interpreters/OpenTelemetrySpanLog.h>
+#include <Interpreters/InterpreterUpdateQuery.h>
 #include <Optimizer/QueryUseOptimizerChecker.h>
 #include <Interpreters/InterpreterCreateStatsQuery.h>
 #include <Interpreters/InterpreterDropStatsQuery.h>
 #include <Interpreters/InterpreterShowStatsQuery.h>
+#include <Interpreters/PlanSegmentHelper.h>
+#include <Parsers/ASTAlterDiskCacheQuery.h>
+#include <Interpreters/InterpreterAlterDiskCacheQuery.h>
+#include <Interpreters/InterpreterCreateBinding.h>
+#include <Interpreters/InterpreterShowBindings.h>
+#include <Interpreters/InterpreterDropBinding.h>
 
 #include <Parsers/ASTSystemQuery.h>
 
 #include <Databases/MySQL/MaterializeMySQLSyncThread.h>
 #include <Parsers/ASTExternalDDLQuery.h>
+#include "common/logger_useful.h"
 #include <Common/ProfileEvents.h>
 #include <Common/typeid_cast.h>
+#include "Interpreters/DistributedStages/PlanSegment.h"
+
+#include <Interpreters/InterpreterBeginQuery.h>
+#include <Interpreters/InterpreterCommitQuery.h>
+#include <Interpreters/InterpreterRollbackQuery.h>
+#include <Interpreters/InterpreterShowStatementsQuery.h>
+#include <Interpreters/InterpreterSwitchQuery.h>
+#include <Parsers/ASTTransaction.h>
 
 
 namespace ProfileEvents
@@ -149,19 +176,19 @@ std::unique_ptr<IInterpreter> InterpreterFactory::get(ASTPtr & query, ContextMut
 
     ProfileEvents::increment(ProfileEvents::Query);
 
+    // in ce, we will disable complex query without optimizer
+    /*
     DistributedStagesSettings distributed_stages_settings = InterpreterDistributedStages::extractDistributedStagesSettings(query, context);
 
     bool use_distributed_stages = (distributed_stages_settings.enable_distributed_stages) && !options.is_internal;
+    use_distributed_stages = use_distributed_stages && !context->getSettingsRef().enable_optimizer && PlanSegmentHelper::supportDistributedStages(query);
 
-    if (use_distributed_stages)
+    if (use_distributed_stages && context->getComplexQueryActive() && QueryUseOptimizerChecker::check(query, context, true))
     {
-        if (!context->getComplexQueryActive())
-            throw Exception("Server config missing exchange_status_port and exchange_port cannot execute query with enable_distributed_stages enabled",
-                            ErrorCodes::LOGICAL_ERROR);
-
         if (query->as<ASTSelectQuery>() || query->as<ASTSelectWithUnionQuery>())
-            return std::make_unique<InterpreterDistributedStages>(query, context);
+            return std::make_unique<InterpreterSelectQueryUseOptimizer>(query, context, options);
     }
+    */
 
     if (query->as<ASTSelectQuery>())
     {
@@ -185,17 +212,32 @@ std::unique_ptr<IInterpreter> InterpreterFactory::get(ASTPtr & query, ContextMut
         if (QueryUseOptimizerChecker::check(query, context)) {
             return std::make_unique<InterpreterSelectQueryUseOptimizer>(query, context, options);
         }
-        throw Exception("Intersect & except requires optimizer enabled.(SET enable_optimizer=1)", ErrorCodes::NOT_IMPLEMENTED);
+        return std::make_unique<InterpreterSelectIntersectExceptQuery>(query, context, options);
     }
     else if (query->as<ASTInsertQuery>())
     {
+        /// currently, the optimizer hasn't support insert select, call the check to force close optimizer.
+        QueryUseOptimizerChecker::check(query, context);
+
         ProfileEvents::increment(ProfileEvents::InsertQuery);
+        if (QueryUseOptimizerChecker::check(query, context))
+        {
+            return std::make_unique<InterpreterSelectQueryUseOptimizer>(query, context, options);
+        }
         bool allow_materialized = static_cast<bool>(context->getSettingsRef().insert_allow_materialized_columns);
         return std::make_unique<InterpreterInsertQuery>(query, context, allow_materialized);
+    }
+    else if (query->as<ASTUpdateQuery>())
+    {
+        return std::make_unique<InterpreterUpdateQuery>(query, context);
     }
     else if (query->as<ASTCreateQuery>())
     {
         return std::make_unique<InterpreterCreateQuery>(query, context);
+    }
+    else if (query->as<ASTCreateSnapshotQuery>())
+    {
+        return std::make_unique<InterpreterCreateSnapshotQuery>(query, context);
     }
     else if (query->as<ASTDropQuery>())
     {
@@ -216,6 +258,14 @@ std::unique_ptr<IInterpreter> InterpreterFactory::get(ASTPtr & query, ContextMut
     else if (query->as<ASTUseQuery>())
     {
         return std::make_unique<InterpreterUseQuery>(query, context);
+    }
+    else if (query->as<ASTSwitchQuery>())
+    {
+        return std::make_unique<InterpreterSwitchQuery>(query, context);
+    }
+    else if (query->as<ASTAdviseQuery>())
+    {
+        return std::make_unique<InterpreterAdviseQuery>(query, context);
     }
     else if (query->as<ASTSetQuery>())
     {
@@ -258,6 +308,14 @@ std::unique_ptr<IInterpreter> InterpreterFactory::get(ASTPtr & query, ContextMut
     {
         return std::make_unique<InterpreterShowCreateQuery>(query, context);
     }
+    else if (query->as<ASTShowCreateExternalCatalogQuery>())
+    {
+        return std::make_unique<InterpreterShowCreateQuery>(query, context);
+    }
+    else if (query->as<ASTShowCreateExternalTableQuery>())
+    {
+        return std::make_unique<InterpreterShowCreateQuery>(query, context);
+    }
     else if (query->as<ASTShowCreateDictionaryQuery>())
     {
         return std::make_unique<InterpreterShowCreateQuery>(query, context);
@@ -281,6 +339,10 @@ std::unique_ptr<IInterpreter> InterpreterFactory::get(ASTPtr & query, ContextMut
     else if (query->as<ASTCheckQuery>())
     {
         return std::make_unique<InterpreterCheckQuery>(query, context);
+    }
+    else if (query->as<ASTAlterDiskCacheQuery>())
+    {
+        return std::make_unique<InterpreterAlterDiskCacheQuery>(query, context);
     }
     else if (query->as<ASTKillQueryQuery>())
     {
@@ -386,18 +448,49 @@ std::unique_ptr<IInterpreter> InterpreterFactory::get(ASTPtr & query, ContextMut
     {
         return std::make_unique<InterpreterShowStatsQuery>(query, context);
     }
-    else if (query->as<ASTDumpInfoQuery>())
+    else if (query->as<ASTDumpQuery>())
     {
-        if (QueryUseOptimizerChecker::check(query, context))
-        {
-            return std::make_unique<InterpreterDumpInfoQueryUseOptimizer>(query, context);
-        }
-        else
-            throw Exception("Not support dump query, because it's optimizer check fail.", ErrorCodes::UNKNOWN_TYPE_OF_QUERY);
+        return std::make_unique<InterpreterDumpQuery>(query, context);
     }
     else if (query->as<ASTReproduceQuery>())
     {
-        return std::make_unique<InterpreterReproduceQueryUseOptimizer>(query, context);
+        return std::make_unique<InterpreterReproduceQuery>(query, context);
+    }
+    else if (query->as<ASTBeginQuery>())
+    {
+        return std::make_unique<InterpreterBeginQuery>(query, context);
+    }
+    else if (query->as<ASTBeginTransactionQuery>())
+    {
+        return std::make_unique<InterpreterBeginQuery>(query, context);
+    }
+    else if (query->as<ASTCommitQuery>())
+    {
+        return std::make_unique<InterpreterCommitQuery>(query, context);
+    }
+    else if (query->as<ASTRollbackQuery>())
+    {
+        return std::make_unique<InterpreterRollbackQuery>(query, context);
+    }
+    else if (query->as<ASTShowStatementsQuery>())
+    {
+        return std::make_unique<InterpreterShowStatementsQuery>(query, context);
+    }
+    else if (query->as<ASTDeleteQuery>())
+    {
+        return std::make_unique<InterpreterDeleteQuery>(query, context);
+    }
+    else if (query->as<ASTCreateBinding>())
+    {
+        return std::make_unique<InterpreterCreateBinding>(query, context);
+    }
+    else if (query->as<ASTShowBindings>())
+    {
+        return std::make_unique<InterpreterShowBindings>(query, context);
+    }
+    else if (query->as<ASTDropBinding>())
+    {
+        return std::make_unique<InterpreterDropBinding>(query, context);
     }
     else
     {

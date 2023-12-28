@@ -18,30 +18,21 @@
 #include <Optimizer/CardinalityEstimate/PlanNodeStatistics.h>
 #include <Optimizer/Cascades/CascadesOptimizer.h>
 #include <Optimizer/Rule/Patterns.h>
-#include <Parsers/ASTFunction.h>
 #include <QueryPlan/AggregatingStep.h>
-#include <QueryPlan/JoinStep.h>
 #include <QueryPlan/AnyStep.h>
+#include <QueryPlan/JoinStep.h>
 #include <QueryPlan/PlanNode.h>
 #include <QueryPlan/ProjectionStep.h>
 
 namespace DB
 {
-namespace
-{
-    // The filter factor of Y filter join X, used for early pruning.
-    constexpr double FILTER_FACTOR = 0.5;
-    // The filter source Y max allowed table scan size, used for early pruning.
-    constexpr uint32_t MAX_SEARCH_TREE_THRESHOLD = 4;
-}
-
 const std::vector<RuleType> & MagicSetRule::blockRules() const
 {
     static std::vector<RuleType> block{RuleType::MAGIC_SET_FOR_AGGREGATION, RuleType::MAGIC_SET_FOR_PROJECTION_AGGREGATION};
     return block;
 }
 
-static bool checkFilterFactor(
+static double getFilterFactor(
     const PlanNodeStatisticsPtr & source_statistics,
     const PlanNodeStatisticsPtr & filter_statistics,
     const Names & source_names,
@@ -57,7 +48,7 @@ static bool checkFilterFactor(
             filter_factor *= static_cast<double>(filter_name_statistic->getNdv()) / source_name_statistic->getNdv();
         }
     }
-    return filter_factor < FILTER_FACTOR;
+    return filter_factor;
 }
 
 PlanNodePtr MagicSetRule::buildMagicSetAsFilterJoin(
@@ -92,7 +83,7 @@ PlanNodePtr MagicSetRule::buildMagicSetAsFilterJoin(
         }
         filter_node = PlanNodeBase::createPlanNode(
             context->nextNodeId(),
-            std::make_shared<ProjectionStep>(DataStream{.header = names_and_types}, assignments, name_to_type),
+            std::make_shared<ProjectionStep>(DataStream{.header = names_and_types}, std::move(assignments), std::move(name_to_type)),
             PlanNodes{filter_node});
     }
 
@@ -109,7 +100,12 @@ PlanNodePtr MagicSetRule::buildMagicSetAsFilterJoin(
         filter_node = PlanNodeBase::createPlanNode(
             context->nextNodeId(),
             std::make_shared<AggregatingStep>(
-                filter_node->getStep()->getOutputStream(), reallocated_filter_names, AggregateDescriptions{}, GroupingSetsParamsList{}, true, GroupingDescriptions{}, false, false),
+                filter_node->getStep()->getOutputStream(),
+                reallocated_filter_names,
+                NameSet{},
+                AggregateDescriptions{},
+                GroupingSetsParamsList{},
+                true),
             PlanNodes{filter_node});
     }
 
@@ -120,6 +116,8 @@ PlanNodePtr MagicSetRule::buildMagicSetAsFilterJoin(
         source->getStep()->getOutputStream(),
         ASTTableJoin::Kind::Inner,
         ASTTableJoin::Strictness::All,
+        context->getSettingsRef().max_threads,
+        context->getSettingsRef().optimize_read_in_order,
         source_names,
         reallocated_filter_names);
     filter_join_step->setMagic(true);
@@ -130,10 +128,11 @@ PlanNodePtr MagicSetRule::buildMagicSetAsFilterJoin(
 PatternPtr MagicSetForProjectionAggregation::getPattern() const
 {
     return Patterns::join()
-        ->matchingStep<JoinStep>([&](const JoinStep & s) {
+        .matchingStep<JoinStep>([&](const JoinStep & s) {
             return (s.getKind() == ASTTableJoin::Kind::Inner || s.getKind() == ASTTableJoin::Kind::Right) && !s.isMagic();
         })
-        ->with({Patterns::project()->withSingle(Patterns::aggregating()->withSingle(Patterns::any())), Patterns::any()});
+        .with(Patterns::project().withSingle(Patterns::aggregating().withSingle(Patterns::any())), Patterns::any())
+        .result();
 }
 
 TransformResult MagicSetForProjectionAggregation::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
@@ -143,7 +142,9 @@ TransformResult MagicSetForProjectionAggregation::transformImpl(PlanNodePtr node
     auto magic_set_node = node->getChildren()[1];
     auto magic_set_group_id = dynamic_cast<const AnyStep &>(*magic_set_node->getStep().get()).getGroupId();
     auto magic_set_group = rule_context.optimization_context->getOptimizerContext().getMemo().getGroupById(magic_set_group_id);
-    if (magic_set_group->getMaxTableScans() > MAX_SEARCH_TREE_THRESHOLD)
+
+    auto & context = rule_context.context;
+    if (magic_set_group->getMaxTableScans() > context->getSettingsRef().magic_set_max_search_tree)
     {
         return {};
     }
@@ -151,17 +152,30 @@ TransformResult MagicSetForProjectionAggregation::transformImpl(PlanNodePtr node
     auto project_node = node->getChildren()[0];
     const auto & project_step = dynamic_cast<const ProjectionStep &>(*project_node->getStep());
 
-    auto target_agg_node = project_node->getChildren()[0];
-    const auto & target_agg_step = dynamic_cast<const AggregatingStep &>(*target_agg_node->getStep());
+    auto agg_node = project_node->getChildren()[0];
 
-    const auto & source_statistics = target_agg_node->getStatistics();
+    const auto & target_node = agg_node->getChildren()[0];
+    const auto & source_statistics = target_node->getStatistics();
     const auto & filter_statistics = magic_set_node->getStatistics();
-    if (!source_statistics || !filter_statistics || source_statistics.value()->getRowCount() <= filter_statistics.value()->getRowCount())
+
+    auto target_node_group_id = dynamic_cast<const AnyStep &>(*target_node->getStep().get()).getGroupId();
+    auto target_node_group = rule_context.optimization_context->getOptimizerContext().getMemo().getGroupById(target_node_group_id);
+    if (magic_set_group->getMaxTableScanRows() > target_node_group->getMaxTableScanRows() * context->getSettingsRef().magic_set_rows_factor)
     {
         return {};
     }
 
-    NameSet grouping_key{target_agg_step.getKeys().begin(), target_agg_step.getKeys().end()};
+    if (!source_statistics || !filter_statistics
+        || source_statistics.value()->getRowCount() * context->getSettingsRef().magic_set_rows_factor
+            <= filter_statistics.value()->getRowCount()
+        || source_statistics.value()->getRowCount() < context->getSettingsRef().magic_set_source_min_rows)
+    {
+        return {};
+    }
+
+    const auto & agg_step = dynamic_cast<const AggregatingStep &>(*agg_node->getStep());
+
+    NameSet grouping_key{agg_step.getKeys().begin(), agg_step.getKeys().end()};
     std::map<String, String> projection_mapping;
     for (const auto & assignment : project_step.getAssignments())
     {
@@ -189,20 +203,14 @@ TransformResult MagicSetForProjectionAggregation::transformImpl(PlanNodePtr node
     }
 
 
-    if (target_keys.empty())
+    if (getFilterFactor(source_statistics.value(), filter_statistics.value(), target_keys, filter_keys)
+        > context->getSettingsRef().magic_set_filter_factor)
     {
         return {};
     }
 
-    if (!checkFilterFactor(source_statistics.value(), filter_statistics.value(), target_keys, filter_keys))
-    {
-        return {};
-    }
 
-    auto & context = rule_context.context;
-
-    PlanNodePtr filter_join_node
-        = buildMagicSetAsFilterJoin(target_agg_node->getChildren()[0], magic_set_node, target_keys, filter_keys, context);
+    PlanNodePtr filter_join_node = buildMagicSetAsFilterJoin(target_node, magic_set_node, target_keys, filter_keys, context);
 
     return PlanNodeBase::createPlanNode(
         context->nextNodeId(),
@@ -212,7 +220,7 @@ TransformResult MagicSetForProjectionAggregation::transformImpl(PlanNodePtr node
                 context->nextNodeId(),
                 project_step.copy(context),
                 PlanNodes{
-                    PlanNodeBase::createPlanNode(context->nextNodeId(), target_agg_step.copy(context), PlanNodes{filter_join_node}),
+                    PlanNodeBase::createPlanNode(context->nextNodeId(), agg_step.copy(context), PlanNodes{filter_join_node}),
                 }),
             node->getChildren()[1]});
 }
@@ -220,10 +228,11 @@ TransformResult MagicSetForProjectionAggregation::transformImpl(PlanNodePtr node
 PatternPtr MagicSetForAggregation::getPattern() const
 {
     return Patterns::join()
-        ->matchingStep<JoinStep>([&](const JoinStep & s) {
+        .matchingStep<JoinStep>([&](const JoinStep & s) {
             return (s.getKind() == ASTTableJoin::Kind::Inner || s.getKind() == ASTTableJoin::Kind::Right) && !s.isMagic();
         })
-        ->with({Patterns::aggregating()->withSingle(Patterns::any()), Patterns::any()});
+        .with(Patterns::aggregating().withSingle(Patterns::any()), Patterns::any())
+        .result();
 }
 
 TransformResult MagicSetForAggregation::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
@@ -233,22 +242,36 @@ TransformResult MagicSetForAggregation::transformImpl(PlanNodePtr node, const Ca
     auto magic_set_node = node->getChildren()[1];
     auto magic_set_group_id = dynamic_cast<const AnyStep &>(*magic_set_node->getStep().get()).getGroupId();
     auto magic_set_group = rule_context.optimization_context->getOptimizerContext().getMemo().getGroupById(magic_set_group_id);
-    if (magic_set_group->getMaxTableScans() > MAX_SEARCH_TREE_THRESHOLD)
+
+    auto & context = rule_context.context;
+    if (magic_set_group->getMaxTableScans() > context->getSettingsRef().magic_set_max_search_tree)
     {
         return {};
     }
 
-    auto target_agg_node = node->getChildren()[0];
-    const auto & target_agg_step = dynamic_cast<const AggregatingStep &>(*target_agg_node->getStep().get());
+    auto agg_node = node->getChildren()[0];
 
-    const auto & source_statistics = target_agg_node->getStatistics();
+    auto target_node = agg_node->getChildren()[0];
+    auto target_node_group_id = dynamic_cast<const AnyStep &>(*target_node->getStep().get()).getGroupId();
+    auto target_node_group = rule_context.optimization_context->getOptimizerContext().getMemo().getGroupById(target_node_group_id);
+    if (magic_set_group->getMaxTableScanRows() > target_node_group->getMaxTableScanRows() * context->getSettingsRef().magic_set_rows_factor)
+    {
+        return {};
+    }
+
+    const auto & source_statistics = target_node->getStatistics();
     const auto & filter_statistics = magic_set_node->getStatistics();
-    if (!source_statistics || !filter_statistics || source_statistics.value()->getRowCount() <= filter_statistics.value()->getRowCount())
+    if (!source_statistics || !filter_statistics
+        || source_statistics.value()->getRowCount() * context->getSettingsRef().magic_set_rows_factor
+            <= filter_statistics.value()->getRowCount()
+        || source_statistics.value()->getRowCount() < context->getSettingsRef().magic_set_source_min_rows)
     {
         return {};
     }
 
-    NameSet grouping_key{target_agg_step.getKeys().begin(), target_agg_step.getKeys().end()};
+    const auto & agg_step = dynamic_cast<const AggregatingStep &>(*agg_node->getStep().get());
+
+    NameSet grouping_key{agg_step.getKeys().begin(), agg_step.getKeys().end()};
     std::vector<String> target_keys;
     std::vector<String> filter_keys;
     for (auto left_key = join_step.getLeftKeys().begin(), right_key = join_step.getRightKeys().begin();
@@ -268,22 +291,111 @@ TransformResult MagicSetForAggregation::transformImpl(PlanNodePtr node, const Ca
         return {};
     }
 
-    if (!checkFilterFactor(source_statistics.value(), filter_statistics.value(), target_keys, filter_keys))
+    if (getFilterFactor(source_statistics.value(), filter_statistics.value(), target_keys, filter_keys)
+        > context->getSettingsRef().magic_set_filter_factor)
     {
         return {};
     }
 
-    auto context = rule_context.context;
-
-    PlanNodePtr filter_join_node
-        = buildMagicSetAsFilterJoin(target_agg_node->getChildren()[0], magic_set_node, target_keys, filter_keys, context);
+    PlanNodePtr filter_join_node = buildMagicSetAsFilterJoin(target_node, magic_set_node, target_keys, filter_keys, context);
 
     return PlanNodeBase::createPlanNode(
         context->nextNodeId(),
         join_step.copy(context),
         PlanNodes{
-            PlanNodeBase::createPlanNode(context->nextNodeId(), target_agg_step.copy(context), PlanNodes{filter_join_node}),
+            PlanNodeBase::createPlanNode(context->nextNodeId(), agg_step.copy(context), PlanNodes{filter_join_node}),
             node->getChildren()[1]});
 }
 
+// PatternPtr MagicSetForJoinAggregation::getPattern() const
+// {
+//     return Patterns::join()
+//         .matchingStep<JoinStep>([&](const JoinStep & s) { return s.supportReorder(false, false); })
+//         .with(Patterns::aggregating().withSingle(Patterns::any()), Patterns::join().matchingStep<JoinStep>([&](const JoinStep & s) {
+//             return s.supportReorder(false, false);
+//         }))
+//         .result();
+// }
+
+// TransformResult MagicSetForJoinAggregation::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
+// {
+//     const auto & join_step = dynamic_cast<const JoinStep &>(*node->getStep());
+//     const auto & down_join_step = dynamic_cast<const JoinStep &>(*node->getChildren()[1]->getStep());
+
+//     auto magic_set_node = node->getChildren()[1]->getChildren()[0];
+//     auto magic_set_group_id = dynamic_cast<const AnyStep &>(*magic_set_node->getStep().get()).getGroupId();
+//     auto magic_set_group = rule_context.optimization_context->getOptimizerContext().getMemo().getGroupById(magic_set_group_id);
+//     if (magic_set_group->getMaxTableScans() > MAX_SEARCH_TREE_THRESHOLD)
+//     {
+//         return {};
+//     }
+
+//     auto agg_node = node->getChildren()[0];
+//     auto target_node = agg_node->getChildren()[0];
+
+//     const auto & source_statistics = target_node->getStatistics();
+//     const auto & filter_statistics = magic_set_node->getStatistics();
+//     if (!source_statistics || !filter_statistics
+//        || source_statistics.value()->getRowCount() * context->getSettingsRef().magic_set_rows_factor
+//            <= filter_statistics.value()->getRowCount()
+//        || source_statistics.value()->getRowCount() < context->getSettingsRef().magic_set_source_min_rows)
+//     {
+//         return {};
+//     }
+
+//     const auto & agg_step = dynamic_cast<const AggregatingStep &>(*agg_node->getStep().get());
+//
+//     NameSet grouping_key{target_agg_step.getKeys().begin(), target_agg_step.getKeys().end()};
+//     std::vector<String> target_keys;
+//     std::vector<String> filter_keys;
+//     for (auto left_key = join_step.getLeftKeys().begin(), right_key = join_step.getRightKeys().begin();
+//          left_key != join_step.getLeftKeys().end();
+//          ++left_key, ++right_key)
+//     {
+//         if (!grouping_key.contains(*left_key))
+//         {
+//             continue;
+//         }
+//         target_keys.emplace_back(*left_key);
+//         filter_keys.emplace_back(*right_key);
+//     }
+
+//     if (target_keys.empty())
+//     {
+//         return {};
+//     }
+
+//     if (getFilterFactor(source_statistics.value(), filter_statistics.value(), target_keys, filter_keys)
+//         > context->getSettingsRef().magic_set_filter_factor)
+//     {
+//         return {};
+//     }
+
+//     auto context = rule_context.context;
+
+//     PlanNodePtr filter_join_node
+//         = buildMagicSetAsFilterJoin(target_node, magic_set_node, target_keys, filter_keys, context);
+
+
+//     Names left_keys;
+//     Names right_keys;
+//         for (auto left_key = join_step.getLeftKeys().begin(), right_key = join_step.getRightKeys().begin();
+//          left_key != join_step.getLeftKeys().end();
+//          ++left_key, ++right_key)
+//     {
+//         if (!grouping_key.contains(*left_key))
+//         {
+//             continue;
+//         }
+//         target_keys.emplace_back(*left_key);
+//         filter_keys.emplace_back(*right_key);
+//     }
+
+//     return PlanNodeBase::createPlanNode(
+//         context->nextNodeId(),
+//         join_step.copy(context),
+//         PlanNodes{
+//             PlanNodeBase::createPlanNode(context->nextNodeId(), agg_step.copy(context), PlanNodes{filter_join_node}),
+//             node->getChildren()[1]});
+// }
 }

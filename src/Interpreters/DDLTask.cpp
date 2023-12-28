@@ -28,6 +28,7 @@
 #include <IO/ReadBufferFromString.h>
 #include <Poco/Net/NetException.h>
 #include <common/logger_useful.h>
+#include "Interpreters/Context_fwd.h"
 #include <Parsers/ParserQuery.h>
 #include <Parsers/parseQuery.h>
 #include <Parsers/ASTQueryWithOnCluster.h>
@@ -161,7 +162,7 @@ void DDLTaskBase::parseQueryFromEntry(ContextPtr context)
     const char * begin = entry.query.data();
     const char * end = begin + entry.query.size();
 
-    ParserQuery parser_query(end, ParserSettings::valueOf(context->getSettingsRef().dialect_type));
+    ParserQuery parser_query(end, ParserSettings::valueOf(context->getSettingsRef()));
     String description;
     query = parseQuery(parser_query, begin, end, description, 0, context->getSettingsRef().max_parser_depth);
 }
@@ -429,9 +430,9 @@ void ZooKeeperMetadataTransaction::commit()
     state = COMMITTED;
 }
 
-ClusterPtr tryGetReplicatedDatabaseCluster(const String & cluster_name)
+ClusterPtr tryGetReplicatedDatabaseCluster(const String & cluster_name, ContextPtr context)
 {
-    if (const auto * replicated_db = dynamic_cast<const DatabaseReplicated *>(DatabaseCatalog::instance().tryGetDatabase(cluster_name).get()))
+    if (const auto * replicated_db = dynamic_cast<const DatabaseReplicated *>(DatabaseCatalog::instance().tryGetDatabase(cluster_name, context).get()))
         return replicated_db->getCluster();
     return {};
 }

@@ -369,7 +369,18 @@ bool HTTPHandler::authenticateUser(
         if (!basic_credentials)
             throw Exception("Invalid authentication: unexpected 'Basic' HTTP Authorization scheme", ErrorCodes::AUTHENTICATION_FAILED);
 
-        basic_credentials->setUserName(user);
+        if (auto pos = user.find('`'); pos != String::npos)
+        {
+            auto tenant_id_from_user = String(user.c_str(), pos);
+            context->setSetting("tenant_id", tenant_id_from_user);
+            context->setTenantId(tenant_id_from_user);
+            if (user.substr(pos + 1) == "default")
+                user = user.substr(pos + 1);
+            else
+                user[pos] = '.';
+        }
+
+        basic_credentials->setUserName(user); // add tenant_id to user here
         basic_credentials->setPassword(password);
     }
     else
@@ -728,7 +739,28 @@ void HTTPHandler::processQuery(
     }
 
     if (!database.empty())
-        context->setCurrentDatabase(database);
+    {
+        auto &default_database = database;
+        auto &connection_context = context;
+        //CNCH multi-tenant default database pattern from gateway client: {tenant_id}`{default_database}
+        if (auto pos = default_database.find('`'); pos != String::npos)
+        {
+            settings_changes.push_back({"tenant_id", String(default_database.c_str(), pos)});
+            connection_context->setTenantId(String(default_database.c_str(), pos));
+            if (pos + 1 != default_database.size())  ///multi-tenant default database storage pattern: {tenant_id}.{default_database}
+            {
+                auto sub_str = default_database.substr(pos + 1);
+                if (sub_str == "default" || sub_str == "system")
+                    default_database = std::move(sub_str);
+                else
+                    default_database[pos] = '.';
+            }
+            else                                     /// {tenant_id}`
+                default_database.clear();
+        }
+        if (!default_database.empty())
+            connection_context->setCurrentDatabase(default_database);
+    }
 
     if (!default_format.empty())
         context->setDefaultFormat(default_format);
@@ -804,6 +836,11 @@ void HTTPHandler::processQuery(
     {
         /// TODO: set Content-Length if possible
         pushDelayedResults(used_output);
+    }
+
+    if (context->isAsyncMode())
+    {
+        context->waitReadFromClientFinished();
     }
 
     /// Send HTTP headers with code 200 if no exception happened and the data is still not sent to

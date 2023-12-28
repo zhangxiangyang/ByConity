@@ -34,6 +34,8 @@ namespace DB
 {
 
 class ASTAlterCommand;
+class IDatabase;
+using DatabasePtr = std::shared_ptr<IDatabase>;
 
 /// Operation from the ALTER query (except for manipulation with PART/PARTITION).
 /// Adding Nested columns is not expanded to add individual columns.
@@ -57,6 +59,10 @@ struct AlterCommand
         DROP_INDEX,
         ADD_CONSTRAINT,
         DROP_CONSTRAINT,
+        ADD_FOREIGN_KEY,
+        DROP_FOREIGN_KEY,
+        ADD_UNIQUE_NOT_ENFORCED,
+        DROP_UNIQUE_NOT_ENFORCED,
         ADD_PROJECTION,
         DROP_PROJECTION,
         MODIFY_TTL,
@@ -66,6 +72,9 @@ struct AlterCommand
         RENAME_COLUMN,
         REMOVE_TTL,
         CLEAR_MAP_KEY,
+        MATERIALIZE_PROJECTION,
+        CHANGE_ENGINE,
+        MODIFY_DATABASE_SETTING,
     };
 
     /// Which property user wants to remove from column
@@ -136,6 +145,18 @@ struct AlterCommand
     // For ADD/DROP CONSTRAINT
     String constraint_name;
 
+    // For ADD FOREIGN KEY
+    ASTPtr foreign_key_decl = nullptr;
+
+    // FOR ADD/DROP FOREIGN_KEY
+    String foreign_key_name;
+
+    // For ADD UNIQUE NOT ENFORCED
+    ASTPtr unique_not_enforced_decl = nullptr;
+
+    // FOR ADD/DROP UNIQUE NOT ENFORCED
+    String unique_not_enforced_name;
+
     /// For ADD PROJECTION
     ASTPtr projection_decl = nullptr;
     String after_projection_name;
@@ -169,6 +190,9 @@ struct AlterCommand
 
     /// For CLEAR MAP KEYS
     ASTPtr map_keys;
+
+    /// For change engine
+    ASTPtr engine;
 
     /// What to remove from column (or TTL)
     RemoveProperty to_remove = RemoveProperty::NO_PROPERTY;

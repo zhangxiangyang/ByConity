@@ -32,7 +32,15 @@
 #include <Storages/MergeTree/MergeTreeDataPartWide.h>
 #include <Common/escapeForFileName.h>
 #include <Common/typeid_cast.h>
+#include <Common/ProfileEventsTimer.h>
+#include <unordered_map>
 #include <utility>
+
+namespace ProfileEvents
+{
+    extern const Event SkipRowsTimeMicro;
+    extern const Event ReadRowsTimeMicro;
+}
 
 namespace DB
 {
@@ -48,16 +56,18 @@ namespace ErrorCodes
 }
 
 MergeTreeReaderWide::MergeTreeReaderWide(
-    DataPartWidePtr data_part_,
+    MergeTreeMetaBase::DataPartPtr data_part_,
     NamesAndTypesList columns_,
     const StorageMetadataPtr & metadata_snapshot_,
     UncompressedCache * uncompressed_cache_,
     MarkCache * mark_cache_,
     MarkRanges mark_ranges_,
     MergeTreeReaderSettings settings_,
+    MergeTreeIndexExecutor * index_executor_,
     IMergeTreeDataPart::ValueSizeMap avg_value_size_hints_,
     const ReadBufferFromFileBase::ProfileCallback & profile_callback_,
-    clockid_t clock_type_)
+    clockid_t clock_type_,
+    bool create_streams_)
     : IMergeTreeReader(
         std::move(data_part_),
         std::move(columns_),
@@ -66,8 +76,14 @@ MergeTreeReaderWide::MergeTreeReaderWide(
         std::move(mark_cache_),
         std::move(mark_ranges_),
         std::move(settings_),
-        std::move(avg_value_size_hints_))
+        std::move(avg_value_size_hints_),
+        index_executor_)
 {
+    if (!create_streams_)
+    {
+        return;
+    }
+
     try
     {
         for (const NameAndTypePair & column : columns)
@@ -112,7 +128,8 @@ MergeTreeReaderWide::MergeTreeReaderWide(
             }
         }
 
-        if (!dup_implicit_keys.empty()) names = columns.getNames();
+        if (!dup_implicit_keys.empty())
+            names = columns.getNames();
     }
     catch (...)
     {
@@ -121,12 +138,9 @@ MergeTreeReaderWide::MergeTreeReaderWide(
     }
 }
 
-size_t MergeTreeReaderWide::readRows(size_t from_mark, bool continue_reading, size_t max_rows_to_read, Columns & res_columns)
+size_t MergeTreeReaderWide::readRows(size_t from_mark, size_t current_task_last_mark, size_t from_row,
+    size_t max_rows_to_read, Columns& res_columns)
 {
-    if (!continue_reading)
-        next_row_number_to_read = data_part->index_granularity.getMarkStartingRow(from_mark);
-
-    size_t read_rows = 0;
     try
     {
         size_t num_columns = columns.size();
@@ -140,89 +154,38 @@ size_t MergeTreeReaderWide::readRows(size_t from_mark, bool continue_reading, si
             res_col_to_idx[name] = i;
         }
 
-        auto sort_columns = columns;
+        sort_columns = columns;
         if (!dup_implicit_keys.empty())
             sort_columns.sort([](const auto & lhs, const auto & rhs) { return (!lhs.type->isMap()) && rhs.type->isMap(); });
 
-        /// Pointers to offset columns that are common to the nested data structure columns.
-        /// If append is true, then the value will be equal to nullptr and will be used only to
-        /// check that the offsets column has been already read.
-        OffsetColumns offset_columns;
-        std::unordered_map<String, ISerialization::SubstreamsCache> caches;
+        size_t from_mark_start_row = data_part->index_granularity.getMarkStartingRow(
+            from_mark);
+        size_t starting_row = from_mark_start_row + from_row;
+        size_t init_row_number = next_row_number_to_read;
+        bool adjacent_reading = next_row_number_to_read >= from_mark_start_row
+            && starting_row >= next_row_number_to_read;
+        size_t rows_to_skip = adjacent_reading ? starting_row - next_row_number_to_read
+            : from_row;
 
-        int row_number_column_pos = -1;
-        auto name_and_type = sort_columns.begin();
-        for (size_t i = 0; i < num_columns; ++i, ++name_and_type)
+        if (!adjacent_reading)
         {
-            auto column_from_part = getColumnFromPart(*name_and_type);
-            const auto & [name, type] = column_from_part;
-            size_t pos = res_col_to_idx[name];
-
-            /// The column is already present in the block so we will append the values to the end.
-            bool append = res_columns[pos] != nullptr;
-            if (!append)
-                res_columns[pos] = type->createColumn();
-
-            /// row number column will be populated at last after `read_rows` is set
-            if (name == "_part_row_number")
-            {
-                row_number_column_pos = pos;
-                continue;
-            }
-
-            auto & column = res_columns[pos];
-            try
-            {
-                size_t column_size_before_reading = column->size();
-                auto & cache = caches[column_from_part.getNameInStorage()];
-                if (type->isMap() && !type->isMapKVStore())
-                    readMapDataNotKV(
-                        column_from_part, column, from_mark, continue_reading, max_rows_to_read, caches, res_col_to_idx, res_columns);
-                else
-                    readData(column_from_part, column, from_mark, continue_reading, max_rows_to_read, cache);
-
-                /// For elements of Nested, column_size_before_reading may be greater than column size
-                ///  if offsets are not empty and were already read, but elements are empty.
-                if (!column->empty())
-                    read_rows = std::max(read_rows, column->size() - column_size_before_reading);
-            }
-            catch (Exception & e)
-            {
-                /// Better diagnostics.
-                e.addMessage("(while reading column " + name + ")");
-                throw;
-            }
-
-            if (column->empty())
-                res_columns[pos] = nullptr;
+            next_row_number_to_read = from_mark_start_row;
         }
 
-        /// Populate _part_row_number column if requested
-        if (row_number_column_pos >= 0)
-        {
-            /// update `read_rows` if no physical columns are read (only _part_row_number is requested)
-            if (columns.size() == 1)
-            {
-                read_rows = std::min(max_rows_to_read, data_part->rows_count - next_row_number_to_read);
-            }
+        size_t skipped_rows = skipUnnecessaryRows(num_columns, from_mark, adjacent_reading,
+            current_task_last_mark, rows_to_skip);
+        next_row_number_to_read += skipped_rows;
 
-            if (read_rows)
-            {
-                auto mutable_column = res_columns[row_number_column_pos]->assumeMutable();
-                ColumnUInt64 & column = assert_cast<ColumnUInt64 &>(*mutable_column);
-                for (size_t i = 0, row_number = next_row_number_to_read; i < read_rows; ++i)
-                    column.insertValue(row_number++);
-                res_columns[row_number_column_pos] = std::move(mutable_column);
-            }
-            else
-            {
-                res_columns[row_number_column_pos] = nullptr;
-            }
+        size_t read_rows = 0;
+        if (skipped_rows >= rows_to_skip)
+        {
+            adjacent_reading = rows_to_skip > 0 || init_row_number == starting_row;
+            read_rows = readNecessaryRows(num_columns, from_mark, adjacent_reading,
+                current_task_last_mark, max_rows_to_read, res_col_to_idx, res_columns);
+            next_row_number_to_read += read_rows;
         }
 
-        /// NOTE: positions for all streams must be kept in sync.
-        /// In particular, even if for some streams there are no rows to be read,
-        /// you must ensure that no seeks are skipped and at this point they all point to to_mark.
+        return read_rows;
     }
     catch (Exception & e)
     {
@@ -241,8 +204,133 @@ size_t MergeTreeReaderWide::readRows(size_t from_mark, bool continue_reading, si
 
         throw;
     }
+}
 
-    next_row_number_to_read += read_rows;
+size_t MergeTreeReaderWide::skipUnnecessaryRows(size_t num_columns, size_t from_mark, bool continue_reading,
+    size_t current_task_last_mark, size_t rows_to_skip)
+{
+    if (rows_to_skip <= 0)
+        return 0;
+
+    ProfileEventsTimer timer(ProfileEvents::SkipRowsTimeMicro);
+
+    size_t skipped_rows = 0;
+    auto name_and_type = sort_columns.begin();
+    for (size_t i = 0; i < num_columns; ++i, ++name_and_type)
+    {
+        auto column_from_part = getColumnFromPart(*name_and_type);
+        const auto& [name, type] = column_from_part;
+        
+        if (name == "_part_row_number")
+        {
+            skipped_rows = std::max(skipped_rows, std::min(rows_to_skip, data_part->rows_count - next_row_number_to_read));
+            continue;
+        }
+
+        try
+        {
+            auto& cache = caches[column_from_part.getNameInStorage()];
+            if (type->isMap() && !type->isMapKVStore())
+                skipped_rows = std::max(skipped_rows,
+                    skipMapDataNotKV(column_from_part, from_mark, continue_reading,
+                        current_task_last_mark, rows_to_skip));
+            else
+                skipped_rows = std::max(skipped_rows,
+                    skipData(column_from_part, from_mark, continue_reading,
+                        current_task_last_mark, rows_to_skip, cache));
+        }
+        catch (Exception& e)
+        {
+            /// Better diagnostics.
+            e.addMessage("(while reading column " + name + ")");
+            throw;
+        }
+    }
+    caches.clear();
+
+    return skipped_rows;
+}
+
+size_t MergeTreeReaderWide::readNecessaryRows(size_t num_columns, size_t from_mark, bool continue_reading,
+    size_t current_task_last_mark, size_t rows_to_read,
+    std::unordered_map<String, size_t>& res_col_to_idx, Columns& res_columns)
+{
+    if (rows_to_read <= 0)
+        return 0;
+
+    ProfileEventsTimer timer(ProfileEvents::ReadRowsTimeMicro);
+
+    size_t read_rows = 0;
+    int row_number_column_pos = -1;
+    auto name_and_type = sort_columns.begin();
+    for (size_t i = 0; i < num_columns; ++i, ++name_and_type)
+    {
+        auto column_from_part = getColumnFromPart(*name_and_type);
+        const auto& [name, type] = column_from_part;
+        size_t pos = res_col_to_idx[name];
+
+        if (res_columns[pos] == nullptr)
+            res_columns[pos] = type->createColumn();
+
+        /// row number column will be populated at last after `read_rows` is set
+        if (name == "_part_row_number")
+        {
+            row_number_column_pos = pos;
+            continue;
+        }
+
+        auto& column = res_columns[pos];
+        try
+        {
+            size_t column_size_before_reading = column->size();
+            auto& cache = caches[column_from_part.getNameInStorage()];
+            if (type->isMap() && !type->isMapKVStore())
+                readMapDataNotKV(column_from_part, column, from_mark, continue_reading,
+                    current_task_last_mark, rows_to_read, res_col_to_idx, res_columns);
+            else
+                readData(column_from_part, column, from_mark, continue_reading,
+                   current_task_last_mark, rows_to_read, cache);
+
+            /// For elements of Nested, column_size_before_reading may be greater than column size
+            ///  if offsets are not empty and were already read, but elements are empty.
+            if (!column->empty())
+                read_rows = std::max(read_rows, column->size() - column_size_before_reading);
+        }
+        catch (Exception& e)
+        {
+            /// Better diagnostics.
+            e.addMessage("(while reading column " + name + ")");
+            throw;
+        }
+
+        if (column->empty())
+            res_columns[pos] = nullptr;
+    }
+    caches.clear();
+
+    /// Populate _part_row_number column if requested
+    if (row_number_column_pos >= 0)
+    {
+        /// update `read_rows` if no physical columns are read (only _part_row_number is requested)
+        if (columns.size() == 1)
+        {
+            read_rows = std::min(rows_to_read, data_part->rows_count - next_row_number_to_read);
+        }
+
+        if (read_rows)
+        {
+            auto mutable_column = res_columns[row_number_column_pos]->assumeMutable();
+            ColumnUInt64 & column = assert_cast<ColumnUInt64 &>(*mutable_column);
+            for (size_t i = 0, row_number = next_row_number_to_read; i < read_rows; ++i)
+                column.insertValue(row_number++);
+            res_columns[row_number_column_pos] = std::move(mutable_column);
+        }
+        else
+        {
+            res_columns[row_number_column_pos] = nullptr;
+        }
+    }
+
     return read_rows;
 }
 
@@ -263,13 +351,23 @@ void MergeTreeReaderWide::addStreams(const NameAndTypePair & name_and_type,
         if (!data_file_exists)
             return;
 
+        bool is_lc_dict = isLowCardinalityDictionary(substream_path);
         streams.emplace(
             stream_name,
             std::make_unique<MergeTreeReaderStream>(
-                data_part->volume->getDisk(),
-                data_part->getFullRelativePath() + stream_name,
+                IMergeTreeReaderStream::StreamFileMeta {
+                    .disk = data_part->volume->getDisk(),
+                    .rel_path = data_part->getFullRelativePath() + stream_name + DATA_FILE_EXTENSION,
+                    .offset = data_part->getFileOffsetOrZero(stream_name + DATA_FILE_EXTENSION),
+                    .size = data_part->getFileSizeOrZero(stream_name + DATA_FILE_EXTENSION),
+                },
+                IMergeTreeReaderStream::StreamFileMeta {
+                    .disk = data_part->volume->getDisk(),
+                    .rel_path = data_part->index_granularity_info.getMarksFilePath(data_part->getFullRelativePath() + stream_name),
+                    .offset = data_part->getFileOffsetOrZero(data_part->index_granularity_info.getMarksFilePath(stream_name)),
+                    .size = data_part->getFileSizeOrZero(data_part->index_granularity_info.getMarksFilePath(stream_name)),
+                },
                 stream_name,
-                DATA_FILE_EXTENSION,
                 data_part->getMarksCount(),
                 all_mark_ranges,
                 settings,
@@ -278,10 +376,9 @@ void MergeTreeReaderWide::addStreams(const NameAndTypePair & name_and_type,
                 &data_part->index_granularity_info,
                 profile_callback,
                 clock_type,
-                data_part->getFileOffsetOrZero(stream_name + DATA_FILE_EXTENSION),
-                data_part->getFileSizeOrZero(stream_name + DATA_FILE_EXTENSION),
-                data_part->getFileOffsetOrZero(data_part->index_granularity_info.getMarksFilePath(stream_name)),
-                data_part->getFileSizeOrZero(data_part->index_granularity_info.getMarksFilePath(stream_name))));
+                is_lc_dict
+            )
+        );
     };
 
     auto serialization = data_part->getSerializationForColumn(name_and_type);

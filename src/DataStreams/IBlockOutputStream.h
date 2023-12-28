@@ -23,6 +23,8 @@ class IBlockOutputStream : private boost::noncopyable
 public:
     IBlockOutputStream() {}
 
+    virtual String getName() const { return {}; }
+
     /** Get data structure of the stream in a form of "header" block (it is also called "sample block").
       * Header block contains column names, data types, columns of size 0. Constant columns must have corresponding values.
       * You must pass blocks of exactly this structure to the 'write' method.
@@ -63,8 +65,14 @@ public:
       */
     void addTableLock(const TableLockHolder & lock) { table_locks.push_back(lock); }
 
+    void setBuffer(std::shared_ptr<WriteBuffer> buffer) {
+        this->buffer_ = buffer;
+    }
+
 private:
     std::vector<TableLockHolder> table_locks;
+    // Used to ensure buffer's life cycle is as long as this class
+    std::shared_ptr<WriteBuffer> buffer_;
 };
 
 }

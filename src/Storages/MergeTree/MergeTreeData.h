@@ -24,7 +24,6 @@
 #include <MergeTreeCommon/MergeTreeMetaBase.h>
 
 #include <Common/MultiVersion.h>
-#include <Common/QueueForAsyncTask.h>
 #include <Storages/IStorage.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
@@ -597,8 +596,6 @@ public:
 
     /// Get required partition vector with query info
     DataPartsVector getRequiredPartitions(const SelectQueryInfo & query_info, ContextPtr context);
-
-    void checkColumnsValidity(const ColumnsDescription & columns) const override;
 
 protected:
 

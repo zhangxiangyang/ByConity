@@ -25,6 +25,7 @@
 
 #include <Core/Block.h>
 #include <common/types.h>
+#include <Common/RowExistsColumnInfo.h>
 #include <Core/NamesAndTypes.h>
 #include <Storages/IStorage.h>
 #include <Storages/MergeTree/IMergeTreeDataPart_fwd.h>
@@ -46,6 +47,7 @@
 #include <Poco/Path.h>
 #include <Common/HashTable/HashMap.h>
 #include <common/types.h>
+#include "Storages/MergeTree/Index/MergeTreeIndexHelper.h"
 #include <roaring.hh>
 #include <forward_list>
 
@@ -76,12 +78,25 @@ class IMergeTreeDataPartWriter;
 class MarkCache;
 class UncompressedCache;
 
+struct PartHostInfo
+{
+    String disk_cache_host_port;
+    String assign_compute_host_port;
+};
+
+struct BitmapIndexChecker;
+using BitmapIndexCheckerPtr = std::shared_ptr<BitmapIndexChecker>;
+
+
 /// Description of the data part.
 class IMergeTreeDataPart : public std::enable_shared_from_this<IMergeTreeDataPart>
 {
 public:
     //static constexpr auto DATA_FILE_EXTENSION = ".bin";
     static constexpr UInt64 NOT_INITIALIZED_COMMIT_TIME = 0;
+
+    static constexpr UInt8 DELETED_FLAG = 1 << 0;
+    static constexpr UInt8 LOW_PRIORITY_FLAG = 1 << 1;
 
     using Checksums = MergeTreeDataPartChecksums;
     using Checksum = MergeTreeDataPartChecksums::Checksum;
@@ -109,7 +124,8 @@ public:
         const std::optional<String> & relative_path,
         Type part_type_,
         const IMergeTreeDataPart * parent_part_,
-        IStorage::StorageLocation location_);
+        IStorage::StorageLocation location_,
+        const UUID& part_id_ = UUIDHelpers::Nil);
 
     IMergeTreeDataPart(
         const MergeTreeMetaBase & storage_,
@@ -118,7 +134,8 @@ public:
         const std::optional<String> & relative_path,
         Type part_type_,
         const IMergeTreeDataPart * parent_part_,
-        IStorage::StorageLocation location_);
+        IStorage::StorageLocation location_,
+        const UUID& part_id_ = UUIDHelpers::Nil);
 
     virtual MergeTreeReaderPtr getReader(
         const NamesAndTypesList & columns_,
@@ -127,8 +144,10 @@ public:
         UncompressedCache * uncompressed_cache,
         MarkCache * mark_cache,
         const MergeTreeReaderSettings & reader_settings_,
+        MergeTreeIndexExecutor * bitmap_index_reader = nullptr,
         const ValueSizeMap & avg_value_size_hints_ = ValueSizeMap{},
-        const ReadBufferFromFileBase::ProfileCallback & profile_callback_ = ReadBufferFromFileBase::ProfileCallback{}) const = 0;
+        const ReadBufferFromFileBase::ProfileCallback & profile_callback_ = ReadBufferFromFileBase::ProfileCallback{},
+        const ProgressCallback & internal_progress_cb = {}) const = 0;
 
     virtual MergeTreeWriterPtr getWriter(
         const NamesAndTypesList & columns_list,
@@ -136,9 +155,12 @@ public:
         const std::vector<MergeTreeIndexPtr> & indices_to_recalc,
         const CompressionCodecPtr & default_codec_,
         const MergeTreeWriterSettings & writer_settings,
-        const MergeTreeIndexGranularity & computed_index_granularity = {}) const = 0;
+        const MergeTreeIndexGranularity & computed_index_granularity = {},
+        const BitmapBuildInfo & bitmap_build_info = {}) const = 0;
 
     virtual bool isStoredOnDisk() const = 0;
+
+    virtual bool isStoredOnRemoteDisk() const = 0;
 
     virtual bool supportsVerticalMerge() const { return false; }
 
@@ -174,7 +196,6 @@ public:
     void remove() const;
 
     virtual void projectionRemove(const String & parent_to, bool keep_shared_data) const;
-
 
     /// Initialize columns (from columns.txt if exists, or create from column files if not).
     /// Load checksums from checksums.txt if exists. Load index if required.
@@ -306,6 +327,12 @@ public:
         return name + " (state " + stateString() + ")";
     }
 
+    //  Unique identification for projection part and normal part, used in disk cache segment and mark_cache, etc
+    String getUniquePartName() const
+    {
+        return parent_part ? parent_part->name + "_" + name : name;
+    }
+
     /// Returns true if state of part is one of affordable_states
     bool checkState(const std::initializer_list<State> & affordable_states) const
     {
@@ -373,11 +400,15 @@ public:
 
     CompressionCodecPtr default_codec;
 
+    BitmapIndexCheckerPtr bitmap_index_checker = std::make_shared<BitmapIndexChecker>();
+
     /// load checksum on demand. return ChecksumsPtr from global cache or its own checksums_ptr;
     ChecksumsPtr getChecksums() const;
+    virtual void prefetchChecksums() const { getChecksums(); }
 
     /// Get primary index, load if primary index is not initialized.
     IndexPtr getIndex() const;
+    virtual void prefetchIndex() const { getIndex(); }
 
     /// For data in RAM ('index')
     UInt64 getIndexSizeInBytes() const;
@@ -391,16 +422,25 @@ public:
     off_t getFileOffsetOrZero(const String & file_name) const;
 
     /// Returns path to part dir relatively to disk mount point
-    String getFullRelativePath() const;
+    virtual String getFullRelativePath() const;
 
     /// Returns full path to part dir
-    String getFullPath() const;
+    virtual String getFullPath() const;
 
     IMergeTreeDataPartPtr getMvccDataPart(const String & file_name) const;
+
+    // collect all the visible projection parts' and corresponding checksums from the historical parts into the current visible part (head part)
+    // this function must be called when finishing the loading parts
+    void gatherProjections();
 
     /// Moves a part to detached/ directory and adds prefix to its name
     void renameToDetached(const String & prefix) const;
     String getRelativePathForDetachedPart(const String & prefix) const;
+
+    void createDeleteBitmapForDetachedPart() const;
+
+    /// For convenience, when detach part for unique table, we need to generate a new base bitmap.
+    LocalDeleteBitmapPtr createNewBaseDeleteBitmap(const UInt64 & txn_id) const;
 
     /// Makes checks and move part to new directory
     /// Changes only relative_dir_name, you need to update other metadata (name, is_temp) explicitly
@@ -438,17 +478,22 @@ public:
 
     const std::map<String, std::shared_ptr<IMergeTreeDataPart>> & getProjectionParts() const { return projection_parts; }
 
-    void addProjectionPart(const String & projection_name, std::shared_ptr<IMergeTreeDataPart> && projection_part)
-    {
-        projection_parts.emplace(projection_name, std::move(projection_part));
-    }
+    const NameSet & getProjectionPartsNames() const { return projection_parts_names; }
+    void setProjectionPartsNames(const NameSet & projection_parts_names_);
+
+    void addProjectionPart(const String & projection_name, const std::shared_ptr<IMergeTreeDataPart> & projection_part);
 
     bool hasProjection(const String & projection_name) const
     {
         return projection_parts.find(projection_name) != projection_parts.end();
     }
 
-    void loadProjections(bool require_columns_checksums, bool check_consistency);
+    virtual void loadProjections(bool require_columns_checksums, bool check_consistency);
+
+    bool hasBitmapIndex(const String & column_name) const
+    {
+        return bitmap_index_checker->hasBitmapIndex(column_name);
+    }
 
     /// Return set of metadat file names without checksums. For example,
     /// columns.txt or checksums.txt itself.
@@ -489,6 +534,13 @@ public:
 
     bool isPartial() const { return info.hint_mutation; }
 
+    bool hasRowExistsImplicitColumn() const { return isPartial() && hasColumnFiles(RowExistsColumn::ROW_EXISTS_COLUMN); }
+
+    /// Return _row_exists' mutation which point to the part that contains the column file.
+    Int64 getMutationOfRowExists() const;
+
+    bool isDropRangePart() const { return deleted && info.min_block == 0 && info.level == MergeTreePartInfo::MAX_LEVEL; }
+
     /// FIXME: move to PartMetaEntry once metastore is added
     /// Used to prevent concurrent modification to a part.
     /// Can be removed once all data modification tasks (e.g, build bitmap index, recode) are
@@ -521,6 +573,13 @@ public:
     size_t covered_parts_size = 0; /// only for deleted part. used to record bytes_on_disk before the part is deleted.
     size_t covered_parts_rows = 0; /// only for deleted part. used to record rows_count before the part is deleted.
 
+    /// If true it means that delete bitmap info will be considered as delete flag info
+    /// Notice that it's only valid for invisible committed parts
+    bool delete_flag = false;
+
+    /// If true it means that the part is belongs to unique table engine and from dumper tool
+    bool low_priority = false;
+
     Int64 bucket_number = -1;               /// bucket_number > 0 if the part is assigned to bucket
     UInt64 table_definition_hash = 0;       // cluster by definition hash for data file
 
@@ -530,13 +589,15 @@ public:
     /// stored in descending order of commit time
     mutable std::forward_list<DataModelDeleteBitmapPtr> delete_bitmap_metas;
 
-    void setDeleteBitmapMeta(DeleteBitmapMetaPtr bitmap_meta) const;
+    void setDeleteBitmapMeta(DeleteBitmapMetaPtr bitmap_meta, bool force_set = true) const;
 
     void setDeleteBitmap(ImmutableDeleteBitmapPtr delete_bitmap_) { delete_bitmap = std::move(delete_bitmap_); }
 
+    size_t getDeleteBitmapMetaDepth() const { return std::distance(delete_bitmap_metas.begin(), delete_bitmap_metas.end()); }
+
     /// Return null if the part doesn't have delete bitmap.
     /// Otherwise load the bitmap on demand and return.
-    virtual const ImmutableDeleteBitmapPtr & getDeleteBitmap([[maybe_unused]] bool is_unique_new_part = false) const
+    virtual const ImmutableDeleteBitmapPtr & getDeleteBitmap([[maybe_unused]] bool allow_null = false) const
     {
         return delete_bitmap;
     }
@@ -547,6 +608,18 @@ public:
 
     /// Return version value from partition. Throws exception if the table didn't use partition as version
     UInt64 getVersionFromPartition() const;
+
+    DiskCacheMode disk_cache_mode {DiskCacheMode::AUTO};
+    bool enableDiskCache() const;
+
+    void setHostPort(const String & disk_cache_host_port_, const String & assign_compute_host_port_) const
+    {
+        disk_cache_host_port = disk_cache_host_port_;
+        assign_compute_host_port = assign_compute_host_port_;
+    }
+
+    mutable String disk_cache_host_port;
+    mutable String assign_compute_host_port;
 
 protected:
     friend class MergeTreeMetaBase;
@@ -569,6 +642,9 @@ protected:
     const IMergeTreeDataPart * parent_part;
 
     std::map<String, std::shared_ptr<IMergeTreeDataPart>> projection_parts;
+
+    // names of projections that are truly managed by current part, to distinguish from the projections gathered from the previous parts
+    NameSet projection_parts_names;
 
     /// Protect checksums_ptr. FIXME:  May need more protection in getChecksums()
     /// to prevent checksums_ptr from being modified and corvered by multiple threads.
@@ -598,6 +674,8 @@ protected:
 
     virtual void removeImpl(bool keep_shared_data) const;
 
+    virtual void setChecksumsPtrIfNeed(const ChecksumsPtr & checksums);
+
 private:
     /// In compact parts order of columns is necessary
     NameToNumber column_name_to_position;
@@ -606,7 +684,7 @@ private:
     void loadUUID();
 
     /// Reads columns names and types from columns.txt
-    void loadColumns(bool require);
+    virtual void loadColumns(bool require);
 
     /// If versions.txt exists, reads versions from it
     void loadVersions();
@@ -678,4 +756,5 @@ bool isInMemoryPart(const MergeTreeDataPartPtr & data_part);
 bool isCnchPart(const MergeTreeDataPartPtr & data_part);
 
 void writePartBinary(const IMergeTreeDataPart & part, WriteBuffer & buf);
+void writeProjectionBinary(const IMergeTreeDataPart & part, WriteBuffer & buf);
 }

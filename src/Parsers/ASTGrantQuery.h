@@ -23,12 +23,12 @@
 
 #include <Parsers/IAST.h>
 #include <Access/AccessRightsElement.h>
-#include <Parsers/ASTQueryWithOnCluster.h>
 
 
 namespace DB
 {
 class ASTRolesOrUsersSet;
+class Context;
 
 
 /** GRANT access_type[(column_name [,...])] [,...] ON {db.table|db.*|*.*|table|*} TO {user_name | CURRENT_USER} [,...] [WITH GRANT OPTION]
@@ -37,7 +37,7 @@ class ASTRolesOrUsersSet;
   * GRANT role [,...] TO {user_name | role_name | CURRENT_USER} [,...] [WITH ADMIN OPTION]
   * REVOKE [ADMIN OPTION FOR] role [,...] FROM {user_name | role_name | CURRENT_USER} [,...] | ALL | ALL EXCEPT {user_name | role_name | CURRENT_USER} [,...]
   */
-class ASTGrantQuery : public IAST, public ASTQueryWithOnCluster
+class ASTGrantQuery : public IAST
 {
 public:
     bool attach_mode = false;
@@ -46,6 +46,7 @@ public:
     std::shared_ptr<ASTRolesOrUsersSet> roles;
     bool admin_option = false;
     std::shared_ptr<ASTRolesOrUsersSet> grantees;
+    bool tenant_rewritten = false;
 
     String getID(char) const override;
 
@@ -55,6 +56,8 @@ public:
     void formatImpl(const FormatSettings & settings, FormatState &, FormatStateStacked) const override;
     void replaceEmptyDatabase(const String & current_database);
     void replaceCurrentUserTag(const String & current_user_name) const;
-    ASTPtr getRewrittenASTWithoutOnCluster(const std::string &) const override { return removeOnCluster<ASTGrantQuery>(clone()); }
+    void rewriteNamesWithTenant(const Context *);
+    void rewriteNamesWithoutTenant(const Context *);
+    // ASTPtr getRewrittenASTWithoutOnCluster(const std::string &) const override { return removeOnCluster<ASTGrantQuery>(clone()); }
 };
 }

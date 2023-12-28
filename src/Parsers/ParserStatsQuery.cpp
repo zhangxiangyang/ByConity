@@ -116,14 +116,19 @@ Float64 getValueFromNumberLiteral(const ASTPtr & node)
         throw Exception("Not a literal node", ErrorCodes::SYNTAX_ERROR);
 }
 
-bool ParserCreateStatsQuery::parseSuffix(Pos & pos, Expected & expected, IAST & ast)
+bool ParserCreateStatsQuery::parseSuffix(Pos & pos, QueryAst & node, Expected & expected)
 {
+    ParserKeyword s_sync("SYNC");
+    ParserKeyword s_async("ASYNC");
     ParserKeyword s_partition("PARTITION");
     ParserKeyword s_with("WITH");
     ParserPartition partition_p;
     ParserNothing dummy_p;
 
-    auto & create_stats_ast = dynamic_cast<ASTCreateStatsQuery &>(ast);
+    using SampleType = ASTCreateStatsQuery::SampleType;
+    using SyncMode = ASTCreateStatsQuery::SyncMode;
+
+    auto & create_stats_ast = node;
 
     if (s_partition.ignore(pos, expected))
     {
@@ -136,12 +141,21 @@ bool ParserCreateStatsQuery::parseSuffix(Pos & pos, Expected & expected, IAST & 
         create_stats_ast.children.push_back(create_stats_ast.partition);
     }
 
+    if (s_sync.ignore(pos, expected))
+    {
+        create_stats_ast.sync_mode = SyncMode::Sync;
+    }
+    else if (s_async.ignore(pos, expected))
+    {
+        create_stats_ast.sync_mode = SyncMode::Async;
+    }
+
     if (s_with.ignore(pos, expected))
     {
         auto parse_specifier = [&pos, &expected, &create_stats_ast] {
             ParserKeyword s_sample("SAMPLE");
             ParserKeyword s_fullscan("FULLSCAN");
-            ASTPtr node;
+            ASTPtr literal_node;
 
             if (s_fullscan.ignore(pos, expected))
             {
@@ -160,17 +174,17 @@ bool ParserCreateStatsQuery::parseSuffix(Pos & pos, Expected & expected, IAST & 
                 ParserCreateStatsQuerySampleRatioSpecifier ratio_p;
                 while (true)
                 {
-                    if (rows_p.parse(pos, node, expected))
+                    if (rows_p.parse(pos, literal_node, expected))
                     {
                         if (create_stats_ast.sample_rows)
                             return false; // duplicate
-                        create_stats_ast.sample_rows = getValueFromUInt64Literal(node);
+                        create_stats_ast.sample_rows = getValueFromUInt64Literal(literal_node);
                     }
-                    else if (ratio_p.parse(pos, node, expected))
+                    else if (ratio_p.parse(pos, literal_node, expected))
                     {
                         if (create_stats_ast.sample_ratio)
                             return false; // duplicate
-                        create_stats_ast.sample_ratio = getValueFromNumberLiteral(node);
+                        create_stats_ast.sample_ratio = getValueFromNumberLiteral(literal_node);
                     }
                     else
                     {

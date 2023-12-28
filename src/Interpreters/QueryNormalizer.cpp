@@ -325,7 +325,7 @@ void QueryNormalizer::visit(ASTIdentifier & node, ASTPtr & ast, Data & data)
     if (!IdentifierSemantic::getColumnName(node))
         return;
 
-    if (data.settings.prefer_column_name_to_alias)
+    if (data.settings.prefer_column_name_to_alias && !(data.aliases_rewrite_scope && data.is_order_by_clause))
     {
         if (data.source_columns_set.find(node.name()) != data.source_columns_set.end())
             return;
@@ -384,6 +384,7 @@ void QueryNormalizer::visit(ASTIdentifier & node, ASTPtr & ast, Data & data)
     }
 }
 
+/// special visitChildren() for ASTTablesInSelectQueryElement
 void QueryNormalizer::visit(ASTTablesInSelectQueryElement & node, const ASTPtr &, Data & data)
 {
     /// normalize JOIN ON section
@@ -392,6 +393,14 @@ void QueryNormalizer::visit(ASTTablesInSelectQueryElement & node, const ASTPtr &
         auto & join = node.table_join->as<ASTTableJoin &>();
         if (join.on_expression)
             visit(join.on_expression, data);
+
+        if (join.using_expression_list && !data.aliases_rewrite_scope)
+            visit(join.using_expression_list, data);
+    }
+
+    if (node.array_join)
+    {
+        visit(node.array_join, data);
     }
 }
 
@@ -405,8 +414,13 @@ void QueryNormalizer::visit(ASTSelectQuery & select, const ASTPtr &, Data & data
 {
     for (auto & child : select.children)
     {
+        if (child == select.orderBy())
+            data.is_order_by_clause = true;
+
         if (needVisitChild(child))
             visit(child, data);
+
+        data.is_order_by_clause = false;
     }
 
     /// If the WHERE clause or HAVING consists of a single alias, the reference must be replaced not only in children,
@@ -457,7 +471,7 @@ void QueryNormalizer::visitChildren(IAST * node, Data & data)
             visitChildren(func_node->window_definition.get(), data);
         }
     }
-    else if (!node->as<ASTSelectQuery>())
+    else if (!node->as<ASTSelectQuery>() && !node->as<ASTTablesInSelectQueryElement>())
     {
         for (auto & child : node->children)
             if (needVisitChild(child))

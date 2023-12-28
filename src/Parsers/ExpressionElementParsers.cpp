@@ -21,13 +21,19 @@
 
 #include <errno.h>
 #include <cstdlib>
+#include <string>
+#include <type_traits>
+#include <errno.h>
 
 #include <Poco/String.h>
 
-#include <IO/ReadHelpers.h>
+#include <Core/Field.h>
+#include <DataTypes/DataTypesDecimal.h>
+#include <Functions/castTypeToEither.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <Common/typeid_cast.h>
+#include <IO/ReadHelpers.h>
 #include <Parsers/DumpASTNode.h>
+#include <Common/typeid_cast.h>
 
 #include <Parsers/ASTAsterisk.h>
 #include <Parsers/ASTClusterByElement.h>
@@ -62,7 +68,7 @@
 #include "ASTColumnsMatcher.h"
 
 #include <Interpreters/StorageID.h>
-
+#include <Parsers/formatTenantDatabaseName.h>
 namespace DB
 {
 
@@ -268,7 +274,7 @@ bool ParserCompoundIdentifier::parseImpl(Pos & pos, ASTPtr & node, Expected & ex
 
     if (table_name_with_optional_uuid)
     {
-        if (parts.size() > 2)
+        if (parts.size() > 3)
             return false;
 
         if (s_uuid.ignore(pos, expected))
@@ -281,7 +287,19 @@ bool ParserCompoundIdentifier::parseImpl(Pos & pos, ASTPtr & node, Expected & ex
         }
 
         if (parts.size() == 1) node = std::make_shared<ASTTableIdentifier>(parts[0], std::move(params));
-        else node = std::make_shared<ASTTableIdentifier>(parts[0], parts[1], std::move(params));
+        else if (parts.size() == 3)
+        {
+            auto & catalog = parts[0];
+            auto & database = parts[1];
+            auto new_database = formatCatalogDatabaseName(database, catalog);
+            node = std::make_shared<ASTTableIdentifier>(new_database, parts[2], std::move(params));
+            node->as<ASTTableIdentifier>()->rewriteCnchDatabaseName(pos.getContext());
+        }
+        else
+        {
+            node = std::make_shared<ASTTableIdentifier>(parts[0], parts[1], std::move(params));
+            node->as<ASTTableIdentifier>()->rewriteCnchDatabaseName(pos.getContext());
+        }
         node->as<ASTTableIdentifier>()->uuid = uuid;
     }
     else
@@ -365,6 +383,7 @@ bool ParserFunction::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     /// TRIM(BOTH|LEADING|TRAILING x FROM y)
     /// SUBSTRING(x FROM a)
     /// SUBSTRING(x FROM a FOR b)
+    /// GROUP_CONCAT([DISTINCT] x [ORDER_BY y [ASC | DESC]] [SEPARATOR str])
 
     String function_name = getIdentifierName(identifier);
     String function_name_lowercase = Poco::toLower(function_name);
@@ -534,6 +553,26 @@ bool ParserFunction::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         {
             return false;
         }
+
+        const auto &name = function_name_lowercase;
+        if (name.starts_with('l') && (name == "lead" || name == "lag"))
+        {
+            // fixed to ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+            auto &fn = function_node_as_iast->as<ASTFunction &>();
+            if (fn.window_definition)
+            {
+                auto &def = fn.window_definition->as<ASTWindowDefinition &>();
+
+                def.frame_is_default = false;
+                def.frame_type = WindowFrame::FrameType::Rows;
+                def.frame_begin_type = WindowFrame::BoundaryType::Unbounded;
+                def.frame_begin_offset = nullptr;
+                def.frame_begin_preceding = true;
+                def.frame_end_type = WindowFrame::BoundaryType::Unbounded;
+                def.frame_end_offset = nullptr;
+                def.frame_end_preceding = false;
+            }
+        }
     }
 
     node = function_node;
@@ -597,6 +636,11 @@ bool ParserWindowReference::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
         if (window_name_parser.parse(pos, window_name_ast, expected))
         {
             function.window_name = getIdentifierName(window_name_ast);
+            const auto name = Poco::toLower(function.name);
+            if (name.starts_with('l') && (name == "lead" || name == "lag"))
+            {
+                function.window_definition = std::make_shared<ASTWindowDefinition>();
+            }
             return true;
         }
         else
@@ -608,7 +652,12 @@ bool ParserWindowReference::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     // Variant 2:
     // function_name ( * ) OVER ( window_definition )
     ParserWindowDefinition parser_definition(dt);
-    return parser_definition.parse(pos, function.window_definition, expected);
+    if (parser_definition.parse(pos, function.window_definition, expected))
+    {
+        function.children.push_back(function.window_definition);
+        return true;
+    }
+    return false;
 }
 
 static bool tryParseFrameDefinition(ASTWindowDefinition * node, IParser::Pos & pos,
@@ -737,6 +786,25 @@ static bool tryParseFrameDefinition(ASTWindowDefinition * node, IParser::Pos & p
             {
                 return false;
             }
+        }
+    }
+
+    ParserKeyword keyword_exclude("EXCLUDE");
+    ParserKeyword keyword_no("NO");
+    ParserKeyword keyword_others("OTHERS");
+    // TODO: add support for other exclude types
+    if (keyword_exclude.ignore(pos, expected))
+    {
+        if (keyword_no.ignore(pos, expected))
+        {
+            if (!keyword_others.ignore(pos, expected))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Other exclude types are not supported currenlty");
         }
     }
 
@@ -1065,7 +1133,7 @@ bool ParserSubstringExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & e
     ASTPtr start_node;
     ASTPtr length_node;
 
-    if (!ParserKeyword("SUBSTRING").ignore(pos, expected))
+    if (!ParserKeyword("SUBSTRING").ignore(pos, expected) && !ParserKeyword("SUBSTR").ignore(pos, expected))
         return false;
 
     if (pos->type != TokenType::OpeningRoundBracket)
@@ -1124,6 +1192,82 @@ bool ParserSubstringExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & e
     func_node->children.push_back(func_node->arguments);
 
     node = std::move(func_node);
+    return true;
+}
+
+bool ParserGroupConcatExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
+{
+    /// There are 2 syntaxes for GROUP_CONCAT/groupConcat
+    /// 1. ClickHouse version: GROUP_CONCAT[(str_val)](col_name)
+    /// 2. MySQL: GROUP_CONCAT([DISTINCT] col_name [ORDER BY col_name_2 [ASC | DESC]] [SEPARATOR str_val])
+    /// Note: arguments that are square-bracketed [] are optional
+    /// This parser is dedicated for the second syntax because the first syntax is already handled by default
+
+    ParserKeyword s_distinct("DISTINCT");
+    ParserKeyword s_order_by("ORDER BY");
+    ParserKeyword s_separator("SEPARATOR");
+    ParserNotEmptyExpressionList column_elem(false, dt);
+    ParserOrderByExpressionList columns_order_by(dt);
+    ParserExpressionList separator_elem(false, dt);
+
+    bool has_distinct = false;
+
+    ASTPtr expr_list_args;
+    ASTPtr expr_list_params;
+
+    if (!ParserKeyword("GROUP_CONCAT").ignore(pos, expected) && !ParserKeyword("groupConcat").ignore(pos, expected))
+        return false;
+    
+    if (pos->type != TokenType::OpeningRoundBracket)
+        return false;
+    ++pos;
+
+    if (s_distinct.ignore(pos, expected))
+        has_distinct = true;
+
+    if (!column_elem.parse(pos, expr_list_args, expected))
+        return false;
+
+    if (s_order_by.ignore(pos, expected))
+    {
+        ASTPtr order_by_ast;
+
+        if (!columns_order_by.parse(pos, order_by_ast, expected))
+            return false;
+        
+        // TODO: order the data by the column specified BEFORE aggregating
+    }
+
+    if (s_separator.ignore(pos, expected))
+    {
+        if (!separator_elem.parse(pos, expr_list_params, expected))
+            return false;
+    }
+
+    if (pos->type != TokenType::ClosingRoundBracket)
+        return false;
+    ++pos;
+
+    if (pos->type == TokenType::OpeningRoundBracket)
+        // It's not the second syntax. Maybe the first or maybe a syntax error
+        return false;
+
+    auto function_node = std::make_shared<ASTFunction>();
+
+    function_node->name = "groupConcat";
+    if (has_distinct)
+        function_node->name += "Distinct";
+
+    function_node->arguments = expr_list_args;
+    function_node->children.push_back(function_node->arguments);
+
+    if (expr_list_params)
+    {
+        function_node->parameters = expr_list_params;
+        function_node->children.push_back(function_node->parameters);
+    }
+
+    node = std::move(function_node);
     return true;
 }
 
@@ -1419,12 +1563,16 @@ bool ParserDateAddExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & exp
     const char * function_name = nullptr;
     ASTPtr timestamp_node;
     ASTPtr offset_node;
+    ASTPtr convert_node;
 
     if (ParserKeyword("DATEADD").ignore(pos, expected) || ParserKeyword("DATE_ADD").ignore(pos, expected)
-        || ParserKeyword("TIMESTAMPADD").ignore(pos, expected) || ParserKeyword("TIMESTAMP_ADD").ignore(pos, expected))
+        || ParserKeyword("ADDDATE").ignore(pos, expected) || ParserKeyword("TIMESTAMPADD").ignore(pos, expected)
+        || ParserKeyword("TIMESTAMP_ADD").ignore(pos, expected))
         function_name = "plus";
-    else if (ParserKeyword("DATESUB").ignore(pos, expected) || ParserKeyword("DATE_SUB").ignore(pos, expected)
-        || ParserKeyword("TIMESTAMPSUB").ignore(pos, expected) || ParserKeyword("TIMESTAMP_SUB").ignore(pos, expected))
+    else if (
+        ParserKeyword("DATESUB").ignore(pos, expected) || ParserKeyword("DATE_SUB").ignore(pos, expected)
+        || ParserKeyword("SUBDATE").ignore(pos, expected) || ParserKeyword("TIMESTAMPSUB").ignore(pos, expected)
+        || ParserKeyword("TIMESTAMP_SUB").ignore(pos, expected))
         function_name = "minus";
     else
         return false;
@@ -1433,9 +1581,8 @@ bool ParserDateAddExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & exp
         return false;
     ++pos;
 
-    IntervalKind interval_kind;
-    ASTPtr interval_func_node;
-    if (parseIntervalKind(pos, expected, interval_kind))
+    ParserInterval interval_parser;
+    if (interval_parser.parse(pos, convert_node, expected))
     {
         /// function(unit, offset, timestamp)
         if (pos->type != TokenType::Comma)
@@ -1451,13 +1598,6 @@ bool ParserDateAddExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & exp
 
         if (!ParserExpression(dt).parse(pos, timestamp_node, expected))
             return false;
-        auto interval_expr_list_args = std::make_shared<ASTExpressionList>();
-        interval_expr_list_args->children = {offset_node};
-
-        interval_func_node = std::make_shared<ASTFunction>();
-        interval_func_node->as<ASTFunction &>().name = interval_kind.toNameOfFunctionToIntervalDataType();
-        interval_func_node->as<ASTFunction &>().arguments = std::move(interval_expr_list_args);
-        interval_func_node->as<ASTFunction &>().children.push_back(interval_func_node->as<ASTFunction &>().arguments);
     }
     else
     {
@@ -1469,12 +1609,43 @@ bool ParserDateAddExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & exp
             return false;
         ++pos;
 
-        if (!ParserIntervalOperatorExpression{dt}.parse(pos, interval_func_node, expected))
+        if (!ParserKeyword("INTERVAL").ignore(pos, expected))
             return false;
+
+        if (!ParserExpression(dt).parse(pos, offset_node, expected))
+            return false;
+
+        interval_parser.parse(pos, convert_node, expected);
+
     }
     if (pos->type != TokenType::ClosingRoundBracket)
         return false;
     ++pos;
+
+    const char * interval_function_name = interval_parser.getToIntervalKindFunctionName();
+    if (interval_function_name == nullptr)
+        return false;
+
+    auto interval_expr_list_args = std::make_shared<ASTExpressionList>();
+
+    if (convert_node != nullptr)
+    {
+        auto convert_expr_list_args = std::make_shared<ASTExpressionList>();
+        convert_expr_list_args->children = {offset_node};
+
+        ASTFunction & convert = dynamic_cast<ASTFunction &>(*convert_node);
+        convert.arguments = std::move(convert_expr_list_args);
+        convert.children.push_back(convert.arguments);
+        
+        offset_node = std::move(convert_node);
+    }
+
+    interval_expr_list_args->children = {offset_node};
+
+    auto interval_func_node = std::make_shared<ASTFunction>();
+    interval_func_node->name = interval_function_name;
+    interval_func_node->arguments = std::move(interval_expr_list_args);
+    interval_func_node->children.push_back(interval_func_node->arguments);
 
     auto expr_list_args = std::make_shared<ASTExpressionList>();
     expr_list_args->children = {timestamp_node, interval_func_node};
@@ -1493,9 +1664,14 @@ bool ParserDateDiffExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & ex
 {
     ASTPtr left_node;
     ASTPtr right_node;
+    auto func_node = std::make_shared<ASTFunction>();
+    func_node->name = "dateDiff";
 
-    if (!(ParserKeyword("DATEDIFF").ignore(pos, expected) || ParserKeyword("DATE_DIFF").ignore(pos, expected)
-        || ParserKeyword("TIMESTAMPDIFF").ignore(pos, expected) || ParserKeyword("TIMESTAMP_DIFF").ignore(pos, expected)))
+    if (ParserKeyword("DATEDIFF").ignore(pos, expected) || ParserKeyword("DATE_DIFF").ignore(pos, expected))
+        func_node->name = "dateDiff";
+    else if (ParserKeyword("TIMESTAMPDIFF").ignore(pos, expected) || ParserKeyword("TIMESTAMP_DIFF").ignore(pos, expected))
+        func_node->name = "timestampDiff";
+    else
         return false;
 
     if (pos->type != TokenType::OpeningRoundBracket)
@@ -1527,8 +1703,6 @@ bool ParserDateDiffExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & ex
     auto expr_list_args = std::make_shared<ASTExpressionList>();
     expr_list_args->children = {std::make_shared<ASTLiteral>(interval_kind.toDateDiffUnit()), left_node, right_node};
 
-    auto func_node = std::make_shared<ASTFunction>();
-    func_node->name = "dateDiff";
     func_node->arguments = std::move(expr_list_args);
     func_node->children.push_back(func_node->arguments);
 
@@ -1588,6 +1762,21 @@ static const char *get_decimal_pt(const char *buf)
     return pt;
 }
 
+bool ParserBool::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
+{
+    if (ParserKeyword("true").parse(pos, node, expected))
+    {
+        node = std::make_shared<ASTLiteral>(true);
+        return true;
+    }
+    else if (ParserKeyword("false").parse(pos, node, expected))
+    {
+        node = std::make_shared<ASTLiteral>(false);
+        return true;
+    }
+    else
+        return false;
+}
 bool ParserNumber::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     const char * data_begin = pos->begin;
@@ -1632,7 +1821,6 @@ bool ParserNumber::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         UInt32 integral = dot - buf;
         UInt32 precision = sz - 1; /* remove point */
         UInt32 scale = precision - integral;
-        ASTs elements;
 
         /* check valid decimal */
         if (precision > DecimalUtils::max_precision<Decimal256> ||
@@ -1653,21 +1841,26 @@ bool ParserNumber::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
             return false;
         }
 
-        elements.reserve(2);
-        elements.push_back(std::make_shared<ASTLiteral>(precision));
-        elements.push_back(std::make_shared<ASTLiteral>(scale));
+        String decimal_str(data_begin, pos->begin - data_begin + sz);
+        DataTypePtr decimal_type = createDecimal<DataTypeDecimal>(precision, scale);
+        Field field;
 
-        auto list = std::make_shared<ASTExpressionList>();
-        list->children = std::move(elements);
+        if (!castTypeToEither<
+                DataTypeDecimal<Decimal32>,
+                DataTypeDecimal<Decimal64>,
+                DataTypeDecimal<Decimal128>,
+                DataTypeDecimal<Decimal256>>(decimal_type.get(), [&](auto && type) {
+                using FieldType = typename std::decay_t<decltype(type)>::FieldType;
+                auto value = type.parseFromString(decimal_str);
+                field = DecimalField<FieldType>(value, scale);
+                return true;
+            }))
+        {
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected data type for parsing decimal literal");
+        }
 
-        auto function_node = std::make_shared<ASTFunction>();
-        function_node->name = "Decimal";
-        function_node->no_empty_args = true;
-        function_node->arguments = list;
-        function_node->children.push_back(function_node->arguments);
-
-        auto literal = std::make_shared<ASTLiteral>(String(data_begin, pos->begin - data_begin + sz));
-        node = createFunctionCast(literal, function_node);
+        auto literal = std::make_shared<ASTLiteral>(field);
+        node = literal;
         ++pos;
         return true;
     }
@@ -1858,12 +2051,16 @@ bool ParserLiteral::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     ParserNull null_p;
     ParserNumber num_p(dt);
+    ParserBool bool_p;
     ParserStringLiteral str_p;
 
     if (null_p.parse(pos, node, expected))
         return true;
 
     if (num_p.parse(pos, node, expected))
+        return true;
+
+    if (bool_p.parse(pos, node, expected))
         return true;
 
     if (str_p.parse(pos, node, expected))
@@ -2308,6 +2505,7 @@ bool ParserExpressionElement::parseImpl(Pos & pos, ASTPtr & node, Expected & exp
         || ParserDateAddExpression(dt).parse(pos, node, expected)
         || ParserDateDiffExpression(dt).parse(pos, node, expected)
         || ParserSubstringExpression(dt).parse(pos, node, expected)
+        || ParserGroupConcatExpression(dt).parse(pos, node, expected)
         || ParserTrimExpression(dt).parse(pos, node, expected)
         || ParserLeftExpression(dt).parse(pos, node, expected)
         || ParserRightExpression(dt).parse(pos, node, expected)
@@ -2384,12 +2582,18 @@ bool ParserExistsExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & expe
 bool ParserClusterByElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     ParserExpression elem_p;
+    ParserKeyword expression("EXPRESSION");
     ParserKeyword into("INTO");
     ParserKeyword buckets("BUCKETS");
     ParserKeyword split_number("SPLIT_NUMBER");
     ParserKeyword with_range("WITH_RANGE");
     ParserUnsignedInteger total_bucket_number_p;
     ParserUnsignedInteger split_number_p;
+
+    // parse EXPRESSION keyword
+    bool is_user_defined_expression = false;
+    if (expression.ignore(pos, expected))
+        is_user_defined_expression = true;
 
     // parse columns in CLUSTER BY. Must come first as pos and expected is passed in after parsing CLUSTER BY
     ASTPtr columns_elem;
@@ -2423,6 +2627,12 @@ bool ParserClusterByElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expe
     // parses the SPLIT_NUMBER. This argument is optional.
     if (split_number.ignore(pos, expected))
     {
+        if (is_user_defined_expression)
+        {
+            expected.add(pos, "no SPLIT_NUMBER for user defined CLUSTER BY EXPRESSION");
+            return false;
+        }
+
         if (!split_number_p.parse(pos, split_number_elem, expected))
             return false;
 
@@ -2444,6 +2654,12 @@ bool ParserClusterByElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expe
     bool is_with_range_present = false;
     if (with_range.ignore(pos, expected))
     {
+        if (is_user_defined_expression)
+        {
+            expected.add(pos, "no WITH_RANGE for user defined CLUSTER BY EXPRESSION");
+            return false;
+        }
+
         if (split_number_value <= 0)
         {
             expected.add(pos, "required SPLIT_NUMBER > 0 for WITH_RANGE");
@@ -2452,7 +2668,7 @@ bool ParserClusterByElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expe
         is_with_range_present = true;
     }
 
-    node = std::make_shared<ASTClusterByElement>(columns_elem, total_bucket_number_elem, split_number_value, is_with_range_present);
+    node = std::make_shared<ASTClusterByElement>(columns_elem, total_bucket_number_elem, split_number_value, is_with_range_present, is_user_defined_expression);
 
     return true;
 }
@@ -2746,6 +2962,25 @@ bool ParserAssignment::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     tryGetIdentifierNameInto(column, assignment->column_name);
     if (expression)
         assignment->children.push_back(expression);
+
+    return true;
+}
+
+bool ParserEscapeExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
+{
+    ParserStringLiteral escape_exp;
+    if(!escape_exp.parse(pos, node, expected))
+        return false;
+
+    const auto * literal = node->as<ASTLiteral>();
+    String escape_char;
+
+    if (!literal || !literal->value.tryGet(escape_char))
+        return false;
+
+    // We only accept escape chars of length 1. Only exception is '\\'.
+    if (escape_char != "\\\\" && escape_char.size() != 1)
+        return false;
 
     return true;
 }

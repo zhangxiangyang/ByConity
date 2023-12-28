@@ -66,6 +66,7 @@ private:
       */
     static void splitMutationCommands(
         MergeTreeMetaBase::DataPartPtr part,
+        const StorageMetadataPtr & metadata_snapshot,
         const MutationCommands & commands,
         MutationCommands & for_interpreter,
         MutationCommands & for_file_renames);
@@ -85,7 +86,8 @@ private:
         MergeTreeMetaBase::DataPartPtr source_part,
         const Block & updated_header,
         NamesAndTypesList storage_columns,
-        const MutationCommands & commands_for_removes);
+        const MutationCommands & commands_for_removes,
+        bool with_row_exists_column);
 
     /// Get skip indices, that should exists in the resulting data part.
     static MergeTreeIndices getIndicesForNewDataPart(
@@ -157,6 +159,13 @@ private:
         const ReservationPtr & space_reservation,
         TableLockHolder & holder,
         ContextPtr context);
+
+    // For projections that needed to be recaluated, we collect all the columns that are depended on by the projections
+    static void addColumnsForRecalculateProjections(
+        MergeTreeData::DataPartPtr part,
+        const StorageMetadataPtr & metadata_snapshot,
+        const NameSet & mutated_columns,
+        MutationCommands & for_interpreter);
 
 public :
     /// Initialize and write to disk new part fields like checksums, columns, etc.

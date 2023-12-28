@@ -21,10 +21,14 @@
 
 #include <Databases/DatabaseOnDisk.h>
 
+#include <filesystem>
+#include <Databases/DatabaseAtomic.h>
+#include <Databases/DatabaseOrdinary.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/WriteHelpers.h>
+#include <Interpreters/ApplyWithSubqueryVisitor.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/InterpreterCreateQuery.h>
 #include <Parsers/ASTCreateQuery.h>
@@ -34,13 +38,11 @@
 #include <Storages/IStorage.h>
 #include <Storages/StorageFactory.h>
 #include <TableFunctions/TableFunctionFactory.h>
-#include <Common/escapeForFileName.h>
-#include <common/logger_useful.h>
-#include <Databases/DatabaseOrdinary.h>
-#include <Databases/DatabaseAtomic.h>
 #include <Common/assert_cast.h>
-#include <filesystem>
+#include <Common/escapeForFileName.h>
 #include <Common/filesystemHelpers.h>
+#include <common/logger_useful.h>
+#include <Storages/UniqueNotEnforcedDescription.h>
 
 namespace fs = std::filesystem;
 
@@ -72,6 +74,9 @@ std::pair<String, StoragePtr> createTableFromAST(
     ast_create_query.attach = true;
     ast_create_query.database = database_name;
 
+    if (ast_create_query.select && ast_create_query.isView())
+        ApplyWithSubqueryVisitor().visit(*ast_create_query.select);
+
     if (ast_create_query.as_table_function)
     {
         const auto & factory = TableFunctionFactory::instance();
@@ -86,6 +91,8 @@ std::pair<String, StoragePtr> createTableFromAST(
 
     ColumnsDescription columns;
     ConstraintsDescription constraints;
+    ForeignKeysDescription foreign_keys;
+    UniqueNotEnforcedDescription unique;
 
     if (!ast_create_query.is_dictionary)
     {
@@ -93,10 +100,22 @@ std::pair<String, StoragePtr> createTableFromAST(
         /// - the database has not been loaded yet;
         /// - the code is simpler, since the query is already brought to a suitable form.
         if (!ast_create_query.columns_list || !ast_create_query.columns_list->columns)
-            throw Exception("Missing definition of columns.", ErrorCodes::EMPTY_LIST_OF_COLUMNS_PASSED);
+        {
+            if (!ast_create_query.storage || !ast_create_query.storage->engine)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid storage definition in metadata file: "
+                                                           "it's a bug or result of manual intervention in metadata files");
 
-        columns = InterpreterCreateQuery::getColumnsDescription(*ast_create_query.columns_list->columns, context, true);
-        constraints = InterpreterCreateQuery::getConstraintsDescription(ast_create_query.columns_list->constraints);
+            if (!StorageFactory::instance().checkIfStorageSupportsSchemaInference(ast_create_query.storage->engine->name))
+                throw Exception(ErrorCodes::EMPTY_LIST_OF_COLUMNS_PASSED, "Missing definition of columns.");
+            /// Leave columns empty.
+        }
+        else
+        {
+            columns = InterpreterCreateQuery::getColumnsDescription(*ast_create_query.columns_list->columns, context, true);
+            constraints = InterpreterCreateQuery::getConstraintsDescription(ast_create_query.columns_list->constraints);
+            foreign_keys = InterpreterCreateQuery::getForeignKeysDescription(ast_create_query.columns_list->foreign_keys);
+            unique = InterpreterCreateQuery::getUniqueNotEnforcedDescription(ast_create_query.columns_list->unique);
+        }
     }
 
     return
@@ -109,8 +128,9 @@ std::pair<String, StoragePtr> createTableFromAST(
             context->getGlobalContext(),
             columns,
             constraints,
-            has_force_restore_data_flag)
-    };
+            foreign_keys,
+            unique,
+            has_force_restore_data_flag)};
 }
 
 
@@ -171,11 +191,15 @@ void applyMetadataChangesToCreateQuery(const ASTPtr & query, const StorageInMemo
     ASTPtr new_columns = InterpreterCreateQuery::formatColumns(metadata.columns);
     ASTPtr new_indices = InterpreterCreateQuery::formatIndices(metadata.secondary_indices);
     ASTPtr new_constraints = InterpreterCreateQuery::formatConstraints(metadata.constraints);
+    ASTPtr new_foreign_keys = InterpreterCreateQuery::formatForeignKeys(metadata.foreign_keys);
+    ASTPtr new_unique = InterpreterCreateQuery::formatUnique(metadata.unique_not_enforced);
     ASTPtr new_projections = InterpreterCreateQuery::formatProjections(metadata.projections);
 
     ast_create_query.columns_list->replace(ast_create_query.columns_list->columns, new_columns);
     ast_create_query.columns_list->setOrReplace(ast_create_query.columns_list->indices, new_indices);
     ast_create_query.columns_list->setOrReplace(ast_create_query.columns_list->constraints, new_constraints);
+    ast_create_query.columns_list->setOrReplace(ast_create_query.columns_list->foreign_keys, new_foreign_keys);
+    ast_create_query.columns_list->setOrReplace(ast_create_query.columns_list->unique, new_unique);
     ast_create_query.columns_list->setOrReplace(ast_create_query.columns_list->projections, new_projections);
 
     if (metadata.select.select_query)
@@ -522,7 +546,11 @@ void DatabaseOnDisk::renameTable(
 ASTPtr DatabaseOnDisk::getCreateTableQueryImpl(const String & table_name, ContextPtr, bool throw_on_error) const
 {
     ASTPtr ast;
-    bool has_table = tryGetTable(table_name, getContext()) != nullptr;
+    StoragePtr storage = tryGetTable(table_name, getContext());
+    bool has_table = storage != nullptr;
+    bool is_system_storage = false;
+    if (has_table)
+        is_system_storage = storage->isSystemStorage();
     auto table_metadata_path = getObjectMetadataPath(table_name);
     try
     {
@@ -533,9 +561,11 @@ ASTPtr DatabaseOnDisk::getCreateTableQueryImpl(const String & table_name, Contex
         if (!has_table && e.code() == ErrorCodes::FILE_DOESNT_EXIST && throw_on_error)
             throw Exception{"Table " + backQuote(table_name) + " doesn't exist",
                             ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY};
-        else if (throw_on_error)
+        else if (!is_system_storage && throw_on_error)
             throw;
     }
+    if (!ast && is_system_storage)
+        ast = getCreateQueryFromStorage(table_name, storage, throw_on_error);
     return ast;
 }
 
@@ -552,12 +582,14 @@ ASTPtr DatabaseOnDisk::getCreateDatabaseQuery() const
         ast_create_query.attach = false;
         ast_create_query.database = database_name;
     }
+    // ast was assigned before it was dereferenced earlier
+    // coverity[check_after_deref]
     if (!ast)
     {
         /// Handle databases (such as default) for which there are no database.sql files.
         /// If database.sql doesn't exist, then engine is Ordinary
         String query = "CREATE DATABASE " + backQuoteIfNeed(getDatabaseName()) + " ENGINE = Ordinary";
-        ParserCreateQuery parser(ParserSettings::valueOf(settings.dialect_type));
+        ParserCreateQuery parser(ParserSettings::valueOf(settings));
         ast = parseQuery(parser, query.data(), query.data() + query.size(), "", 0, settings.max_parser_depth);
     }
 
@@ -670,18 +702,20 @@ ASTPtr DatabaseOnDisk::parseQueryFromMetadata(
 {
     String query;
 
-    try
+    int metadata_file_fd = ::open(metadata_file_path.c_str(), O_RDONLY | O_CLOEXEC);
+
+    if (metadata_file_fd == -1)
     {
-        ReadBufferFromFile in(metadata_file_path, METADATA_FILE_BUFFER_SIZE);
-        readStringUntilEOF(query, in);
-    }
-    catch (const Exception & e)
-    {
-        if (!throw_on_error && e.code() == ErrorCodes::FILE_DOESNT_EXIST)
+        if (errno == ENOENT && !throw_on_error)
             return nullptr;
-        else
-            throw;
+
+        throwFromErrnoWithPath("Cannot open file " + metadata_file_path, metadata_file_path,
+                               errno == ENOENT ? ErrorCodes::FILE_DOESNT_EXIST : ErrorCodes::CANNOT_OPEN_FILE);
     }
+
+
+    ReadBufferFromFile in(metadata_file_fd, metadata_file_path, METADATA_FILE_BUFFER_SIZE);
+    readStringUntilEOF(query, in);
 
     /** Empty files with metadata are generated after a rough restart of the server.
       * Remove these files to slightly reduce the work of the admins on startup.
@@ -695,7 +729,7 @@ ASTPtr DatabaseOnDisk::parseQueryFromMetadata(
     }
 
     auto settings = local_context->getSettingsRef();
-    ParserCreateQuery parser(ParserSettings::valueOf(settings.dialect_type));
+    ParserCreateQuery parser(ParserSettings::valueOf(settings));
     const char * pos = query.data();
     std::string error_message;
     auto ast = tryParseQuery(parser, pos, pos + query.size(), error_message, /* hilite = */ false,
@@ -736,6 +770,34 @@ ASTPtr DatabaseOnDisk::getCreateQueryFromMetadata(const String & database_metada
     }
 
     return ast;
+}
+
+ASTPtr DatabaseOnDisk::getCreateQueryFromStorage(const String & table_name, const StoragePtr & storage, bool throw_on_error) const
+{
+    auto metadata_ptr = storage->getInMemoryMetadataPtr();
+    if (metadata_ptr == nullptr)
+    {
+        if (throw_on_error)
+            throw Exception(ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY, "Cannot get metadata of {}.{}", backQuote(getDatabaseName()), backQuote(table_name));
+        else
+            return nullptr;
+    }
+
+    /// setup create table query storage info.
+    auto ast_engine = std::make_shared<ASTFunction>();
+    ast_engine->name = storage->getName();
+    ast_engine->no_empty_args = true;
+    auto ast_storage = std::make_shared<ASTStorage>();
+    ast_storage->set(ast_storage->engine, ast_engine);
+
+    unsigned max_parser_depth = static_cast<unsigned>(getContext()->getSettingsRef().max_parser_depth);
+    auto create_table_query = DB::getCreateQueryFromStorage(storage,
+                                                            ast_storage,
+                                                            false,
+                                                            max_parser_depth,
+                                                            throw_on_error);
+
+    return create_table_query;
 }
 
 }

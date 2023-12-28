@@ -17,6 +17,8 @@
 
 #include <Interpreters/SystemLog.h>
 #include <Interpreters/KafkaLog.h>
+#include <Interpreters/QueryLog.h>
+#include <Interpreters/MaterializedMySQLLog.h>
 
 
 namespace DB
@@ -24,11 +26,14 @@ namespace DB
 
 class QueryMetricLog;
 class QueryWorkerMetricLog;
+class CnchQueryLog;
 
 // Query metrics definitions
 constexpr auto CNCH_SYSTEM_LOG_QUERY_METRICS_TABLE_NAME = "query_metrics";
 constexpr auto CNCH_SYSTEM_LOG_QUERY_WORKER_METRICS_TABLE_NAME = "query_worker_metrics";
 constexpr auto CNCH_SYSTEM_LOG_KAFKA_LOG_TABLE_NAME = "cnch_kafka_log";
+constexpr auto CNCH_SYSTEM_LOG_QUERY_LOG_TABLE_NAME = "cnch_query_log";
+constexpr auto CNCH_SYSTEM_LOG_MATERIALIZED_MYSQL_LOG_TABLE_NAME = "cnch_materialized_mysql_log";
 
 static inline bool isQueryMetricsTable(const String & database, const String & table)
 {
@@ -53,6 +58,12 @@ public:
         return cloud_kafka_log;
     }
 
+    std::shared_ptr<CloudMaterializedMySQLLog> getMaterializedMySQLLog() const
+    {
+        std::lock_guard<std::mutex> g(mutex);
+        return cloud_materialized_mysql_log;
+    }
+
     std::shared_ptr<QueryMetricLog> getQueryMetricLog() const
     {
         std::lock_guard<std::mutex> g(mutex);
@@ -65,18 +76,33 @@ public:
         return query_worker_metrics;
     }
 
+    std::shared_ptr<CnchQueryLog> getCnchQueryLog() const
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return cnch_query_log;
+    }
+
     void shutdown();
 
 private:
     std::shared_ptr<CloudKafkaLog> cloud_kafka_log;
+    std::shared_ptr<CloudMaterializedMySQLLog> cloud_materialized_mysql_log;
     std::shared_ptr<QueryMetricLog> query_metrics;                /// Used to log query metrics.
     std::shared_ptr<QueryWorkerMetricLog> query_worker_metrics;   /// Used to log query worker metrics.
+    std::shared_ptr<CnchQueryLog> cnch_query_log;
 
     int init_time_in_worker{};
     int init_time_in_server{};
     mutable std::mutex mutex;
     template<typename CloudLog>
     bool initInServerForSingleLog(ContextPtr & global_context,
+        const String & db,
+        const String & tb,
+        const String & config_prefix,
+        const Poco::Util::AbstractConfiguration & config,
+        std::shared_ptr<CloudLog> & cloud_log);
+    template<typename CloudLog>
+    bool initInWorkerForSingleLog(ContextPtr & global_context,
         const String & db,
         const String & tb,
         const String & config_prefix,
@@ -95,6 +121,8 @@ private:
 constexpr auto QUERY_METRICS_CONFIG_PREFIX = "query_metrics";
 constexpr auto QUERY_WORKER_METRICS_CONFIG_PREFIX = "query_worker_metrics";
 constexpr auto CNCH_KAFKA_LOG_CONFIG_PREFIX = "cnch_kafka_log";
+constexpr auto CNCH_QUERY_LOG_CONFIG_PREFIX = "cnch_query_log";
+constexpr auto CNCH_MATERIALIZED_MYSQL_LOG_CONFIG_PREFIX = "cnch_materialized_mysql_log";
 
 /// Instead of typedef - to allow forward declaration.
 class CloudKafkaLog : public CnchSystemLog<KafkaLogElement>
@@ -102,6 +130,13 @@ class CloudKafkaLog : public CnchSystemLog<KafkaLogElement>
 public:
     using CnchSystemLog<KafkaLogElement>::CnchSystemLog;
     void logException(const StorageID & storage_id, String msg, String consumer_id = "");
+};
+
+/// Instead of typedef - to allow forward declaration.
+class CloudMaterializedMySQLLog : public CnchSystemLog<MaterializedMySQLLogElement>
+{
+public:
+    using CnchSystemLog<MaterializedMySQLLogElement>::CnchSystemLog;
 };
 
 } // end namespace

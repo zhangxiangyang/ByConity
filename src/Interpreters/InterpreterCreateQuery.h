@@ -26,6 +26,8 @@
 #include <Interpreters/IInterpreter.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ConstraintsDescription.h>
+#include <Storages/ForeignKeysDescription.h>
+#include <Storages/UniqueNotEnforcedDescription.h>
 #include <Storages/IStorage_fwd.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <Parsers/IParserBase.h>
@@ -56,6 +58,8 @@ public:
     static ASTPtr formatColumns(const ColumnsDescription & columns);
     static ASTPtr formatIndices(const IndicesDescription & indices);
     static ASTPtr formatConstraints(const ConstraintsDescription & constraints);
+    static ASTPtr formatForeignKeys(const ForeignKeysDescription & foreign_keys);
+    static ASTPtr formatUnique(const UniqueNotEnforcedDescription & unique);
     static ASTPtr formatProjections(const ProjectionsDescription & projections);
 
     void setForceRestoreData(bool has_force_restore_data_flag_)
@@ -77,6 +81,8 @@ public:
     ///  for case when columns in CREATE query is specified explicitly.
     static ColumnsDescription getColumnsDescription(const ASTExpressionList & columns, ContextPtr context, bool attach);
     static ConstraintsDescription getConstraintsDescription(const ASTExpressionList * constraints);
+    static ForeignKeysDescription getForeignKeysDescription(const ASTExpressionList * foreign_keys);
+    static UniqueNotEnforcedDescription getUniqueNotEnforcedDescription(const ASTExpressionList * unique);
 
     static void prepareOnClusterQuery(ASTCreateQuery & create, ContextPtr context, const String & cluster_name);
 
@@ -88,9 +94,11 @@ private:
         ColumnsDescription columns;
         IndicesDescription indices;
         ConstraintsDescription constraints;
+        ForeignKeysDescription foreign_keys;
+        UniqueNotEnforcedDescription unique;
         ProjectionsDescription projections;
     };
-
+    BlockIO createExternalCatalog(ASTCreateQuery & create);
     BlockIO createDatabase(ASTCreateQuery & create);
     BlockIO createTable(ASTCreateQuery & create);
 
@@ -108,6 +116,8 @@ private:
 
     void assertOrSetUUID(ASTCreateQuery & create, const DatabasePtr & database) const;
 
+    size_t processIgnoreBitEngineEncode(ColumnsDescription & columns) const;
+
     ASTPtr query_ptr;
 
     /// Skip safety threshold when loading tables.
@@ -119,4 +129,6 @@ private:
     mutable String as_database_saved;
     mutable String as_table_saved;
 };
+
+ASTPtr convertMergeTreeToCnchEngine(ASTPtr query_ptr);
 }

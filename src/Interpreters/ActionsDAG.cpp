@@ -30,6 +30,7 @@
 #include <Functions/materialize.h>
 #include <Functions/FunctionsLogical.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ArrayJoinAction.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/Operators.h>
 #include <IO/ReadHelpers.h>
@@ -102,7 +103,7 @@ void ActionsDAG::Node::serialize(WriteBuffer & buf) const
     writeBinary(children.size(), buf);
     for (const auto & child : children)
         writeBinary(child->id, buf);
-
+    
     serializeEnum(type, buf);
 
     writeBinary(result_name, buf);
@@ -298,7 +299,8 @@ const ActionsDAG::Node & ActionsDAG::addAlias(const Node & child, std::string al
 
 const ActionsDAG::Node & ActionsDAG::addArrayJoin(const Node & child, std::string result_name)
 {
-    const DataTypeArray * array_type = typeid_cast<const DataTypeArray *>(child.result_type.get());
+    const auto & array_type = getArrayJoinDataType(child.result_type);
+
     if (!array_type)
         throw Exception("ARRAY JOIN requires array argument", ErrorCodes::TYPE_MISMATCH);
 
@@ -483,7 +485,7 @@ std::string ActionsDAG::dumpNames() const
     return out.str();
 }
 
-void ActionsDAG::removeUnusedActions(const NameSet & required_names)
+void ActionsDAG::removeUnusedActions(const NameSet & required_names, bool allow_constant_folding)
 {
     NodeRawConstPtrs required_nodes;
     required_nodes.reserve(required_names.size());
@@ -507,10 +509,10 @@ void ActionsDAG::removeUnusedActions(const NameSet & required_names)
     }
 
     index.swap(required_nodes);
-    removeUnusedActions();
+    removeUnusedActions(true, allow_constant_folding);
 }
 
-void ActionsDAG::removeUnusedActions(const Names & required_names)
+void ActionsDAG::removeUnusedActions(const Names & required_names, bool allow_constant_folding)
 {
     NodeRawConstPtrs required_nodes;
     required_nodes.reserve(required_names.size());
@@ -530,10 +532,10 @@ void ActionsDAG::removeUnusedActions(const Names & required_names)
     }
 
     index.swap(required_nodes);
-    removeUnusedActions();
+    removeUnusedActions(true, allow_constant_folding);
 }
 
-void ActionsDAG::removeUnusedActions(bool allow_remove_inputs)
+void ActionsDAG::removeUnusedActions(bool allow_remove_inputs, bool allow_constant_folding)
 {
     std::unordered_set<const Node *> visited_nodes;
     std::stack<Node *> stack;
@@ -564,7 +566,7 @@ void ActionsDAG::removeUnusedActions(bool allow_remove_inputs)
         auto * node = stack.top();
         stack.pop();
 
-        if (!node->children.empty() && node->column && isColumnConst(*node->column))
+        if (allow_constant_folding && !node->children.empty() && node->column && isColumnConst(*node->column))
         {
             /// Constant folding.
             node->type = ActionsDAG::ActionType::COLUMN;
@@ -614,8 +616,8 @@ static ColumnWithTypeAndName executeActionForHeader(const ActionsDAG::Node * nod
         {
             auto key = arguments.at(0);
             key.column = key.column->convertToFullColumnIfConst();
+            const auto * array = getArrayJoinColumnRawPtr(key.column);
 
-            const ColumnArray * array = typeid_cast<const ColumnArray *>(key.column.get());
             if (!array)
                 throw Exception(ErrorCodes::TYPE_MISMATCH,
                                 "ARRAY JOIN of not array: {}", node->result_name);
@@ -1557,7 +1559,7 @@ ActionsDAG::SplitResult ActionsDAG::split(std::unordered_set<const Node *> split
                         new_inputs.push_back(cur.node);
                     }
                 }
-                
+
                 stack.pop();
             }
         }

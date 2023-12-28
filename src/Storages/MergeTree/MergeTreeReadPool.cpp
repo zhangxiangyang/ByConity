@@ -21,6 +21,7 @@
 
 #include <Storages/MergeTree/MergeTreeReadPool.h>
 #include <Storages/MergeTree/MergeTreeBaseSelectProcessor.h>
+#include <Storages/MergeTree/FilterWithRowUtils.h>
 #include <Common/formatReadable.h>
 #include <common/range.h>
 
@@ -29,6 +30,7 @@ namespace ProfileEvents
 {
     extern const Event SlowRead;
     extern const Event ReadBackoff;
+    extern const Event TaskStealCount;
 }
 
 namespace ErrorCodes
@@ -46,7 +48,7 @@ MergeTreeReadPool::MergeTreeReadPool(
     MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter_,
     const MergeTreeMetaBase & data_,
     const StorageMetadataPtr & metadata_snapshot_,
-    const PrewhereInfoPtr & prewhere_info_,
+    const SelectQueryInfo & query_info_,
     const bool check_columns_,
     const Names & column_names_,
     const BackoffSettings & backoff_settings_,
@@ -59,11 +61,11 @@ MergeTreeReadPool::MergeTreeReadPool(
     , column_names{column_names_}
     , do_not_steal_tasks{do_not_steal_tasks_}
     , predict_block_size_bytes{preferred_block_size_bytes_ > 0}
-    , prewhere_info{prewhere_info_}
+    , prewhere_info{getPrewhereInfo(query_info_)}
     , parts_ranges{std::move(parts_)}
 {
     /// parts don't contain duplicate MergeTreeDataPart's.
-    const auto per_part_sum_marks = fillPerPartInfo(parts_ranges, delete_bitmap_getter_, check_columns_);
+    const auto per_part_sum_marks = fillPerPartInfo(parts_ranges, delete_bitmap_getter_, getIndexContext(query_info_), check_columns_);
     fillPerThreadInfo(threads_, sum_marks_, per_part_sum_marks, parts_ranges, min_marks_for_concurrent_read_);
 }
 
@@ -102,6 +104,7 @@ MergeTreeReadTaskPtr MergeTreeReadPool::getTask(const size_t min_marks_to_read, 
                 it = remaining_thread_tasks.begin();
             thread_idx = *it;
         }
+        ProfileEvents::increment(ProfileEvents::TaskStealCount);
     }
     auto & thread_tasks = threads_tasks[thread_idx];
 
@@ -111,13 +114,26 @@ MergeTreeReadTaskPtr MergeTreeReadPool::getTask(const size_t min_marks_to_read, 
     auto & part = parts_with_idx[part_idx];
     auto & marks_in_part = thread_tasks.sum_marks_in_parts.back();
 
-    /// Get whole part to read if it is small enough.
-    auto need_marks = std::min(marks_in_part, min_marks_to_read);
+    auto need_marks = min_marks_to_read;
 
-    /// Do not leave too little rows in part for next time.
-    if (marks_in_part > need_marks &&
-        marks_in_part - need_marks < min_marks_to_read)
-        need_marks = marks_in_part;
+    // If there are remaining tasks can be stolen, read the whole part
+    // For remote storage like S3, we can send less net request if task is bigger
+    if (thread_tasks.parts_and_ranges.size() > 1) {
+        need_marks = marks_in_part; 
+    } else {
+        // If only last part is left, get whole part to read if it is small enough.
+        if (marks_in_part <= min_marks_to_read)
+            need_marks = marks_in_part;
+        // Else, we read certain proportion of part, left a proportion to steal
+        // TODO: set this proportion as configurable
+        else
+            need_marks = marks_in_part * 2 / 3;
+
+        // Do not leave too little rows in part for next time.
+        if (marks_in_part > need_marks &&
+            marks_in_part - need_marks < min_marks_to_read)
+            need_marks = marks_in_part;
+    }
 
     MarkRanges ranges_to_get_from_part;
 
@@ -155,37 +171,13 @@ MergeTreeReadTaskPtr MergeTreeReadPool::getTask(const size_t min_marks_to_read, 
         }
     }
 
-    auto curr_task_size_predictor = !per_part_size_predictor[part_idx] ? nullptr
-        : std::make_unique<MergeTreeBlockSizePredictor>(*per_part_size_predictor[part_idx]); /// make a copy
+    auto curr_task_size_predictor = !per_part_params[part_idx].size_predictor ? nullptr
+        : std::make_unique<MergeTreeBlockSizePredictor>(*per_part_params[part_idx].size_predictor); /// make a copy
 
     return std::make_unique<MergeTreeReadTask>(
         part.data_part, part.delete_bitmap, ranges_to_get_from_part, part.part_index_in_query, ordered_names,
-        per_part_column_name_set[part_idx], per_part_columns[part_idx], per_part_pre_columns[part_idx],
-        prewhere_info && prewhere_info->remove_prewhere_column, per_part_should_reorder[part_idx], std::move(curr_task_size_predictor));
-}
-
-MarkRanges MergeTreeReadPool::getRestMarks(const IMergeTreeDataPart & part, const MarkRange & from) const
-{
-    MarkRanges all_part_ranges;
-
-    /// Inefficient in presence of large number of data parts.
-    for (const auto & part_ranges : parts_ranges)
-    {
-        if (part_ranges.data_part.get() == &part)
-        {
-            all_part_ranges = part_ranges.ranges;
-            break;
-        }
-    }
-    if (all_part_ranges.empty())
-        throw Exception("Trying to read marks range [" + std::to_string(from.begin) + ", " + std::to_string(from.end) + "] from part '"
-            + part.getFullPath() + "' which has no ranges in this query", ErrorCodes::LOGICAL_ERROR);
-
-    auto begin = std::lower_bound(all_part_ranges.begin(), all_part_ranges.end(), from, [] (const auto & f, const auto & s) { return f.begin < s.begin; });
-    if (begin == all_part_ranges.end())
-        begin = std::prev(all_part_ranges.end());
-    begin->begin = from.begin;
-    return MarkRanges(begin, all_part_ranges.end());
+        per_part_params[part_idx].column_name_set, per_part_params[part_idx].task_columns,
+        prewhere_info && prewhere_info->remove_prewhere_column, per_part_params[part_idx].should_reorder, std::move(curr_task_size_predictor));
 }
 
 Block MergeTreeReadPool::getHeader() const
@@ -234,7 +226,7 @@ void MergeTreeReadPool::profileFeedback(const ReadBufferFromFileBase::ProfileInf
 
 
 std::vector<size_t> MergeTreeReadPool::fillPerPartInfo(
-    const RangesInDataParts & parts, MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter, const bool check_columns)
+    const RangesInDataParts & parts, MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter, const MergeTreeIndexContextPtr & index_context, const bool check_columns)
 {
     std::vector<size_t> per_part_sum_marks;
     Block sample_block = metadata_snapshot->getSampleBlock();
@@ -250,26 +242,21 @@ std::vector<size_t> MergeTreeReadPool::fillPerPartInfo(
 
         per_part_sum_marks.push_back(sum_marks);
 
-        auto [required_columns, required_pre_columns, should_reorder] =
-            getReadTaskColumns(data, metadata_snapshot, part.data_part, column_names, prewhere_info, check_columns);
+        auto task_columns =
+            getReadTaskColumns(data, metadata_snapshot, part.data_part, column_names, prewhere_info, index_context, check_columns);
 
-        /// will be used to distinguish between PREWHERE and WHERE columns when applying filter
-        const auto & required_column_names = required_columns.getNames();
-        per_part_column_name_set.emplace_back(required_column_names.begin(), required_column_names.end());
-
-        per_part_pre_columns.push_back(std::move(required_pre_columns));
-        per_part_columns.push_back(std::move(required_columns));
-        per_part_should_reorder.push_back(should_reorder);
-
-        parts_with_idx.emplace_back(part.data_part, part.part_index_in_query, delete_bitmap_getter(part.data_part));
+        PerPartParams params;
+        const auto & required_column_names = task_columns.columns.getNames();
+        params.column_name_set = NameSet{required_column_names.begin(), required_column_names.end()};
+        params.should_reorder = task_columns.should_reorder;
+        parts_with_idx.push_back({ part.data_part, part.part_index_in_query, combineFilterBitmap(part, delete_bitmap_getter)});
 
         if (predict_block_size_bytes)
-        {
-            per_part_size_predictor.emplace_back(std::make_unique<MergeTreeBlockSizePredictor>(
-                part.data_part, column_names, sample_block));
-        }
-        else
-            per_part_size_predictor.emplace_back(nullptr);
+            params.size_predictor = std::make_unique<MergeTreeBlockSizePredictor>(
+                part.data_part, column_names, sample_block);
+
+        params.task_columns = std::move(task_columns);
+        per_part_params.emplace_back(std::move(params));
     }
 
     return per_part_sum_marks;

@@ -37,6 +37,9 @@
 
 #include <sparsehash/dense_hash_map>
 #include <sparsehash/dense_hash_set>
+#include <Common/typeid_cast.h>
+#include <Storages/ForeignKeysDescription.h>
+#include <Storages/UniqueNotEnforcedDescription.h>
 
 
 namespace DB
@@ -56,6 +59,8 @@ StorageInMemoryMetadata::StorageInMemoryMetadata(const StorageInMemoryMetadata &
     : columns(other.columns)
     , secondary_indices(other.secondary_indices)
     , constraints(other.constraints)
+    , foreign_keys(other.foreign_keys)
+    , unique_not_enforced(other.unique_not_enforced)
     , projections(other.projections.clone())
     , partition_key(other.partition_key)
     , cluster_by_key(other.cluster_by_key)
@@ -79,6 +84,8 @@ StorageInMemoryMetadata & StorageInMemoryMetadata::operator=(const StorageInMemo
     columns = other.columns;
     secondary_indices = other.secondary_indices;
     constraints = other.constraints;
+    foreign_keys = other.foreign_keys;
+    unique_not_enforced = other.unique_not_enforced;
     projections = other.projections.clone();
     partition_key = other.partition_key;
     cluster_by_key = other.cluster_by_key;
@@ -117,6 +124,16 @@ void StorageInMemoryMetadata::setSecondaryIndices(IndicesDescription secondary_i
 void StorageInMemoryMetadata::setConstraints(ConstraintsDescription constraints_)
 {
     constraints = std::move(constraints_);
+}
+
+void StorageInMemoryMetadata::setForeignKeys(ForeignKeysDescription foreign_keys_)
+{
+    foreign_keys = std::move(foreign_keys_);
+}
+
+void StorageInMemoryMetadata::setUniqueNotEnforced(UniqueNotEnforcedDescription unique_)
+{
+    unique_not_enforced = std::move(unique_);
 }
 
 void StorageInMemoryMetadata::setProjections(ProjectionsDescription projections_)
@@ -165,6 +182,16 @@ bool StorageInMemoryMetadata::hasSecondaryIndices() const
 const ConstraintsDescription & StorageInMemoryMetadata::getConstraints() const
 {
     return constraints;
+}
+
+const ForeignKeysDescription & StorageInMemoryMetadata::getForeignKeys() const
+{
+    return foreign_keys;
+}
+
+const UniqueNotEnforcedDescription & StorageInMemoryMetadata::getUniqueNotEnforced() const
+{
+    return unique_not_enforced;
 }
 
 const ProjectionsDescription & StorageInMemoryMetadata::getProjections() const
@@ -389,8 +416,26 @@ Block StorageInMemoryMetadata::getSampleBlock(bool include_func_columns) const
     return res;
 }
 
+Block StorageInMemoryMetadata::getSampleBlockWithDeleteFlag() const
+{
+    Block res = getSampleBlock();
+
+    auto delete_flag_column = getFuncColumns().tryGetByName(DELETE_FLAG_COLUMN_NAME);
+    if (delete_flag_column)
+        res.insert({delete_flag_column->type->createColumn(), delete_flag_column->type, delete_flag_column->name});
+    else
+        throw Exception(
+            ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK,
+            "Column _delete_flag_ doesn't exist when executing method getSampleBlockWithDeleteFlag.");
+
+    return res;
+}
+
 Block StorageInMemoryMetadata::getSampleBlockForColumns(
-    const Names & column_names, const NamesAndTypesList & virtuals, const StorageID & storage_id) const
+    const Names & column_names,
+    const NamesAndTypesList & virtuals,
+    const StorageID & storage_id,
+    BitEngineReadType bitengine_read_type) const
 {
     Block res;
 
@@ -408,6 +453,9 @@ Block StorageInMemoryMetadata::getSampleBlockForColumns(
         if (column)
         {
             auto column_name = column->name;
+            if (isBitmap64(column->type) && column->type->isBitEngineEncode()
+                && bitengine_read_type == BitEngineReadType::ONLY_ENCODE)
+                column_name += BITENGINE_COLUMN_EXTENSION;
             res.insert({column->type->createColumn(), column->type, column_name});
         }
         else if (auto it = virtuals_map.find(name); it != virtuals_map.end())
@@ -482,6 +530,13 @@ Names StorageInMemoryMetadata::getColumnsForClusterByKey() const
     return {};
 }
 
+Names StorageInMemoryMetadata::getColumnsRequiredForClusterByKey() const
+{
+    if (hasClusterByKey())
+        return cluster_by_key.expression->getRequiredColumns();
+    return {};
+}
+
 Int64 StorageInMemoryMetadata::getBucketNumberFromClusterByKey() const
 {
     if (isClusterByKeyDefined())
@@ -501,6 +556,34 @@ bool StorageInMemoryMetadata::getWithRangeFromClusterByKey() const
     if (hasClusterByKey())
         return cluster_by_key.definition_ast->as<ASTClusterByElement>()->is_with_range;
     return false;
+}
+
+bool StorageInMemoryMetadata::getIsUserDefinedExpressionFromClusterByKey() const
+{
+    if (hasClusterByKey())
+        return cluster_by_key.definition_ast->as<ASTClusterByElement>()->is_user_defined_expression;
+    return false;
+}
+
+bool StorageInMemoryMetadata::checkIfClusterByKeySameWithUniqueKey() const
+{
+    if (!hasUniqueKey())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Only unique table can call method checkIfClusterByKeySameWithUniqueKey, but it's not unique table.");
+    if (!isClusterByKeyDefined())
+        return false;
+
+    /// If required columns are same in unique key and cluster by expression, we can make sure that all same unique key will split into the same bucket while writing.
+    Names unique_key_required_columns = getColumnsRequiredForUniqueKey();
+    Names cluster_by_key_required_columns = getColumnsRequiredForClusterByKey();
+    if (unique_key_required_columns.size() != cluster_by_key_required_columns.size())
+        return false;
+    NameSet unique_key_required_columns_set = {unique_key_required_columns.begin(), unique_key_required_columns.end()};
+    for (const auto & column: cluster_by_key_required_columns)
+    {
+        if (!unique_key_required_columns_set.count(column))
+            return false;
+    }
+    return true;
 }
 
 const KeyDescription & StorageInMemoryMetadata::getSortingKey() const
@@ -842,5 +925,6 @@ bool StorageInMemoryMetadata::hasMapColumn() const
     }
     return false;
 }
+
 
 }

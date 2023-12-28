@@ -31,15 +31,19 @@ namespace CnchBGThread
         PartGC = 1,
         MergeMutate = 2,
         Consumer = 3,
-        DedupWorker = 4,
-        Clustering = 5,
+        MemoryBuffer = 4, /// NOTE: Just reserved for compatibility.
+        DedupWorker = 5,
+        Clustering = 6,
+        MaterializedMySQL = 7,
+        
         ServerMinType = PartGC,
-        ServerMaxType = Clustering,
+        ServerMaxType = MaterializedMySQL,
 
         GlobalGC = 20, /// reserve several entries
         TxnGC = 21,
+        AutoStatistics = 22,
         DaemonMinType = GlobalGC,
-        DaemonMaxType = TxnGC,
+        DaemonMaxType = AutoStatistics,
 
         ResourceReport = 30, /// worker
         WorkerMinType = ResourceReport, /// Enum to mark start of worker types
@@ -86,10 +90,16 @@ constexpr auto toString(CnchBGThreadType type)
             return "DedupWorkerManager";
         case CnchBGThreadType::GlobalGC:
             return "GlobalGCThread";
+        case CnchBGThreadType::AutoStatistics:
+            return "AutoStatistics";
         case CnchBGThreadType::TxnGC:
             return "TxnGCThread";
         case CnchBGThreadType::ResourceReport:
             return "ResourceReport";
+        case CnchBGThreadType::MemoryBuffer:
+            return "MemoryBuffer";
+        case CnchBGThreadType::MaterializedMySQL:
+            return "MaterializedMySQL";
     }
     __builtin_unreachable();
 }

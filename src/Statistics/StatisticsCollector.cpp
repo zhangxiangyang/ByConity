@@ -21,12 +21,17 @@
 #include <Statistics/CacheManager.h>
 #include <Statistics/CachedStatsProxy.h>
 #include <Statistics/CollectStep.h>
+#include <Statistics/HiveConverter.h>
+#include <Statistics/SimplifyHistogram.h>
 #include <Statistics/StatisticsCollector.h>
 #include <Statistics/StatsNdvBucketsImpl.h>
 #include <Statistics/SubqueryHelper.h>
 #include <Statistics/TypeUtils.h>
+#include <Storages/Hive/StorageCnchHive.h>
 #include <boost/algorithm/string/join.hpp>
 #include <common/logger_useful.h>
+#include <DataTypes/DataTypeDateTime64.h>
+#include <Functions/now64.h>
 
 namespace DB::Statistics
 {
@@ -46,6 +51,11 @@ void StatisticsCollector::collect(const ColumnDescVector & cols_desc)
 
     step->collect(cols_desc);
     step->writeResult(table_stats, columns_stats);
+    if (auto basic = table_stats.basic)
+    {
+        auto timestamp = nowSubsecondDt64(DataTypeDateTime64::default_scale);
+        basic->setTimestamp(timestamp);
+    }
 }
 
 void StatisticsCollector::writeToCatalog()
@@ -60,20 +70,19 @@ void StatisticsCollector::writeToCatalog()
     {
         data.column_stats[name] = stats.writeToCollection();
     }
-    auto proxy = createCachedStatsProxy(catalog);
+    auto proxy = createCachedStatsProxy(catalog, settings.cache_policy);
     proxy->put(table_info, std::move(data));
     catalog->invalidateClusterStatsCache(table_info);
+    // clear udi whenever it is to create/drop stats
+    // since after manual drop stats, users just don't want statistics,
+    // so we needn't care about udi for auto stats until next insertion
+    catalog->removeUdiCount(table_info);
 }
 
 void StatisticsCollector::readAllFromCatalog()
 {
-    auto proxy = createCachedStatsProxy(catalog);
-    auto data = proxy->get(table_info);
-    table_stats.readFromCollection(data.table_stats);
-    for (auto & [name, stats] : data.column_stats)
-    {
-        columns_stats[name].readFromCollection(stats);
-    }
+    auto cols = catalog->getCollectableColumns(table_info);
+    readFromCatalogImpl(cols);
 }
 
 void StatisticsCollector::readFromCatalog(const std::vector<String> & cols_name)
@@ -84,8 +93,9 @@ void StatisticsCollector::readFromCatalog(const std::vector<String> & cols_name)
 
 void StatisticsCollector::readFromCatalogImpl(const ColumnDescVector & cols_desc)
 {
-    auto proxy = createCachedStatsProxy(catalog);
+    auto proxy = createCachedStatsProxy(catalog, settings.cache_policy);
     auto data = proxy->get(table_info, true, cols_desc);
+
     if (data.table_stats.empty() && data.column_stats.empty())
     {
         // no stats collected, do nothing
@@ -106,6 +116,25 @@ void StatisticsCollector::readFromCatalogImpl(const ColumnDescVector & cols_desc
     }
 }
 
+static bool isInteger(SerdeDataType type)
+{
+    switch (type)
+    {
+        case SerdeDataType::UInt8:
+        case SerdeDataType::UInt16:
+        case SerdeDataType::UInt32:
+        case SerdeDataType::UInt64:
+        case SerdeDataType::Int8:
+        case SerdeDataType::Int16:
+        case SerdeDataType::Int32:
+        case SerdeDataType::Int64:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
 std::optional<PlanNodeStatisticsPtr> StatisticsCollector::toPlanNodeStatistics() const
 {
     if (!table_stats.basic)
@@ -117,6 +146,7 @@ std::optional<PlanNodeStatisticsPtr> StatisticsCollector::toPlanNodeStatistics()
     auto result = std::make_shared<PlanNodeStatistics>();
     auto table_row_count = table_stats.basic->getRowCount();
     result->updateRowCount(table_row_count);
+
     // whether to construct single bucket histogram from min/max if there is no histogram
     for (auto & [col, stats] : columns_stats)
     {
@@ -135,12 +165,24 @@ std::optional<PlanNodeStatisticsPtr> StatisticsCollector::toPlanNodeStatistics()
             if (stats.ndv_buckets_result)
             {
                 stats.ndv_buckets_result->writeSymbolStatistics(*symbol);
+
+                if (context->getSettingsRef().statistics_simplify_histogram)
+                {
+                    auto is_integer = isInteger(stats.ndv_buckets_result->getSerdeDataType());
+
+                    auto ndv_thres = context->getSettingsRef().statistics_simplify_histogram_ndv_density_threshold;
+                    auto range_thres = context->getSettingsRef().statistics_simplify_histogram_range_density_threshold;
+
+                    symbol->histogram = simplifyHistogram(symbol->histogram, ndv_thres, range_thres, is_integer);
+                }
             }
             else if (construct_single_bucket_histogram)
             {
                 auto bucket = Bucket(symbol->min, symbol->max, symbol->ndv, nonnull_count, true, true);
                 symbol->histogram.emplaceBackBucket(std::move(bucket));
             }
+
+
             result->updateSymbolStatistics(col, symbol);
         }
     }

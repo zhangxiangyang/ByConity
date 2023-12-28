@@ -15,12 +15,29 @@
 
 #include <Optimizer/Iterative/IterativeRewriter.h>
 #include <Optimizer/Rule/Patterns.h>
+#include <QueryPlan/GraphvizPrinter.h>
 
 namespace DB
 {
 namespace ErrorCodes
 {
     extern const int OPTIMIZER_TIMEOUT;
+}
+
+// #define TEST_RECORD_RULE_CALL_TIMES
+
+#ifdef TEST_RECORD_RULE_CALL_TIMES
+static std::map<std::underlying_type_t<RuleType>, size_t> rule_call_times {};
+#endif
+
+std::map<std::underlying_type_t<RuleType>, size_t> IterativeRewriter::getRuleCallTimes()
+{
+#ifdef TEST_RECORD_RULE_CALL_TIMES
+    return rule_call_times;
+#else
+    std::map<std::underlying_type_t<RuleType>, size_t> empty;
+    return empty;
+#endif
 }
 
 IterativeRewriter::IterativeRewriter(const std::vector<RulePtr> & rules_, std::string names_) : names(std::move(names_))
@@ -49,7 +66,9 @@ void IterativeRewriter::rewrite(QueryPlan & plan, ContextMutablePtr ctx) const
         .globalContext = ctx,
         .cte_info = plan.getCTEInfo(),
         .start_time = std::chrono::system_clock::now(),
-        .optimizer_timeout = ctx->getSettingsRef().iterative_optimizer_timeout};
+        .optimizer_timeout = ctx->getSettingsRef().iterative_optimizer_timeout,
+        .excluded_rules_map = &ctx->getExcludedRulesMap(),
+        .plan = plan};
 
     for (auto & item : plan.getCTEInfo().getCTEs())
         explorePlan(item.second, context);
@@ -83,26 +102,54 @@ bool IterativeRewriter::exploreNode(PlanNodePtr & node, IterativeRewriterContext
         auto node_type = node->getStep()->getType();
         if (auto res = rules.find(node_type); res != rules.end())
         {
-            auto & rules_of_this_type = res->second;
+            const auto & rules_of_this_type = res->second;
             for (auto iter = rules_of_this_type.begin();
                  // we can break the loop if the sub-plan has been entirely removed or the node type has been changed
                  node && node->getStep()->getType() == node_type && iter != rules_of_this_type.end();
                  ++iter)
             {
                 const auto & rule = *iter;
+                auto node_id = node->getId();
+                auto rule_id = static_cast<std::underlying_type_t<RuleType>>(rule->getType());
                 if (!rule->isEnabled(ctx.globalContext))
+                    continue;
+
+                if (ctx.excluded_rules_map->operator[](node_id).count(rule_id))
                     continue;
 
                 checkTimeoutNotExhausted(rule->getName(), ctx);
 
                 RuleContext rule_context{.context = ctx.globalContext, .cte_info = ctx.cte_info};
+#ifdef TEST_RECORD_RULE_CALL_TIMES
+                rule_call_times[rule_id]++;
+#endif
                 auto rewrite_result = rule->transform(node, rule_context);
 
                 if (!rewrite_result.empty())
                 {
+                    if (rule->excludeIfTransformSuccess())
+                        ctx.excluded_rules_map->operator[](node_id).emplace(rule_id);
                     node = rewrite_result.getPlans()[0];
                     done = false;
                     progress = true;
+                    if (ctx.globalContext->getSettingsRef().debug_iterative_optimizer)
+                    {
+                        // avoid too many file generated in case of infinite loop
+                        if (ctx.rule_apply_count < 100)
+                        {
+                            // graphviz file path: Iterative_{rewriterName}_{ruleApplyCount}_{ruleName}_{beforeNodeId}_{afterNodeId}...
+                            GraphvizPrinter::printLogicalPlan(
+                                ctx.plan,
+                                ctx.globalContext,
+                                "Iterative_" + name() + "_" + std::to_string(ctx.rule_apply_count++) + "_" + rule->getName() + "_"
+                                    + std::to_string(node_id) + "_" + std::to_string(node->getId()));
+                        }
+                    }
+                }
+                else
+                {
+                    if (rule->excludeIfTransformFailure())
+                        ctx.excluded_rules_map->operator[](node_id).emplace(rule_id);
                 }
             }
         }
@@ -116,25 +163,20 @@ bool IterativeRewriter::exploreChildren(PlanNodePtr & plan, IterativeRewriterCon
     bool progress = false;
 
     PlanNodes children;
-    DataStreams inputs;
 
-    for (PlanNodePtr child : plan->getChildren())
+    for (PlanNodePtr & child : plan->getChildren())
     {
         progress |= explorePlan(child, ctx);
 
         if (child)
         {
             children.emplace_back(child);
-            inputs.push_back(child->getStep()->getOutputStream());
         }
     }
 
     if (progress)
     {
         plan->replaceChildren(children);
-        auto new_step = plan->getStep()->copy(ctx.globalContext);
-        new_step->setInputStreams(inputs);
-        plan->setStep(new_step);
     }
 
     return progress;

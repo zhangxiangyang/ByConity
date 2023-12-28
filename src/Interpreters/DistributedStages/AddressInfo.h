@@ -22,6 +22,11 @@
 
 namespace DB
 {
+namespace Protos
+{
+    class AddressInfo;
+}
+
     class WriteBuffer;
     class ReadBuffer;
 
@@ -35,6 +40,8 @@ namespace DB
 
         void serialize(WriteBuffer &) const;
         void deserialize(ReadBuffer &);
+        void toProto(Protos::AddressInfo & proto) const;
+        void fillFromProto(const Protos::AddressInfo & proto);
 
         const String & getHostName() const { return host_name; }
         UInt16 getPort() const { return port; }
@@ -50,7 +57,6 @@ namespace DB
             ostr << "host_name: " << host_name << ", "
                  << "port: " << std::to_string(port) << ", "
                  << "user: " <<  user << ", "
-                 << "password: " << password << ", "
                  << "exchange_port: " << exchange_port << ", "
                  << "exchange_status_port: " << exchange_status_port;
             return ostr.str();
@@ -66,6 +72,14 @@ namespace DB
                 return ret < 0;
             return port < rhs.port;
         }
+        class Hash
+        {
+        public:
+            size_t operator()(const AddressInfo & key) const
+            {
+                return std::hash<std::string_view>{}(key.host_name) + static_cast<size_t>(key.port);
+            }
+        };
 
     private:
         String host_name;

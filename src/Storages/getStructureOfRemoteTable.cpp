@@ -81,6 +81,8 @@ ColumnsDescription getStructureOfRemoteTableInShard(
     ColumnsDescription res;
 
     auto new_context = ClusterProxy::updateSettingsForCluster(cluster, context, context->getSettingsRef());
+    if (context->isEnabledWorkerFaultTolerance())
+        new_context->setSetting("skip_unavailable_shards", Field{true});
 
     /// Expect only needed columns from the result of DESC TABLE. NOTE 'comment' column is ignored for compatibility reasons.
     Block sample_block
@@ -100,7 +102,7 @@ ColumnsDescription getStructureOfRemoteTableInShard(
 
     const DataTypeFactory & data_type_factory = DataTypeFactory::instance();
 
-    ParserExpression expr_parser(ParserSettings::valueOf(context->getSettingsRef().dialect_type));
+    ParserExpression expr_parser(ParserSettings::valueOf(context->getSettingsRef()));
 
     while (Block current = input->read())
     {

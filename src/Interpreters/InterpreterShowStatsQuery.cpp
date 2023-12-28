@@ -13,13 +13,16 @@
  * limitations under the License.
  */
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <DataStreams/BlocksListBlockInputStream.h>
 #include <Interpreters/InterpreterShowStatsQuery.h>
-#include <Optimizer/Dump/PlanDump.h>
+#include <Optimizer/Dump/DDLDumper.h>
+#include <Optimizer/Dump/StatsLoader.h>
 #include <Parsers/ASTStatsQuery.h>
+#include <Statistics/CachedStatsProxy.h>
 #include <Statistics/FormattedOutput.h>
 #include <Statistics/StatisticsCollector.h>
 #include <Statistics/StatsColumnBasic.h>
@@ -28,9 +31,20 @@
 #include <Statistics/serde_extend.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <Poco/Timestamp.h>
+#include <Storages/StorageMaterializedView.h>
+#include "Core/Block.h"
+#include "Core/Types.h"
+#include "Core/UUID.h"
+#include "Statistics/AutoStatisticsHelper.h"
 
 namespace DB
 {
+
+namespace Statistics
+{
+    std::shared_ptr<StatsTableBasic> getTableStatistics(ContextPtr context, const StatsTableIdentifier & table);
+}
+
 namespace ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
@@ -38,13 +52,21 @@ namespace ErrorCodes
     extern const int UNKNOWN_TABLE;
     extern const int FILE_NOT_FOUND;
 }
+using Protos::DbStats;
+using Protos::DbStats_Version_V1;
+using Protos::DbStats_Version_V2;
 using namespace Statistics;
 
+
 std::vector<FormattedOutputData> getTableFormattedOutput(
-    ContextPtr context, CatalogAdaptorPtr catalog, const StatsTableIdentifier & table_info, const std::vector<String> & column_names)
+    ContextPtr context,
+    CatalogAdaptorPtr catalog,
+    const CollectorSettings & collector_settings,
+    const StatsTableIdentifier & table_info,
+    const std::vector<String> & column_names)
 {
     std::vector<FormattedOutputData> results;
-    StatisticsCollector collector_impl(context, catalog, table_info);
+    StatisticsCollector collector_impl(context, catalog, table_info, collector_settings);
     ColumnDescVector cols_desc;
     if (column_names.empty())
     {
@@ -106,7 +128,7 @@ std::vector<FormattedOutputData> getTableFormattedOutput(
 
 void writeDbStats(ContextPtr context, const String & db_name, const String & path)
 {
-    Protos::DbStats db_stats;
+    DbStats db_stats;
     db_stats.set_db_name(db_name);
     db_stats.set_version(PROTO_VERSION);
     auto catalog = createCatalogAdaptor(context);
@@ -145,36 +167,23 @@ void writeDbStats(ContextPtr context, const String & db_name, const String & pat
     std::ofstream fout(path, std::ios::binary);
     db_stats.SerializeToOstream(&fout);
 }
-void writeDbStatsToJson(ContextPtr context, const String & db_name, const String & path)
+void writeDbStatsToJson(ContextPtr context, const String & db_name, const String & folder)
 {
-    Protos::DbStats db_stats;
-    db_stats.set_db_name(db_name);
-    db_stats.set_version(PROTO_VERSION);
-    auto catalog = createCatalogAdaptor(context);
-    auto tables = catalog->getAllTablesID(db_name);
-    Poco::JSON::Object stats_json;
-    for (auto & table : tables)
-    {
-        String table_name = table.getTableName();
-        if (table_name.find("_local") == String::npos)
-            stats_json.set(db_name + "." + table_name, tableJson(context, db_name, table_name));
-    }
-    std::ofstream fout(path);
-    Poco::Dynamic::Var stats_var(stats_json);
-    fout << stats_var.toString();
-    fout.close();
+    DDLDumper ddl_dumper(folder);
+    ddl_dumper.addTableFromDatabase(db_name, context);
+    ddl_dumper.dumpStats(folder + "/stats.json");
 }
 
 void readDbStats(ContextPtr context, const String & original_db_name, const String & path)
 {
     std::ifstream fin(path, std::ios::binary);
-    Protos::DbStats db_stats;
+    DbStats db_stats;
     db_stats.ParseFromIstream(&fin);
 
-    auto version = db_stats.has_version() ? db_stats.version() : Protos::DbStats_Version_V1;
-    if (version == Protos::DbStats_Version_V1)
+    auto version = db_stats.has_version() ? db_stats.version() : DbStats_Version_V1;
+    if (version == DbStats_Version_V1)
     {
-        version = Protos::DbStats_Version_V2;
+        version = DbStats_Version_V2;
     }
     if (version != PROTO_VERSION)
     {
@@ -185,6 +194,7 @@ void readDbStats(ContextPtr context, const String & original_db_name, const Stri
     auto catalog = createCatalogAdaptor(context);
     auto logger = &Poco::Logger::get("load stats");
 
+    auto load_ts = AutoStats::convertToDateTime64(AutoStats::nowTimePoint());
     for (auto & table_pb : db_stats.tables())
     {
         auto table_name = table_pb.table_name();
@@ -204,10 +214,12 @@ void readDbStats(ContextPtr context, const String & original_db_name, const Stri
             {
                 auto tag = static_cast<StatisticsTag>(k);
                 auto obj = createStatisticsBase(tag, v);
-                collection[tag] = std::move(obj);
+                if (obj)
+                    collection[tag] = std::move(obj);
             }
             StatisticsCollector::TableStats table_stats;
             table_stats.readFromCollection(collection);
+            table_stats.basic->setTimestamp(load_ts);
             collector.setTableStats(std::move(table_stats));
         }
 
@@ -229,6 +241,12 @@ void readDbStats(ContextPtr context, const String & original_db_name, const Stri
     }
 }
 
+void readDbStatsFromJson(ContextPtr context, const String & json_file)
+{
+    StatsLoader stats_loader(json_file, context);
+    stats_loader.loadStats(/*load_all=*/true);
+}
+
 static std::vector<StatsTableIdentifier> getTables(ContextPtr context, const ASTShowStatsQuery * query)
 {
     std::vector<StatsTableIdentifier> tables;
@@ -248,10 +266,31 @@ static std::vector<StatsTableIdentifier> getTables(ContextPtr context, const AST
         }
         tables.emplace_back(table_info_opt.value());
     }
+    // show materialized view as target table
+    for (auto & table : tables)
+    {
+        auto storage = catalog->getStorageByTableId(table);
+        if (const auto * mv = dynamic_cast<const StorageMaterializedView *>(storage.get()))
+        {
+            auto table_opt = catalog->getTableIdByName(mv->getTargetDatabaseName(), mv->getTargetTableName());
+            if (!table_opt.has_value())
+            {
+                auto err_msg = fmt::format(
+                    FMT_STRING("mv {}.{} has invalid target table {}.{}"),
+                    mv->getDatabaseName(),
+                    mv->getTableName(),
+                    mv->getTargetDatabaseName(),
+                    mv->getTargetTableName());
+                LOG_WARNING(&Poco::Logger::get("ShowStats"), err_msg);
+                continue;
+            }
+            table = table_opt.value();
+        }
+    }
     return tables;
 }
 
-BlockIO InterpreterShowStatsQuery::executeTable()
+BlockIO InterpreterShowStatsQuery::executeAll()
 {
     auto query = query_ptr->as<const ASTShowStatsQuery>();
     // Block sample_block = getSampleBlock();
@@ -264,7 +303,7 @@ BlockIO InterpreterShowStatsQuery::executeTable()
 
     for (auto & table_info : tables)
     {
-        auto fods = getTableFormattedOutput(context, catalog, table_info, query->columns);
+        auto fods = getTableFormattedOutput(context, catalog, collector_settings, table_info, query->columns);
         // adjust here to change the order
         auto block = outputFormattedBlock(fods, {"identifier", "type", "count", "null_count", "ndv", "min", "max", "has_histogram"});
         blocks.emplace_back(std::move(block));
@@ -317,9 +356,13 @@ std::vector<FormattedOutputData> getColumnFormattedOutput(const String & full_co
 }
 
 BlocksList getColumnsFormattedOutput(
-    ContextPtr context, CatalogAdaptorPtr catalog, const StatsTableIdentifier & table_info, const std::vector<String> & target_columns)
+    ContextPtr context,
+    CatalogAdaptorPtr catalog,
+    const CollectorSettings & collector_settings,
+    const StatsTableIdentifier & table_info,
+    const std::vector<String> & target_columns)
 {
-    StatisticsCollector collector_impl(context, catalog, table_info);
+    StatisticsCollector collector_impl(context, catalog, table_info, collector_settings);
 
     if (!target_columns.empty())
     {
@@ -387,14 +430,14 @@ BlockIO InterpreterShowStatsQuery::executeColumn()
         }
 
         auto table_info = tables[0];
-        auto new_blocks = getColumnsFormattedOutput(context, catalog, table_info, query->columns);
+        auto new_blocks = getColumnsFormattedOutput(context, catalog, collector_settings, table_info, query->columns);
         blocks.splice(blocks.end(), std::move(new_blocks));
     }
     else
     {
         for (auto & table_info : tables)
         {
-            auto new_blocks = getColumnsFormattedOutput(context, catalog, table_info, {});
+            auto new_blocks = getColumnsFormattedOutput(context, catalog, collector_settings, table_info, {});
             blocks.splice(blocks.end(), std::move(new_blocks));
         }
     }
@@ -415,6 +458,18 @@ void InterpreterShowStatsQuery::executeSpecial()
     auto query = query_ptr->as<const ASTShowStatsQuery>();
     auto context = getContext();
     auto catalog = Statistics::createCatalogAdaptor(context);
+
+    // when special, cache settings will be invalid
+    if (collector_settings.cache_policy != StatisticsCachePolicy::Default)
+    {
+        throw Exception("cache policy is not supported for special functions", ErrorCodes::BAD_ARGUMENTS);
+    }
+
+    if (context->getSettingsRef().statistics_cache_policy != StatisticsCachePolicy::Default)
+    {
+        throw Exception(
+            "statistics_cache_policy is not supported for special functions, must set it to default", ErrorCodes::BAD_ARGUMENTS);
+    }
 
     // refactor this into an explicit command
     if (query->table == "__save")
@@ -445,8 +500,8 @@ void InterpreterShowStatsQuery::executeSpecial()
         auto db_name = query->database;
         if (db_name.empty())
             db_name = context->getCurrentDatabase();
-        auto path = context->getSettingsRef().graphviz_path.toString() + "/" + db_name + ".json";
-        writeDbStatsToJson(context, db_name, path);
+        auto folder = context->getSettingsRef().graphviz_path.toString() + '/' + db_name;
+        writeDbStatsToJson(context, db_name, folder);
     }
     else if (query->table == "__jsonload")
     {
@@ -454,13 +509,13 @@ void InterpreterShowStatsQuery::executeSpecial()
         auto db_name = query->database;
         if (db_name.empty())
             db_name = context->getCurrentDatabase();
-        auto path = context->getSettingsRef().graphviz_path.toString() + "/" + db_name + ".json";
+        auto path = context->getSettingsRef().graphviz_path.toString() + '/' + db_name + "/stats.json";
         if (!std::filesystem::exists(path))
         {
             throw Exception("json_file " + path + " not exists", ErrorCodes::FILE_NOT_FOUND);
         }
 
-        loadStats(context, path);
+        readDbStatsFromJson(context, path);
     }
     else
     {
@@ -468,11 +523,54 @@ void InterpreterShowStatsQuery::executeSpecial()
     }
 }
 
+
+BlockIO InterpreterShowStatsQuery::executeTable()
+{
+    auto query = query_ptr->as<const ASTShowStatsQuery>();
+    auto context = getContext();
+    auto catalog = Statistics::createCatalogAdaptor(context);
+    auto tables = getTables(context, query);
+    std::vector<FormattedOutputData> result;
+    for (auto & table : tables)
+    {
+        FormattedOutputData data;
+        auto obj = getTableStatistics(context, table);
+        auto storage = catalog->getStorageByTableId(table);
+        data.append("database", table.getDatabaseName());
+        data.append("table", table.getTableName());
+        data.append("engine", storage->getName());
+        data.append("unique_key", UUIDHelpers::UUIDToString(table.getUniqueKey()));
+        data.append("row_count", obj ? std::to_string(obj->getRowCount()) : "");
+        data.append("timestamp", obj ? AutoStats::serializeToText(obj->getTimestamp()) : "");
+        result.emplace_back(std::move(data));
+    }
+
+    auto block = outputFormattedBlock(result, {"database", "table", "engine", "unique_key", "row_count", "timestamp"});
+    BlocksList list = {std::move(block)};
+    BlockIO res;
+    // res.in = std::make_shared<Block>(sample_block.cloneWithColumns(std::move(res_columns)));
+    res.in = std::make_shared<BlocksListBlockInputStream>(std::move(list));
+    return res;
+}
+
 BlockIO InterpreterShowStatsQuery::execute()
 {
     auto query = query_ptr->as<const ASTShowStatsQuery>();
     auto context = getContext();
     auto catalog = Statistics::createCatalogAdaptor(context);
+
+    collector_settings.cache_policy = query->cache_policy;
+    if (query->cache_policy == StatisticsCachePolicy::Default)
+    {
+        collector_settings.cache_policy = context->getSettingsRef().statistics_cache_policy;
+    }
+
+    // when enable_memory_catalog is true, we won't use cache
+    if (catalog->getSettingsRef().enable_memory_catalog)
+    {
+        if (collector_settings.cache_policy != StatisticsCachePolicy::Default)
+            throw Exception("memory catalog don't support cache policy", ErrorCodes::BAD_ARGUMENTS);
+    }
 
     if (isSpecialFunction(query->table))
     {
@@ -485,11 +583,17 @@ BlockIO InterpreterShowStatsQuery::execute()
         // throw Exception("unimplemented", ErrorCodes::LOGICAL_ERROR);
         return executeColumn();
     }
-    else
+    else if (query->kind == StatsQueryKind::ALL_STATS)
     {
         catalog->checkHealth(/*is_write=*/false);
+        return executeAll();
+    }
+    else if (query->kind == StatsQueryKind::TABLE_STATS)
+    {
+        catalog->checkHealth(false);
         return executeTable();
     }
+    return {};
 }
 
 }

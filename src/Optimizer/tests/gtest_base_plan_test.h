@@ -20,6 +20,8 @@
 #include <Optimizer/tests/test_config.h>
 #include <QueryPlan/QueryPlan.h>
 
+#include <boost/asio.hpp>
+
 #include <filesystem>
 #include <memory>
 
@@ -49,6 +51,28 @@ public:
 
     const String & getDefaultDatabase() const { return database_name; }
 
+    static std::unordered_map<String, Field> getDefaultOptimizerSettings()
+    {
+        std::unordered_map<std::string, DB::Field> settings;
+#ifndef NDEBUG
+        // debug mode may time out.
+        settings.emplace("iterative_optimizer_timeout", "30000000");
+        settings.emplace("cascades_optimizer_timeout", "30000000");
+#endif
+        settings.emplace("dialect_type", "ANSI");
+        settings.emplace("enable_sharding_optimize", 1);
+        settings.emplace("enable_group_by_keys_pruning", true);
+        settings.emplace("enable_eliminate_join_by_fk", true);
+        settings.emplace("enable_eliminate_complicated_pk_fk_join", true);
+        settings.emplace("enable_eliminate_complicated_pk_fk_join_without_top_join", true);
+        settings.emplace("cost_calculator_cte_weight_for_join_build_side", 1.7);
+        return settings;
+    }
+
+    ContextMutablePtr getSessionContext() { return session_context; }
+    std::string getDatabaseName() { return database_name; }
+
+
 protected:
     String database_name;
     ContextMutablePtr session_context;
@@ -75,22 +99,27 @@ public:
     std::string loadExplain(const std::string & name);
     void saveExplain(const std::string & name, const std::string & explain);
 
-    void unZip(const String & query_id);
-    String loadExplainFromPath(const String & query_id);
-    std::filesystem::path getPlanDumpPath() { return std::filesystem::path(PLAN_DUMP_PATH) / "dump_reproduce/"; }
-    void createTablesFromJson(const String & path);
-    void createClusterInfo(const String & path);
-    String dump(const String & name);
-    String reproduce(const String & path);
-    std::vector<std::string> checkDump(const String & query_id, const String & query_id2);
-    std::vector<std::string> getPathDumpFiles(const String & query_id);
-    void cleanQueryFiles(const String & query_id);
-
     void createTables();
     void dropTableStatistics() { execute("drop stats all", createQueryContext()); }
     void loadTableStatistics();
 
     static bool enforce_regenerate();
+    static int regenerate_task_thread_size();
+
+    void setShowStatistics(bool show_statistics_) { show_statistics = show_statistics_; }
+
+    void setTimerRounds(int n) { timer_rounds = n; }
+    String printMetric()
+    {
+        // auto str = fmt::format(
+        //     FMT_STRING("vanilla: ser {}s, deser {}s\nprotobuf:ser {}s, deser {}s"),
+        //     timers[TimerOption::VanillaSer],
+        //     timers[TimerOption::VanillaDeser],
+        //     timers[TimerOption::ProtobufSer],
+        //     timers[TimerOption::ProtobufDeser]);
+        // timers.clear();
+        return {};
+    }
 
 protected:
     virtual std::vector<std::filesystem::path> getTableDDLFiles() = 0;
@@ -98,7 +127,46 @@ protected:
     virtual std::filesystem::path getQueriesDir() = 0;
     virtual std::filesystem::path getExpectedExplainDir() = 0;
 
+    bool show_statistics = true;
+
     static std::vector<std::string> loadFile(const std::filesystem::path & path, char sep = {});
+    enum class TimerOption
+    {
+        VanillaSer = 0,
+        VanillaDeser = 1,
+        ProtobufSer = 2,
+        ProtobufDeser = 3,
+    };
+    int timer_rounds = 10;
+    std::unordered_map<TimerOption, double> timers;
 };
 
+#define DECLARE_GENERATE_TEST(TEST_SUITE_NAME) \
+    TEST_F(TEST_SUITE_NAME, generate) \
+    { \
+        if (!AbstractPlanTestSuite::enforce_regenerate()) \
+            GTEST_SKIP() << "skip generate. set env REGENERATE=1 to regenerate explains."; \
+\
+        int thread_size = AbstractPlanTestSuite::regenerate_task_thread_size(); \
+        std::cout << "use " << thread_size << " threads for generate task" << std::endl; \
+        boost::asio::thread_pool pool(thread_size); \
+\
+        for (auto & query : tester->loadQueries()) \
+        { \
+            boost::asio::post(pool, [&, query]() { \
+                try \
+                { \
+                    std::cout << " try generate for " + query + "." << std::endl; \
+                    tester->saveExplain(query, explain(query)); \
+                } \
+                catch (...) \
+                { \
+                    std::cerr << " generate for " + query + " failed." << std::endl; \
+                    tester->saveExplain(query, ""); \
+                } \
+            }); \
+        } \
+\
+        pool.join(); \
+    }
 }

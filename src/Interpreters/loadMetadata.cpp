@@ -61,7 +61,7 @@ static void executeCreateQuery(
     const String & file_name,
     bool has_force_restore_data_flag)
 {
-    ParserCreateQuery parser(ParserSettings::valueOf(context->getSettingsRef().dialect_type));
+    ParserCreateQuery parser(ParserSettings::valueOf(context->getSettingsRef()));
     ASTPtr ast = parseQuery(
         parser, query.data(), query.data() + query.size(), "in file " + file_name, 0, context->getSettingsRef().max_parser_depth);
 
@@ -257,7 +257,7 @@ void reloadFormatSchema(String remote_format_schema_path, String format_schema_p
                 Poco::File file(format_schema_path+"/chtmp_" + shortFileName);
                 if (file.exists()) file.remove(); // remove last residual file
 
-                ReadBufferFromByteHDFS reader(fileName);
+                ReadBufferFromByteHDFS reader(fileName, HDFSConnectionParams::defaultNNProxy());
                 WriteBufferFromFile writer(file.path());
                 copyData(reader, writer, nullptr);
                 if (target_file.exists()) target_file.remove();

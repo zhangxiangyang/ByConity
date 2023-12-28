@@ -24,6 +24,7 @@
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSetQuery.h>
+#include <Parsers/ASTBitEngineConstraintDeclaration.h>
 #include <Common/quoteString.h>
 #include <Interpreters/StorageID.h>
 #include <IO/Operators.h>
@@ -105,7 +106,7 @@ void ASTStorage::formatImpl(const FormatSettings & s, FormatState & state, Forma
         s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << "TTL " << (s.hilite ? hilite_none : "");
         ttl_table->formatImpl(s, state, frame);
     }
-    if (settings)
+    if (settings && !settings->changes.empty())
     {
         s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << "SETTINGS " << (s.hilite ? hilite_none : "");
         settings->formatImpl(s, state, frame);
@@ -168,6 +169,10 @@ ASTPtr ASTColumns::clone() const
         res->set(res->indices, indices->clone());
     if (constraints)
         res->set(res->constraints, constraints->clone());
+    if (foreign_keys)
+        res->set(res->foreign_keys, foreign_keys->clone());
+    if (unique)
+        res->set(res->unique, unique->clone());
     if (projections)
         res->set(res->projections, projections->clone());
     if (primary_key)
@@ -205,7 +210,10 @@ void ASTColumns::formatImpl(const FormatSettings & s, FormatState & state, Forma
         for (const auto & constraint : constraints->children)
         {
             auto elem = std::make_shared<ASTColumnsElement>();
-            elem->prefix = "CONSTRAINT";
+            if (constraint->as<ASTBitEngineConstraintDeclaration>())
+                elem->prefix = "BITENGINE_CONSTRAINT";
+            else
+                elem->prefix = "CONSTRAINT";
             elem->set(elem->elem, constraint->clone());
             list.children.push_back(elem);
         }
@@ -220,6 +228,26 @@ void ASTColumns::formatImpl(const FormatSettings & s, FormatState & state, Forma
             list.children.push_back(elem);
         }
     }
+    if (foreign_keys)
+    {
+        for (const auto & foreign_key : foreign_keys->children)
+        {
+            auto elem = std::make_shared<ASTColumnsElement>();
+            elem->prefix = "CONSTRAINT";
+            elem->set(elem->elem, foreign_key->clone());
+            list.children.push_back(elem);
+        }
+    }
+    if (unique)
+    {
+        for (const auto & unique_key : unique->children)
+        {
+            auto elem = std::make_shared<ASTColumnsElement>();
+            elem->prefix = "CONSTRAINT";
+            elem->set(elem->elem, unique_key->clone());
+            list.children.push_back(elem);
+        }
+    }
 
     if (!list.children.empty())
     {
@@ -230,13 +258,38 @@ void ASTColumns::formatImpl(const FormatSettings & s, FormatState & state, Forma
     }
 }
 
+ASTPtr ASTCreateSnapshotQuery::clone() const
+{
+    auto res = std::make_shared<ASTCreateSnapshotQuery>(*this);
+    cloneOutputOptions(*res);
+    return res;
+}
+
+void ASTCreateSnapshotQuery::formatQueryImpl(const FormatSettings & settings, FormatState & /*state*/, FormatStateStacked /*frame*/) const
+{
+    settings.ostr << (settings.hilite ? hilite_keyword : "") << "CREATE SNAPSHOT " << (if_not_exists ? "IF NOT EXISTS " : "")
+                  << (settings.hilite ? hilite_none : "");
+
+    settings.ostr << (!database.empty() ? backQuoteIfNeed(database) + "." : "") << backQuoteIfNeed(table);
+    if (uuid != UUIDHelpers::Nil)
+        settings.ostr << (settings.hilite ? hilite_keyword : "") << " UUID " << (settings.hilite ? hilite_none : "")
+                      << quoteString(toString(uuid));
+
+    if (to_table_id)
+        settings.ostr << (settings.hilite ? hilite_keyword : "") << " TO " << (settings.hilite ? hilite_none : "")
+                      << (!to_table_id.database_name.empty() ? backQuoteIfNeed(to_table_id.database_name) + "." : "")
+                      << backQuoteIfNeed(to_table_id.table_name);
+
+    settings.ostr << (settings.hilite ? hilite_keyword : "") << " TTL " << (settings.hilite ? hilite_none : "") << ttl_in_days
+                  << (settings.hilite ? hilite_keyword : "") << " DAYS " << (settings.hilite ? hilite_none : "");
+}
 
 ASTPtr ASTCreateQuery::clone() const
 {
     auto res = std::make_shared<ASTCreateQuery>(*this);
     res->children.clear();
 
-    if (columns_list)
+    if (columns_list && !columns_list->empty())
         res->set(res->columns_list, columns_list->clone());
     if (storage)
         res->set(res->storage, storage->clone());
@@ -244,6 +297,8 @@ ASTPtr ASTCreateQuery::clone() const
         res->set(res->select, select->clone());
     if (tables)
         res->set(res->tables, tables->clone());
+    if (table_overrides)
+        res->set(res->table_overrides, table_overrides->clone());
 
     if (dictionary)
     {
@@ -260,6 +315,15 @@ ASTPtr ASTCreateQuery::clone() const
 void ASTCreateQuery::formatQueryImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
 {
     frame.need_parens = false;
+
+    if (!catalog.empty() && database.empty() && table.empty())
+    {
+        settings.ostr << (settings.hilite ? hilite_keyword : "") << "CREATE EXTERNAL CATALOG " << (if_not_exists ? "IF NOT EXISTS " : "")
+                      << (settings.hilite ? hilite_none : "") << backQuoteIfNeed(catalog) << " PROPERTIES ";
+        if (catalog_properties)
+            catalog_properties->formatImpl(settings, state, frame);
+        return;
+    }
 
     if (!database.empty() && table.empty())
     {
@@ -280,6 +344,12 @@ void ASTCreateQuery::formatQueryImpl(const FormatSettings & settings, FormatStat
         if (storage)
             storage->formatImpl(settings, state, frame);
 
+        if (table_overrides)
+        {
+            settings.ostr << settings.nl_or_ws;
+            table_overrides->formatImpl(settings, state, frame);
+        }
+        
         return;
     }
 
@@ -399,7 +469,7 @@ void ASTCreateQuery::formatQueryImpl(const FormatSettings & settings, FormatStat
 
     frame.expression_list_always_start_on_new_line = true;
 
-    if (columns_list && !as_table_function)
+    if (columns_list && !columns_list->empty() && !as_table_function)
     {
         settings.ostr << (settings.one_line ? " (" : "\n(");
         FormatStateStacked frame_nested = frame;

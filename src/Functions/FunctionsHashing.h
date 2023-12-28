@@ -67,7 +67,7 @@
 #include <Columns/ColumnByteMap.h>
 #include <Functions/IFunction.h>
 #include <Functions/FunctionHelpers.h>
-#include <Functions/TargetSpecific.h>
+#include <Common/TargetSpecific.h>
 #include <Functions/PerformanceAdaptors.h>
 #include <Functions/hiveCityHash.h>
 #include <common/range.h>
@@ -892,6 +892,8 @@ private:
     ImplementationSelector<IFunction> selector;
 };
 
+// checked applyWithSeed calls and no apparent out of bound buffer
+// coverity[overrun-buffer-val]
 DECLARE_MULTITARGET_CODE(
 
 template <typename Impl, bool with_seed = false>
@@ -1578,7 +1580,7 @@ using FunctionSHA256 = FunctionStringHashFixedString<SHA256Impl>;
 #endif
 using FunctionSipHash128 = FunctionStringHashFixedString<SipHash128Impl>;
 using FunctionCityHash64 = FunctionAnyHash<ImplCityHash64>;
-using FunctionHiveHash64 = FunctionAnyHash<ImplHiveCityHash64>;
+using FunctionHiveCityHash64 = FunctionAnyHash<ImplHiveCityHash64>;
 using FunctionFarmFingerprint64 = FunctionAnyHash<ImplFarmFingerprint64>;
 using FunctionFarmHash64 = FunctionAnyHash<ImplFarmHash64>;
 using FunctionMetroHash64 = FunctionAnyHash<ImplMetroHash64>;

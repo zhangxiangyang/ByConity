@@ -13,17 +13,18 @@
  * limitations under the License.
  */
 
-#include <Optimizer/Dump/Json2Pb.h>
+#include <Optimizer/Dump/ProtoEnumUtils.h>
 #include <Statistics/StatisticsBaseImpl.h>
 #include <Statistics/StatsColumnBasic.h>
-#include <Statistics/StatsCpcSketch.h>
 #include <Statistics/StatsDummy.h>
+#include <Statistics/StatsHllSketch.h>
 #include <Statistics/StatsKllSketchImpl.h>
 #include <Statistics/StatsNdvBucketsExtendImpl.h>
 #include <Statistics/StatsNdvBucketsImpl.h>
 #include <Statistics/StatsTableBasic.h>
 #include <Statistics/TypeMacros.h>
 #include <Common/Exception.h>
+#include <Poco/JSON/Parser.h>
 
 namespace DB::Statistics
 {
@@ -31,7 +32,7 @@ template <class StatsType>
 std::shared_ptr<StatsType> createStatisticsUntyped(StatisticsTag tag, std::string_view blob)
 {
     static_assert(std::is_base_of_v<StatisticsBase, StatsType>);
-    CheckTag<StatsType>(tag);
+    checkTag<StatsType>(tag);
     std::shared_ptr<StatsType> ptr = std::make_shared<StatsType>();
     ptr->deserialize(blob);
     return ptr;
@@ -41,7 +42,7 @@ template <class StatsType, typename T>
 std::shared_ptr<StatsType> createStatisticsTypedImpl(StatisticsTag tag, std::string_view blob)
 {
     static_assert(std::is_base_of_v<StatisticsBase, StatsType>);
-    CheckTag<StatsType>(tag);
+    checkTag<StatsType>(tag);
     using ImplType = typename StatsType::template Impl<T>;
     auto ptr = std::make_shared<ImplType>();
     ptr->deserialize(blob);
@@ -91,7 +92,7 @@ template <class StatsType>
 std::shared_ptr<StatsType> createStatisticsUntypedJson(StatisticsTag tag, std::string_view blob)
 {
     static_assert(std::is_base_of_v<StatisticsBase, StatsType>);
-    CheckTag<StatsType>(tag);
+    checkTag<StatsType>(tag);
     std::shared_ptr<StatsType> ptr = std::make_shared<StatsType>();
     ptr->deserializeFromJson(blob);
     return ptr;
@@ -100,7 +101,7 @@ template <class StatsType, typename T>
 std::shared_ptr<StatsType> createStatisticsTypedJsonImpl(StatisticsTag tag, std::string_view blob)
 {
     static_assert(std::is_base_of_v<StatisticsBase, StatsType>);
-    CheckTag<StatsType>(tag);
+    checkTag<StatsType>(tag);
     using ImplType = typename StatsType::template Impl<T>;
     auto ptr = std::make_shared<ImplType>();
     ptr->deserializeFromJson(blob);
@@ -113,15 +114,13 @@ std::shared_ptr<StatsType> createStatisticsTypedJson(StatisticsTag tag, std::str
     {
         throw Exception("statistics blob corrupted", ErrorCodes::LOGICAL_ERROR);
     }
-    Pparser parser;
-    PVar var = parser.parse(std::string{blob.data(), blob.size()});
-    PObject json_object = *var.extract<PObject::Ptr>();
+    Poco::JSON::Object::Ptr json_object
+        = Poco::JSON::Parser().parse(std::string{blob.data(), blob.size()}).extract<Poco::JSON::Object::Ptr>();
 
-    PVar var_bounds_blob = json_object.get("bounds_blob");
-    PObject object_bounds_blob = *var_bounds_blob.extract<PObject::Ptr>();
+    Poco::JSON::Object::Ptr object_bounds_blob = json_object->getObject("bounds_blob");
 
-    String type_str = object_bounds_blob.get("type_id").toString();
-    SerdeDataType type_index = SerdeDataTypeFromString(type_str);
+    String type_str = object_bounds_blob->getValue<String>("type_id");
+    SerdeDataType type_index = ProtoEnumUtils::serdeDataTypeFromString(type_str);
 
     switch (type_index)
     {
@@ -154,8 +153,8 @@ StatisticsBasePtr createStatisticsBase(StatisticsTag tag, std::string_view blob)
                 return createStatisticsUntyped<StatsTableBasic>(tag, blob);
             case StatisticsTag::ColumnBasic:
                 return createStatisticsUntyped<StatsColumnBasic>(tag, blob);
-            case StatisticsTag::CpcSketch:
-                return createStatisticsUntyped<StatsCpcSketch>(tag, blob);
+            case StatisticsTag::HllSketch:
+                return createStatisticsUntyped<StatsHllSketch>(tag, blob);
             case StatisticsTag::KllSketch:
                 return createStatisticsTyped<StatsKllSketch>(tag, blob);
             case StatisticsTag::NdvBuckets:
@@ -165,7 +164,8 @@ StatisticsBasePtr createStatisticsBase(StatisticsTag tag, std::string_view blob)
             case StatisticsTag::NdvBucketsResult:
                 return createStatisticsTyped<StatsNdvBucketsResult>(tag, blob);
             default: {
-                throw Exception("Unimplemented Statistics Tag", ErrorCodes::NOT_IMPLEMENTED);
+                // unknonw statistics should be ignored instead of throw Exception
+                return nullptr;
             }
         }
     }();

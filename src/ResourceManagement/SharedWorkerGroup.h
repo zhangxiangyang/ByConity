@@ -33,8 +33,8 @@ public:
 
     size_t getNumWorkers() const override;
     std::map<String, WorkerNodePtr> getWorkers() const override;
-    WorkerGroupData getData(bool with_metrics = false, bool only_running_state = true) const override;
-    WorkerGroupMetrics getAggregatedMetrics() const override;
+    WorkerGroupData getData(bool with_metrics, bool only_running_state) const override;
+    WorkerGroupMetrics getMetrics() const override;
 
     void registerNode(const WorkerNodePtr &) override;
     void removeNode(const String &) override;
@@ -62,7 +62,7 @@ public:
     WorkerGroupPtr tryGetLinkedGroup() const;
 
 private:
-    std::map<String, WorkerNodePtr> getWorkersImpl(std::lock_guard<std::mutex> & lock) const;
+    std::map<String, WorkerNodePtr> getWorkersImpl(std::lock_guard<bthread::RecursiveMutex> & lock) const;
 
     const String linked_id;
     WorkerGroupWeakPtr linked_group;

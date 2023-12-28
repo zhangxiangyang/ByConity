@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <limits>
 #include <Core/NamesAndTypes.h>
 #include <Storages/MergeTree/MergeTreeReaderStream.h>
 #include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
@@ -49,11 +50,12 @@ public:
         MarkCache * mark_cache_,
         const MarkRanges & all_mark_ranges_,
         const MergeTreeReaderSettings & settings_,
-        const ValueSizeMap & avg_value_size_hints_ = ValueSizeMap{});
+        const ValueSizeMap & avg_value_size_hints_ = ValueSizeMap{},
+        MergeTreeIndexExecutor * index_executor_ = nullptr);
 
     /// Return the number of rows has been read or zero if there is no columns to read.
     /// If continue_reading is true, continue reading from last state, otherwise seek to from_mark
-    virtual size_t readRows(size_t from_mark, bool continue_reading, size_t max_rows_to_read, Columns & res_columns) = 0;
+    virtual size_t readRows(size_t from_mark, size_t current_task_last_mark, size_t from_row, size_t max_rows_to_read, Columns & res_columns) = 0;
 
     virtual bool canReadIncompleteGranules() const = 0;
 
@@ -73,35 +75,79 @@ public:
     void performRequiredConversions(Columns & res_columns, bool check_column_size = true);
 
     const NamesAndTypesList & getColumns() const { return columns; }
-    size_t numColumnsInResult() const { return columns.size(); }
+    size_t numColumnsInResult() const { return hasBitmapIndexReader() ? columns.size() + getBitmapOutputColumns().size() : columns.size(); }
 
     size_t getFirstMarkToRead() const
     {
         return all_mark_ranges.front().begin;
     }
 
-    const NameSet & getBitmapOutputColumns();
+    bool hasBitmapIndexReader() const;
+
+    const NameOrderedSet & getBitmapOutputColumns() const;
+
+    const NamesAndTypesList & getBitmapColumns() const;
 
     MergeTreeData::DataPartPtr data_part;
 
+    using FileStreams = std::map<std::string, std::unique_ptr<IMergeTreeReaderStream>>;
+    using Serializations = std::map<std::string, SerializationPtr>;
 protected:
+    void prefetchForAllColumns(Priority priority, NamesAndTypesList & prefetch_columns, size_t from_mark, size_t current_task_last_mark, bool continue_reading);
+
+    void prefetchForMapColumn(
+        Priority priority,
+        const NameAndTypePair & name_and_type,
+        size_t from_mark,
+        bool continue_reading,
+        size_t current_task_last_mark);
+    /// Make next readData more simple by calling 'prefetch' of all related ReadBuffers (column streams).
+    void prefetchForColumn(
+        Priority priority,
+        const NameAndTypePair & name_and_type,
+        const SerializationPtr & serialization,
+        size_t from_mark,
+        bool continue_reading,
+        size_t current_task_last_mark,
+        ISerialization::SubstreamsCache & cache);
+
+    bool isLowCardinalityDictionary(const ISerialization::SubstreamPath & substream_path);
     /// Returns actual column type in part, which can differ from table metadata.
-    NameAndTypePair getColumnFromPart(const NameAndTypePair & required_column) const;
+    NameAndTypePair getColumnFromPart(const NameAndTypePair & required_column);
 
     void checkNumberOfColumns(size_t num_columns_to_read) const;
+
+    /// check whether a column is a BitEngine column,
+    /// if it is, the column will be replaced with `BITENGINE_COLUMN_EXTENSION`.
+    /// eg. a field `ids BitMap64 BitEngineEncode` is in the table schema,
+    /// in reading process, we'll read `ids_encoded_bitmap` in disk instead. And that's what we want.
+    bool checkBitEngineColumn(const NameAndTypePair & column) const;
 
     void addByteMapStreams(const NameAndTypePair & name_and_type, const String & col_name,
         const ReadBufferFromFileBase::ProfileCallback & profile_callback, clockid_t clock_type);
 
     void readMapDataNotKV(
         const NameAndTypePair & name_and_type, ColumnPtr & column,
-        size_t from_mark, bool continue_reading, size_t max_rows_to_read,
-        std::unordered_map<String, ISerialization::SubstreamsCache> & caches,
+        size_t from_mark, bool continue_reading, size_t current_task_last_mark, size_t max_rows_to_read,
         std::unordered_map<String, size_t> & res_col_to_idx, Columns & res_columns);
+
+    size_t skipMapDataNotKV(
+        const NameAndTypePair & name_and_type, size_t from_mark,
+        bool continue_reading, size_t current_task_last_mark, size_t max_rows_to_skip);
 
     void readData(
         const NameAndTypePair & name_and_type, ColumnPtr & column,
-        size_t from_mark, bool continue_reading, size_t max_rows_to_read,
+        size_t from_mark, bool continue_reading, size_t current_task_last_mark,
+        size_t max_rows_to_read, ISerialization::SubstreamsCache & cache);
+
+    size_t skipData(
+        const NameAndTypePair & name_and_type, size_t from_mark, bool continue_reading,
+        size_t current_task_last_mark, size_t max_rows_to_skip, ISerialization::SubstreamsCache & cache);
+    
+    void deserializePrefix(
+        const SerializationPtr & serialization,
+        const NameAndTypePair & name_and_type,
+        size_t current_task_last_mark,
         ISerialization::SubstreamsCache & cache);
 
     /// avg_value_size_hints are used to reduce the number of reallocations when creating columns of variable size.
@@ -111,6 +157,8 @@ protected:
 
     /// Columns that are read.
     NamesAndTypesList columns;
+    // Columns after sort
+    NamesAndTypesList sort_columns;
     NamesAndTypesList part_columns;
 
     /// Map ColumnMap to its keys sub columns
@@ -130,20 +178,29 @@ protected:
     using ColumnPosition = std::optional<size_t>;
     virtual ColumnPosition findColumnForOffsets(const String & column_name) const;
 
-    using FileStreams = std::map<std::string, std::unique_ptr<IMergeTreeReaderStream>>;
-    using Serializations = std::map<std::string, SerializationPtr>;
-
     FileStreams streams;
     Serializations serializations;
 
     friend class MergeTreeRangeReader::DelayedStream;
 
+    MergeTreeIndexExecutor * index_executor = nullptr;
+
+    std::unordered_map<String, ISerialization::SubstreamsCache> caches;
+    std::unordered_set<std::string> prefetched_streams;
+    /// Row number, update on seek or read, set to size_t max to force a seek
+    /// when reader start reading
+    size_t next_row_number_to_read = std::numeric_limits<size_t>::max();
+
 private:
+    NameAndTypePair columnTypeFromPart(const NameAndTypePair & required_column);
+
     /// Alter conversions, which must be applied on fly if required
     MergeTreeMetaBase::AlterConversions alter_conversions;
 
     /// Actual data type of columns in part
     google::dense_hash_map<StringRef, const DataTypePtr *, StringRefHash> columns_from_part;
+
+    std::unordered_map<String, NameAndTypePair> columns_type_cache;
 };
 
 }

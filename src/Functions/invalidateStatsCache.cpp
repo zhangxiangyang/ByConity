@@ -27,7 +27,7 @@ namespace ErrorCodes
     extern const int UNKNOWN_TABLE;
 }
 
-void registerFunctionInvalidateStatsCache(FunctionFactory & factory)
+REGISTER_FUNCTION(InvalidateStatsCache)
 {
     factory.registerFunction<FunctionInvalidateStatsCache>();
 }
@@ -52,6 +52,13 @@ ColumnPtr FunctionInvalidateStatsCache::executeImpl(
     // TODO support variadic, i.e. invalidate full database/cluster
     if (identifier_names.size() != 2)
         throw Exception("Function " + getName() + " requires two arguments", ErrorCodes::BAD_ARGUMENTS);
+
+    if (identifier_names[0].empty() && identifier_names[1] == "__reset")
+    {
+        auto catalog = Statistics::createConstCatalogAdaptor(context);
+        catalog->invalidateAllServerStatsCache();
+        return result_type->createColumnConst(input_rows_count, 0);
+    }
 
     auto catalog = Statistics::createConstCatalogAdaptor(context);
     auto table_identifier_opt = catalog->getTableIdByName(identifier_names[0], identifier_names[1]);

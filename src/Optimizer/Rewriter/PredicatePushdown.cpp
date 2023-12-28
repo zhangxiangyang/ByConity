@@ -17,30 +17,34 @@
 #include <Optimizer/Rewriter/PredicatePushdown.h>
 
 #include <Analyzers/TypeAnalyzer.h>
-#include <DataTypes/getLeastSupertype.h>
 #include <DataTypes/DataTypeNullable.h>
-#include <Optimizer/DynamicFilters.h>
+#include <DataTypes/getLeastSupertype.h>
+#include <Interpreters/join_common.h>
+#include <Optimizer/DomainTranslator.h>
 #include <Optimizer/EqualityInference.h>
 #include <Optimizer/ExpressionDeterminism.h>
 #include <Optimizer/ExpressionEquivalence.h>
 #include <Optimizer/ExpressionInliner.h>
 #include <Optimizer/ExpressionInterpreter.h>
+#include <Optimizer/PredicateConst.h>
+#include <Optimizer/PredicateUtils.h>
+#include <Optimizer/ProjectionPlanner.h>
+#include <Optimizer/RuntimeFilterUtils.h>
+#include <Optimizer/SimplifyExpressions.h>
 #include <Optimizer/SymbolUtils.h>
 #include <Optimizer/Utils.h>
 #include <Optimizer/makeCastFunction.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/formatAST.h>
-#include <QueryPlan/AggregatingStep.h>
-#include <QueryPlan/AssignUniqueIdStep.h>
 #include <QueryPlan/FilterStep.h>
 #include <QueryPlan/JoinStep.h>
 #include <QueryPlan/ProjectionStep.h>
+#include <QueryPlan/SymbolMapper.h>
 #include <QueryPlan/UnionStep.h>
 #include <Common/FieldVisitorConvertToNumber.h>
-#include <QueryPlan/SymbolMapper.h>
 
 namespace DB
 {
-
 namespace ErrorCodes
 {
     extern const int PLAN_BUILD_ERROR;
@@ -49,22 +53,39 @@ namespace ErrorCodes
 void PredicatePushdown::rewrite(QueryPlan & plan, ContextMutablePtr context) const
 {
     auto cte_reference_counts = plan.getCTEInfo().collectCTEReferenceCounts(plan.getPlanNode());
-    PredicateVisitor visitor{dynamic_filtering, context, plan.getCTEInfo(), cte_reference_counts};
+    PredicateVisitor visitor{pushdown_filter_into_cte, simplify_common_filter, context, plan.getCTEInfo(), cte_reference_counts};
     PredicateContext predicate_context{
-        .predicate = PredicateConst::TRUE_VALUE, .extra_predicate_for_simplify_outer_join = PredicateConst::TRUE_VALUE};
+        .predicate = PredicateConst::TRUE_VALUE, .extra_predicate_for_simplify_outer_join = PredicateConst::TRUE_VALUE, .context = context};
     auto result = VisitorUtil::accept(plan.getPlanNode(), visitor, predicate_context);
     plan.update(result);
 }
 
 PlanNodePtr PredicateVisitor::visitPlanNode(PlanNodeBase & node, PredicateContext & predicate_context)
 {
-    PredicateContext true_context{.predicate = PredicateConst::TRUE_VALUE,
-                                  .extra_predicate_for_simplify_outer_join = PredicateConst::TRUE_VALUE};
+    PredicateContext true_context{
+        .predicate = PredicateConst::TRUE_VALUE,
+        .extra_predicate_for_simplify_outer_join = PredicateConst::TRUE_VALUE,
+        .context = predicate_context.context};
     PlanNodePtr rewritten = processChild(node, true_context);
     if (!PredicateUtils::isTruePredicate(predicate_context.predicate))
     {
         // we cannot push our predicate down any further
-        auto filter_step = std::make_shared<FilterStep>(rewritten->getStep()->getOutputStream(), predicate_context.predicate);
+        auto name_and_types = rewritten->getStep()->getOutputStream().getNamesToTypes();
+        auto remaining_filter = ExpressionInterpreter::optimizePredicate(predicate_context.predicate, name_and_types, context);
+        Predicate::DomainTranslator<String> domain_translator{context};
+        auto extract_result = domain_translator.getExtractionResult(remaining_filter, name_and_types);
+
+        if (!domain_translator.isIgnored() && remaining_filter->getColumnName() != extract_result.remaining_expression->getColumnName())
+        {
+            ASTPtr combine_extraction_result = PredicateUtils::combineConjuncts(
+                ASTs{domain_translator.toPredicate(extract_result.tuple_domain), extract_result.remaining_expression});
+
+            // the processed predicate is simpler than the original predicate
+            if (combine_extraction_result->getColumnName().size() < remaining_filter->getColumnName().size())
+                remaining_filter = combine_extraction_result;
+        }
+
+        auto filter_step = std::make_shared<FilterStep>(rewritten->getStep()->getOutputStream(), remaining_filter);
         auto filter_node = std::make_shared<FilterNode>(context->nextNodeId(), std::move(filter_step), PlanNodes{rewritten});
         return filter_node;
     }
@@ -127,10 +148,13 @@ PlanNodePtr PredicateVisitor::visitProjectionNode(ProjectionNode & node, Predica
         inlined_deterministic_conjuncts.emplace_back(inlined);
     }
 
+    auto pushdown_predicate = PredicateUtils::combineConjuncts(inlined_deterministic_conjuncts);
+    pushdown_predicate = ExpressionInterpreter::optimizePredicate(pushdown_predicate, step.getInputStreams()[0].getNamesToTypes(), context);
     PredicateContext expression_context{
-        .predicate = PredicateUtils::combineConjuncts(inlined_deterministic_conjuncts),
-        .extra_predicate_for_simplify_outer_join =
-            ExpressionInliner::inlineSymbols(predicate_context.extra_predicate_for_simplify_outer_join, assignments)};
+        .predicate = pushdown_predicate,
+        .extra_predicate_for_simplify_outer_join
+        = ExpressionInliner::inlineSymbols(predicate_context.extra_predicate_for_simplify_outer_join, assignments),
+        .context = predicate_context.context};
     PlanNodePtr rewritten = processChild(node, expression_context);
 
     // All deterministic conjuncts that contains non-inlining targets, and non-deterministic conjuncts,
@@ -153,10 +177,15 @@ PlanNodePtr PredicateVisitor::visitFilterNode(FilterNode & node, PredicateContex
 {
     const auto & step = *node.getStep();
     auto predicates = std::vector<ConstASTPtr>{step.getFilter(), predicate_context.predicate};
-    auto predicate = PredicateUtils::combineConjuncts(predicates);
+    ConstASTPtr predicate = PredicateUtils::combineConjuncts(predicates);
+    if (simplify_common_filter)
+    {
+        predicate = CommonPredicatesRewriter::rewrite(predicate, context);
+    }
     PredicateContext filter_context{
         .predicate = predicate,
-        .extra_predicate_for_simplify_outer_join = predicate_context.extra_predicate_for_simplify_outer_join};
+        .extra_predicate_for_simplify_outer_join = predicate_context.extra_predicate_for_simplify_outer_join,
+        .context = predicate_context.context};
     PlanNodePtr rewritten = process(*node.getChildren()[0], filter_context);
 
     if (rewritten->getStep()->getType() != IQueryPlanStep::Type::Filter)
@@ -185,8 +214,8 @@ PlanNodePtr PredicateVisitor::visitFilterNode(FilterNode & node, PredicateContex
 
 PlanNodePtr PredicateVisitor::visitAggregatingNode(AggregatingNode & node, PredicateContext & predicate_context)
 {
-    const auto & step = * node.getStep();
-    auto & keys = step.getKeys();
+    const auto & step = *node.getStep();
+    const auto & keys = step.getKeys();
 
     // TODO: in case of grouping sets, we should be able to push the filters over grouping keys below the aggregation
     // and also preserve the filter above the aggregation if it has an empty grouping set
@@ -214,7 +243,7 @@ PlanNodePtr PredicateVisitor::visitAggregatingNode(AggregatingNode & node, Predi
 
     // Sort non-equality predicates by those that can be pushed down and those that cannot
     std::set<String> grouping_keys;
-    for (auto & key : keys)
+    for (const auto & key : keys)
     {
         grouping_keys.emplace(key);
     }
@@ -234,22 +263,23 @@ PlanNodePtr PredicateVisitor::visitAggregatingNode(AggregatingNode & node, Predi
 
     // Add the equality predicates back in
     EqualityPartition equality_partition = equality_inference.partitionedBy(grouping_keys);
-    for (auto & conjunct : equality_partition.getScopeEqualities())
+    for (const auto & conjunct : equality_partition.getScopeEqualities())
     {
         pushdown_conjuncts.emplace_back(conjunct);
     }
-    for (auto & conjunct : equality_partition.getScopeComplementEqualities())
+    for (const auto & conjunct : equality_partition.getScopeComplementEqualities())
     {
         post_aggregation_conjuncts.emplace_back(conjunct);
     }
-    for (auto & conjunct : equality_partition.getScopeStraddlingEqualities())
+    for (const auto & conjunct : equality_partition.getScopeStraddlingEqualities())
     {
         post_aggregation_conjuncts.emplace_back(conjunct);
     }
 
     PredicateContext agg_context{
         .predicate = PredicateUtils::combineConjuncts(pushdown_conjuncts),
-        .extra_predicate_for_simplify_outer_join = PredicateConst::TRUE_VALUE};
+        .extra_predicate_for_simplify_outer_join = PredicateConst::TRUE_VALUE,
+        .context = predicate_context.context};
     PlanNodePtr rewritten = process(*node.getChildren()[0], agg_context);
 
     PlanNodePtr output = node.shared_from_this();
@@ -272,7 +302,7 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
     auto step = node.getStep();
 
     // RequireRightKeys is clickhouse sql only, we don't process this kind of join.
-    if(step->getRequireRightKeys().has_value())
+    if (step->getRequireRightKeys().has_value())
     {
         return visitPlanNode(node, predicate_context);
     }
@@ -285,8 +315,8 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
 
     PlanNodePtr & left = node.getChildren()[0];
     PlanNodePtr & right = node.getChildren()[1];
-    ConstASTPtr left_effective_predicate = EffectivePredicateExtractor::extract(left, cte_info, context);
-    ConstASTPtr right_effective_predicate = EffectivePredicateExtractor::extract(right, cte_info, context);
+    ConstASTPtr left_effective_predicate = EffectivePredicateExtractor::extract(left, context);
+    ConstASTPtr right_effective_predicate = EffectivePredicateExtractor::extract(right, context);
     ConstASTPtr join_predicate = PredicateUtils::extractJoinPredicate(node);
 
     std::set<String> left_symbols;
@@ -357,8 +387,7 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
     const DataStream & left_output = left->getStep()->getOutputStream();
     for (const auto & column : left_output.header)
     {
-        Assignment left_assignment{column.name, std::make_shared<ASTIdentifier>(column.name)};
-        left_assignments.emplace_back(left_assignment);
+        left_assignments.emplace_back(column.name, std::make_shared<ASTIdentifier>(column.name));
         left_types[column.name] = column.type;
     }
 
@@ -367,8 +396,7 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
     const DataStream & right_output = right->getStep()->getOutputStream();
     for (const auto & column : right_output.header)
     {
-        Assignment right_assignment{column.name, std::make_shared<ASTIdentifier>(column.name)};
-        right_assignments.emplace_back(right_assignment);
+        right_assignments.emplace_back(column.name, std::make_shared<ASTIdentifier>(column.name));
         right_types[column.name] = column.type;
     }
 
@@ -390,15 +418,17 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
                                                                                              : equality.arguments->getChildren()[1];
             ASTPtr & right_expression = (left_aligned_comparison && right_aligned_comparison) ? equality.arguments->getChildren()[1]
                                                                                               : equality.arguments->getChildren()[0];
-            String left_symbol = left_expression->as<ASTIdentifier>() ?
-                left_expression->getColumnName() : context->getSymbolAllocator()->newSymbol(left_expression->getColumnName());
+            String left_symbol = left_expression->as<ASTIdentifier>()
+                ? left_expression->getColumnName()
+                : context->getSymbolAllocator()->newSymbol(left_expression->getColumnName());
             if (!left_symbols.contains(left_symbol))
             {
                 left_assignments.emplace_back(left_symbol, left_expression);
                 left_types[left_symbol] = left_type_analyzer.getType(left_expression);
             }
-            String right_symbol = right_expression->as<ASTIdentifier>() ?
-                right_expression->getColumnName() : context->getSymbolAllocator()->newSymbol(right_expression->getColumnName());
+            String right_symbol = right_expression->as<ASTIdentifier>()
+                ? right_expression->getColumnName()
+                : context->getSymbolAllocator()->newSymbol(right_expression->getColumnName());
             if (!right_symbols.contains(right_symbol))
             {
                 right_assignments.emplace_back(right_symbol, right_expression);
@@ -436,20 +466,13 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
             right_implicit_filter = build_implicit_filter(step->getRightKeys());
     }
 
-    // create dynamic filters if enabled
-    // add dynamic filter predicates to left side of join
-    // add dynamic filter build expressions to right side projection of join
-    auto dynamic_filters_results = createDynamicFilters(*step);
-    if (!dynamic_filters_results.executors.empty())
-    {
-        std::vector<ConstASTPtr> predicates = std::move(dynamic_filters_results.executors);
-        predicates.emplace_back(left_predicate);
-        left_predicate = PredicateUtils::combineConjuncts(predicates);
-    }
-
     // TODO: combine join implicit filter with inherited extra_predicate_for_simplify_outer_join
-    PredicateContext left_context{.predicate = left_predicate, .extra_predicate_for_simplify_outer_join = left_implicit_filter};
-    PredicateContext right_context{.predicate = right_predicate, .extra_predicate_for_simplify_outer_join = right_implicit_filter};
+    PredicateContext left_context{
+        .predicate = left_predicate, .extra_predicate_for_simplify_outer_join = left_implicit_filter, .context = predicate_context.context};
+    PredicateContext right_context{
+        .predicate = right_predicate,
+        .extra_predicate_for_simplify_outer_join = right_implicit_filter,
+        .context = predicate_context.context};
     PlanNodePtr left_source;
     PlanNodePtr right_source;
 
@@ -473,15 +496,31 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
         right_source = process(*right, right_context);
     }
 
-    auto left_source_expression_step
-        = std::make_shared<ProjectionStep>(left_source->getStep()->getOutputStream(), left_assignments, left_types);
-    auto left_source_expression_node
-        = std::make_shared<ProjectionNode>(context->nextNodeId(), std::move(left_source_expression_step), PlanNodes{left_source});
+    PlanNodePtr left_source_expression_node;
+    if (Utils::isIdentity(left_assignments))
+    {
+        left_source_expression_node = left_source;
+    }
+    else
+    {
+        auto left_source_expression_step
+            = std::make_shared<ProjectionStep>(left_source->getStep()->getOutputStream(), left_assignments, left_types);
+        left_source_expression_node
+            = std::make_shared<ProjectionNode>(context->nextNodeId(), std::move(left_source_expression_step), PlanNodes{left_source});
+    }
 
-    auto right_source_expression_step = std::make_shared<ProjectionStep>(
-        right_source->getStep()->getOutputStream(), right_assignments, right_types, false, dynamic_filters_results.dynamic_filters);
-    auto right_source_expression_node
-        = std::make_shared<ProjectionNode>(context->nextNodeId(), std::move(right_source_expression_step), PlanNodes{right_source});
+    PlanNodePtr right_source_expression_node;
+    if (Utils::isIdentity(right_assignments))
+    {
+        right_source_expression_node = right_source;
+    }
+    else
+    {
+        auto right_source_expression_step
+            = std::make_shared<ProjectionStep>(right_source->getStep()->getOutputStream(), right_assignments, right_types);
+        right_source_expression_node
+            = std::make_shared<ProjectionNode>(context->nextNodeId(), std::move(right_source_expression_step), PlanNodes{right_source});
+    }
 
     PlanNodePtr output_node = node.shared_from_this();
 
@@ -495,84 +534,63 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
     NamesAndTypes output;
     for (const auto & item : left_header)
     {
-        output.emplace_back(NameAndTypePair{item.name, item.type});
+        output.emplace_back(item.name, item.type);
     }
     for (const auto & item : right_header)
     {
-        output.emplace_back(NameAndTypePair{item.name, item.type});
+        output.emplace_back(item.name, item.type);
     }
 
     // cast extracted join keys to super type
     Names left_keys;
     Names right_keys;
     {
-        bool need_project_left = false;
-        bool need_project_right = false;
-        Assignments left_project_assignments;
-        NameToType left_project_types = left_source_expression_node->getOutputNamesToTypes();
-        Assignments right_project_assignments;
-        NameToType right_project_types = right_source_expression_node->getOutputNamesToTypes();
+        ProjectionPlanner left_planner(left_source_expression_node, context);
+        ProjectionPlanner right_planner(right_source_expression_node, context);
         const bool allow_extended_type_conversion = context->getSettingsRef().allow_extended_type_conversion;
-
-        auto put_identities = [](Assignments & assignments, const Names & input_symbols)
-        {
-            for (const auto & symbol: input_symbols)
-                assignments.emplace_back(symbol, std::make_shared<ASTIdentifier>(symbol));
-        };
-
-        put_identities(left_project_assignments, left_source_expression_node->getOutputNames());
-        put_identities(right_project_assignments, right_source_expression_node->getOutputNames());
+        bool need_project = false;
 
         for (const auto & clause : join_clauses)
         {
             String left_key = clause.first;
             String right_key = clause.second;
-            auto left_type = left_project_types.at(left_key);
-            auto right_type = right_project_types.at(right_key);
-            auto res_type = getLeastSupertype({left_type, right_type}, allow_extended_type_conversion);
+            auto left_type = left_planner.getColumnType(left_key);
+            auto right_type = right_planner.getColumnType(right_key);
 
-            auto add_join_key = [&](
-                                    const auto & name,
-                                    const auto & type,
-                                    auto & keys,
-                                    auto & assignments,
-                                    auto & name_to_type,
-                                    auto & need_project)
+            if (!JoinCommon::isJoinCompatibleTypes(left_type, right_type))
             {
-                if (removeNullable(res_type)->equals(*removeNullable(type)))
-                    keys.emplace_back(name);
-                else
-                {
-                    auto casted_name = context->getSymbolAllocator()->newSymbol(name);
-                    assignments.emplace_back(casted_name, makeCastFunction(std::make_shared<ASTIdentifier>(name), res_type));
-                    name_to_type[casted_name] = res_type;
-                    keys.emplace_back(casted_name);
-                    need_project = true;
-                }
-            };
+                auto common_type = getLeastSupertype({left_type, right_type}, allow_extended_type_conversion);
+                left_key = left_planner.addColumn(makeCastFunction(std::make_shared<ASTIdentifier>(left_key), common_type)).first;
+                right_key = right_planner.addColumn(makeCastFunction(std::make_shared<ASTIdentifier>(right_key), common_type)).first;
+                need_project = true;
+            }
 
-            add_join_key(left_key, left_type, left_keys, left_project_assignments, left_project_types, need_project_left);
-            add_join_key(right_key, right_type, right_keys, right_project_assignments, right_project_types, need_project_right);
+            left_keys.emplace_back(left_key);
+            right_keys.emplace_back(right_key);
         }
 
-        if (need_project_left)
+        // TODO: without `need_project`, addRuntimeFilter have a different result for ssb q10
+        if (need_project)
         {
-            auto left_project_step
-                = std::make_shared<ProjectionStep>(left_source_expression_node->getStep()->getOutputStream(), left_project_assignments, left_project_types);
-            left_source_expression_node
-                = std::make_shared<ProjectionNode>(context->nextNodeId(), std::move(left_project_step), PlanNodes{left_source_expression_node});
-        }
-
-        if (need_project_right)
-        {
-            auto right_project_step
-                = std::make_shared<ProjectionStep>(right_source_expression_node->getStep()->getOutputStream(), right_project_assignments, right_project_types);
-            right_source_expression_node
-                = std::make_shared<ProjectionNode>(context->nextNodeId(), std::move(right_project_step), PlanNodes{right_source_expression_node});
+            left_source_expression_node = left_planner.build();
+            right_source_expression_node = right_planner.build();
         }
     }
 
     ASTPtr new_join_filter = PredicateUtils::combineConjuncts(join_filters);
+
+    // can not push normal filter into any inner join
+    auto strictness = step->getStrictness();
+    if (strictness != ASTTableJoin::Strictness::Unspecified && strictness != ASTTableJoin::Strictness::All
+        && (kind == ASTTableJoin::Kind::Inner || kind == ASTTableJoin::Kind::Cross)
+        && (!(step->getFilter() && !PredicateUtils::isTruePredicate(step->getFilter()))))
+    {
+        auto join_conj = PredicateUtils::extractConjuncts<ConstASTPtr>(new_join_filter);
+        auto post_conj = PredicateUtils::extractConjuncts<ConstASTPtr>(post_join_predicate);
+        join_conj.insert(join_conj.end(), post_conj.begin(), post_conj.end());
+        post_join_predicate = PredicateUtils::combineConjuncts(join_conj);
+        new_join_filter = PredicateConst::TRUE_VALUE;
+    }
 
     std::shared_ptr<JoinStep> join_step;
     if (kind == ASTTableJoin::Kind::Cross)
@@ -582,14 +600,21 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
             DataStream{.header = output},
             ASTTableJoin::Kind::Inner,
             ASTTableJoin::Strictness::All,
-            left_keys,
-            right_keys,
+            step->getMaxStreams(),
+            step->getKeepLeftReadInOrder(),
+            std::move(left_keys),
+            std::move(right_keys),
             new_join_filter,
             step->isHasUsing(),
             step->getRequireRightKeys(),
             step->getAsofInequality(),
             step->getDistributionType(),
-            step->isMagic());
+            step->getJoinAlgorithm(),
+            step->isMagic(),
+            step->isOrdered(),
+            step->isSimpleReordered(),
+            step->getRuntimeFilterBuilders(),
+            step->getHints());
     }
     else
     {
@@ -598,14 +623,21 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
             DataStream{.header = output},
             kind,
             step->getStrictness(),
-            left_keys,
-            right_keys,
+            step->getMaxStreams(),
+            step->getKeepLeftReadInOrder(),
+            std::move(left_keys),
+            std::move(right_keys),
             new_join_filter,
             step->isHasUsing(),
             step->getRequireRightKeys(),
             step->getAsofInequality(),
             step->getDistributionType(),
-            step->isMagic());
+            step->getJoinAlgorithm(),
+            step->isMagic(),
+            step->isOrdered(),
+            step->isSimpleReordered(),
+            step->getRuntimeFilterBuilders(),
+            step->getHints());
     }
 
     auto join_node = std::make_shared<JoinNode>(
@@ -622,6 +654,8 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
             join_step->getOutputStream(),
             ASTTableJoin::Kind::Left,
             join_step->getStrictness(),
+            join_step->getMaxStreams(),
+            join_step->getKeepLeftReadInOrder(),
             join_step->getRightKeys(),
             join_step->getLeftKeys(),
             join_step->getFilter(),
@@ -629,7 +663,12 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
             join_step->getRequireRightKeys(),
             join_step->getAsofInequality(),
             join_step->getDistributionType(),
-            join_step->isMagic());
+            join_step->getJoinAlgorithm(),
+            join_step->isMagic(),
+            step->isOrdered(),
+            step->isSimpleReordered(),
+            step->getRuntimeFilterBuilders(),
+            step->getHints());
         join_node = std::make_shared<JoinNode>(
             context->nextNodeId(), join_step, PlanNodes{right_source_expression_node, left_source_expression_node});
     }
@@ -658,46 +697,12 @@ PlanNodePtr PredicateVisitor::visitJoinNode(JoinNode & node, PredicateContext & 
             output_types[column.name] = column.type;
         }
         auto output_expression_step
-            = std::make_shared<ProjectionStep>(output_node->getStep()->getOutputStream(), output_assignments, output_types);
+            = std::make_shared<ProjectionStep>(output_node->getStep()->getOutputStream(), std::move(output_assignments), std::move(output_types));
         auto output_expression_node
             = std::make_shared<ProjectionNode>(context->nextNodeId(), std::move(output_expression_step), PlanNodes{output_node});
         output_node = output_expression_node;
     }
     return output_node;
-}
-
-PredicateVisitor::DynamicFilterResult PredicateVisitor::createDynamicFilters(const JoinStep & join) const
-{
-    if (!dynamic_filtering || (join.getKind() != ASTTableJoin::Kind::Inner && join.getKind() != ASTTableJoin::Kind::Right))
-        return {};
-
-    std::unordered_map<std::string, DataTypePtr> right_name_to_types;
-    for (const auto & item : join.getInputStreams()[1].header)
-        right_name_to_types.emplace(item.name, item.type);
-
-    std::vector<ConstASTPtr> executors;
-    std::unordered_map<String, DynamicFilterBuildInfo> dynamic_filters;
-
-    for (auto left = join.getLeftKeys().begin(), right = join.getRightKeys().begin(); left != join.getLeftKeys().end(); left++, right++)
-    {
-        // generate unique id
-        auto id = context->nextNodeId();
-        DynamicFilterTypes types;
-        if (context->getSettingsRef().enable_dynamic_filter_for_bloom_filter)
-        {
-            executors.emplace_back(DynamicFilters::createDynamicFilterExpression(id, *left, DynamicFilterType::BloomFilter));
-            types.emplace(DynamicFilterType::BloomFilter);
-        }
-        if (right_name_to_types.at(*right)->isComparable())
-        {
-            executors.emplace_back(DynamicFilters::createDynamicFilterExpression(id, *left, DynamicFilterType::Range));
-            types.emplace(DynamicFilterType::Range);
-        }
-        if (!types.empty())
-            dynamic_filters.emplace(*right, DynamicFilterBuildInfo{id, *left, types});
-    }
-    // todo@kaixi: generate for any join filters
-    return DynamicFilterResult{dynamic_filters, executors};
 }
 
 PlanNodePtr PredicateVisitor::visitExchangeNode(ExchangeNode & node, PredicateContext & predicate_context)
@@ -707,61 +712,118 @@ PlanNodePtr PredicateVisitor::visitExchangeNode(ExchangeNode & node, PredicateCo
 
 PlanNodePtr PredicateVisitor::visitWindowNode(WindowNode & node, PredicateContext & predicate_context)
 {
-    //    auto & step_ptr = node.getStep();
-    //    auto & step = dynamic_cast<WindowStep &>(*step_ptr);
-    //
-    //    const WindowDescription & window_desc = step.getWindow();
-    //    WindowPartitionScheme scheme = window_desc.scheme;
-    //    Strings partition_symbols = scheme.partition_keys;
-    //
-    //    // TODO: This could be broader. We can push down conjucts if they are constant for all rows in a window partition.
-    //    // The simplest way to guarantee this is if the conjucts are deterministic functions of the partitioning symbols.
-    //    // This can leave out cases where they're both functions of some set of common expressions and the partitioning
-    //    // function is injective, but that's a rare case. The majority of window nodes are expected to be partitioned by
-    //    // pre-projected symbols.
-    //    ASTPtr predicate = predicate_context.predicate;
-    //    ContextMutablePtr context = predicate_context.context;
-    //    std::vector<ASTPtr> conjuncts = PredicateUtils::extractConjuncts(predicate);
-    //
-    //    std::vector<ASTPtr> push_down_conjuncts;
-    //    std::vector<ASTPtr> non_push_down_conjuncts;
-    //    for (auto & conjunct : conjuncts)
-    //    {
-    //        std::set<String> unique_symbols = SymbolsExtractor::extract(conjunct);
-    //        if (DeterminismEvaluator::isDeterministic(conjunct, context) && PredicateUtils::containsAll(unique_symbols, partition_symbols))
-    //        {
-    //            push_down_conjuncts.emplace_back(conjunct);
-    //        }
-    //        else
-    //        {
-    //            non_push_down_conjuncts.emplace_back(conjunct);
-    //        }
-    //    }
-    //
-    //    PredicateContext window_context{
-    //        .predicate = PredicateUtils::combineConjuncts(push_down_conjuncts), .context = context, .types = predicate_context.types};
-    //    PlanNodePtr rewritten = processChild(node, window_context);
-    //
-    //    ASTPtr non_push_down_predicate = PredicateUtils::combineConjuncts(non_push_down_conjuncts);
-    //    if (!PredicateUtils::isTruePredicate(non_push_down_predicate))
-    //    {
-    //        // Drop in a FilterNode b/c we cannot push our predicate down any further
-    //        ASTPtr extra_predicate = PredicateUtils::combineConjuncts(non_push_down_conjuncts);
-    //        auto filter_step = std::make_shared<FilterStep>(rewritten->getStep()->getOutputStream(), extra_predicate);
-    //        auto filter_node = std::make_shared<FilterNode>(context->nextNodeId(), std::move(filter_step), PlanNodes{rewritten});
-    //        return filter_node;
-    //    }
-    //    return rewritten;
-    return visitPlanNode(node, predicate_context);
+    auto & step_ptr = node.getStep();
+    const auto * step = dynamic_cast<const WindowStep *>(step_ptr.get());
+
+    const WindowDescription & window_desc = step->getWindow();
+    SortDescription scheme = window_desc.partition_by;
+    Strings partition_symbols;
+    for (auto & partition : scheme)
+    {
+        partition_symbols.emplace_back(partition.column_name);
+    }
+
+    auto predicate = predicate_context.predicate;
+    ContextMutablePtr ctx = predicate_context.context;
+    auto conjuncts = PredicateUtils::extractConjuncts(predicate);
+
+    /// guarantee the predicates which can be pushed down through window step
+    /// are deterministic functions, and belongs to window partitioning symbols.
+    std::vector<ConstASTPtr> push_down_conjuncts;
+    std::vector<ConstASTPtr> non_push_down_conjuncts;
+    for (auto & conjunct : conjuncts)
+    {
+        std::set<String> unique_symbols = SymbolsExtractor::extract(conjunct);
+        if (ExpressionDeterminism::isDeterministic(conjunct, ctx) && PredicateUtils::containsAll(partition_symbols, unique_symbols))
+        {
+            push_down_conjuncts.emplace_back(conjunct);
+        }
+        else
+        {
+            non_push_down_conjuncts.emplace_back(conjunct);
+        }
+    }
+
+    PredicateContext window_context{
+        .predicate = PredicateUtils::combineConjuncts(push_down_conjuncts),
+        .extra_predicate_for_simplify_outer_join = predicate_context.extra_predicate_for_simplify_outer_join,
+        .context = ctx};
+    PlanNodePtr rewritten = processChild(node, window_context);
+
+    ASTPtr non_push_down_predicate = PredicateUtils::combineConjuncts(non_push_down_conjuncts);
+    if (!PredicateUtils::isTruePredicate(non_push_down_predicate))
+    {
+        ASTPtr extra_predicate = PredicateUtils::combineConjuncts(non_push_down_conjuncts);
+        auto filter_step = std::make_shared<FilterStep>(rewritten->getStep()->getOutputStream(), extra_predicate);
+        auto filter_node = std::make_shared<FilterNode>(ctx->nextNodeId(), std::move(filter_step), PlanNodes{rewritten});
+        return filter_node;
+    }
+    return rewritten;
+}
+
+PlanNodePtr PredicateVisitor::visitMarkDistinctNode(MarkDistinctNode & node, PredicateContext & predicate_context)
+{
+    auto & step_ptr = node.getStep();
+    auto & step = dynamic_cast<MarkDistinctStep &>(*step_ptr);
+
+    const Strings & distinct_symbols = step.getDistinctSymbols();
+
+    auto predicate = predicate_context.predicate;
+    ContextMutablePtr ctx = predicate_context.context;
+    auto conjuncts = PredicateUtils::extractConjuncts(predicate);
+
+    /// guarantee the predicates which can be pushed down through mark distinct step
+    /// are deterministic functions, and belongs to distinct symbols.
+    std::vector<ConstASTPtr> push_down_conjuncts;
+    std::vector<ConstASTPtr> non_push_down_conjuncts;
+    for (auto & conjunct : conjuncts)
+    {
+        std::set<String> unique_symbols = SymbolsExtractor::extract(conjunct);
+        if (ExpressionDeterminism::isDeterministic(conjunct, ctx) && PredicateUtils::containsAll(distinct_symbols, unique_symbols))
+        {
+            push_down_conjuncts.emplace_back(conjunct);
+        }
+        else
+        {
+            non_push_down_conjuncts.emplace_back(conjunct);
+        }
+    }
+
+    PredicateContext window_context{
+        .predicate = PredicateUtils::combineConjuncts(push_down_conjuncts),
+        .extra_predicate_for_simplify_outer_join = predicate_context.extra_predicate_for_simplify_outer_join,
+        .context = ctx};
+    PlanNodePtr rewritten = processChild(node, window_context);
+
+    ASTPtr non_push_down_predicate = PredicateUtils::combineConjuncts(non_push_down_conjuncts);
+    if (!PredicateUtils::isTruePredicate(non_push_down_predicate))
+    {
+        ASTPtr extra_predicate = PredicateUtils::combineConjuncts(non_push_down_conjuncts);
+        auto filter_step = std::make_shared<FilterStep>(rewritten->getStep()->getOutputStream(), extra_predicate);
+        auto filter_node = std::make_shared<FilterNode>(ctx->nextNodeId(), std::move(filter_step), PlanNodes{rewritten});
+        return filter_node;
+    }
+    return rewritten;
 }
 
 PlanNodePtr PredicateVisitor::visitMergeSortingNode(MergeSortingNode & node, PredicateContext & predicate_context)
 {
+    if (node.getStep()->getLimit() != 0)
+        return visitPlanNode(node, predicate_context);
     return processChild(node, predicate_context);
 }
 
 PlanNodePtr PredicateVisitor::visitPartialSortingNode(PartialSortingNode & node, PredicateContext & predicate_context)
 {
+    if (node.getStep()->getLimit() != 0)
+        return visitPlanNode(node, predicate_context);
+    return processChild(node, predicate_context);
+}
+
+PlanNodePtr PredicateVisitor::visitSortingNode(SortingNode & node, PredicateContext & predicate_context)
+{
+    if (node.getStep()->getLimit() != 0)
+        return visitPlanNode(node, predicate_context);
     return processChild(node, predicate_context);
 }
 
@@ -769,7 +831,6 @@ PlanNodePtr PredicateVisitor::visitUnionNode(UnionNode & node, PredicateContext 
 {
     const auto & step = *node.getStep();
     PlanNodes children;
-    DataStreams inputs;
     ConstASTPtr predicate = predicate_context.predicate;
     for (size_t i = 0; i < node.getChildren().size(); i++)
     {
@@ -783,14 +844,11 @@ PlanNodePtr PredicateVisitor::visitUnionNode(UnionNode & node, PredicateContext 
             = ExpressionInliner::inlineSymbols(predicate_context.extra_predicate_for_simplify_outer_join, assignments);
         PredicateContext source_context{
             .predicate = source_predicate,
-            .extra_predicate_for_simplify_outer_join = source_extra_predicate};
+            .extra_predicate_for_simplify_outer_join = source_extra_predicate,
+            .context = predicate_context.context};
         PlanNodePtr child = process(*node.getChildren()[i], source_context);
         children.emplace_back(child);
-        inputs.push_back(child->getStep()->getOutputStream());
     }
-    auto new_step = std::dynamic_pointer_cast<UnionStep>(node.getStep()->copy(context));
-    new_step->setInputStreams(inputs);
-    node.setStep(new_step);
     node.replaceChildren(children);
     return node.shared_from_this();
 }
@@ -813,46 +871,44 @@ PlanNodePtr PredicateVisitor::visitAssignUniqueIdNode(AssignUniqueIdNode & node,
 
 PlanNodePtr PredicateVisitor::visitCTERefNode(CTERefNode & node, PredicateContext & predicate_context)
 {
-    const auto * cte_step = dynamic_cast<const CTERefStep *>(node.getStep().get());
-    auto mapper = SymbolMapper::symbolMapper(cte_step->getOutputColumns());
+    auto * cte_step = dynamic_cast<CTERefStep *>(node.getStep().get());
+    if (!cte_step->hasFilter() && !PredicateUtils::isTruePredicate(predicate_context.predicate))
+        cte_step->setFilter(true);
 
-    // remove dynamic filters, which don't support appears in OR.
-    // todo: support dynamic filter.
-    auto filters = DynamicFilters::extractDynamicFilters(predicate_context.predicate);
-    ConstASTPtr mapped_filter = mapper.map(PredicateUtils::combineConjuncts(filters.second));
-
-    auto & common_filters = cte_common_filters[cte_step->getId()];
-    common_filters.emplace_back(mapped_filter);
-
+    auto & cte_refs = cte_predicates[cte_step->getId()];
+    cte_refs.emplace_back(std::make_pair(cte_step, predicate_context.predicate));
     // only push filter through cte when filters exist above all cte, and only push filter in the first time.
-    if (common_filters.size() == cte_reference_counts.at(cte_step->getId()))
+    if (cte_refs.size() == cte_reference_counts.at(cte_step->getId()))
     {
         auto & cte_def = cte_info.getCTEDef(cte_step->getId());
-        if (PredicateUtils::isTruePredicate(cte_step->getFilter()))
+        if (pushdown_filter_into_cte)
         {
+            std::vector<ConstASTPtr> common_filters;
+            for (const auto & cte_ref : cte_refs)
+            {
+                auto mapping = cte_ref.first->getOutputColumns();
+                auto mapper = SymbolMapper::simpleMapper(mapping);
+                auto mapped_filter = mapper.map(cte_ref.second);
+                common_filters.emplace_back(mapped_filter);
+            }
             auto optimized_expression = ExpressionInterpreter::optimizePredicate(
                 PredicateUtils::combineDisjuncts(common_filters), cte_def->getStep()->getOutputStream().header.getNamesToTypes(), context);
             PredicateContext cte_predicate_context{
-                .predicate = optimized_expression, .extra_predicate_for_simplify_outer_join = PredicateConst::TRUE_VALUE};
+                .predicate = optimized_expression,
+                .extra_predicate_for_simplify_outer_join = PredicateConst::TRUE_VALUE,
+                .context = predicate_context.context};
             cte_def = VisitorUtil::accept(cte_def, *this, cte_predicate_context);
         }
         else
         {
             PredicateContext cte_predicate_context{
-                .predicate = PredicateConst::TRUE_VALUE, .extra_predicate_for_simplify_outer_join = PredicateConst::TRUE_VALUE};
+                .predicate = PredicateConst::TRUE_VALUE,
+                .extra_predicate_for_simplify_outer_join = PredicateConst::TRUE_VALUE,
+                .context = predicate_context.context};
             cte_def = VisitorUtil::accept(cte_def, *this, cte_predicate_context);
         }
     }
 
-    if (!PredicateUtils::isTruePredicate(mapped_filter))
-    {
-        auto new_step = std::make_shared<CTERefStep>(
-            cte_step->getOutputStream(),
-            cte_step->getId(),
-            cte_step->getOutputColumns(),
-            PredicateUtils::combineConjuncts(std::vector<ConstASTPtr>{{cte_step->getFilter(), mapped_filter}}));
-        node.setStep(new_step);
-    }
     return visitPlanNode(node, predicate_context);
 }
 
@@ -867,17 +923,12 @@ PlanNodePtr PredicateVisitor::processChild(PlanNodeBase & node, PredicateContext
         return node.shared_from_this();
 
     PlanNodes children;
-    DataStreams inputs;
     for (const auto & item : node.getChildren())
     {
         PlanNodePtr child = process(*item, predicate_context);
         children.emplace_back(child);
-        inputs.push_back(child->getStep()->getOutputStream());
     }
 
-    auto new_step = node.getStep()->copy(context);
-    new_step->setInputStreams(inputs);
-    node.setStep(new_step);
     node.replaceChildren(children);
     return node.shared_from_this();
 }
@@ -958,6 +1009,8 @@ InnerJoinResult PredicateVisitor::processInnerJoin(
     auto equalities_without_left = all_inference_without_left_inferred.partitionedBy(left_scope).getScopeEqualities();
     auto equalities_without_right = all_inference_without_right_inferred.partitionedBy(right_scope).getScopeEqualities();
 
+    left_conjuncts.reserve(equalities_without_left.size());
+    right_conjuncts.reserve(equalities_without_right.size());
     for (auto & equality_without_left : equalities_without_left)
     {
         left_conjuncts.emplace_back(equality_without_left);
@@ -1091,7 +1144,7 @@ OuterJoinResult PredicateVisitor::processOuterJoin(
         = EqualityInference::newInstance(std::vector<ConstASTPtr>{inherited_predicate, outer_predicate}, context);
 
     EqualityPartition equality_partition = inherited_inference.partitionedBy(outer_symbols);
-    auto & scope_equalities = equality_partition.getScopeEqualities();
+    const auto & scope_equalities = equality_partition.getScopeEqualities();
     auto outer_only_inherited_equalities = PredicateUtils::combineConjuncts(scope_equalities);
     EqualityInference potential_null_symbol_inference = EqualityInference::newInstance(
         std::vector<ConstASTPtr>{outer_only_inherited_equalities, outer_predicate, inner_predicate, join_predicate}, context);
@@ -1102,9 +1155,9 @@ OuterJoinResult PredicateVisitor::processOuterJoin(
     EqualityInference potential_null_symbol_inference_without_inner_inferred = EqualityInference::newInstance(
         std::vector<ConstASTPtr>{outer_only_inherited_equalities, outer_predicate, join_predicate}, context);
 
-    EqualityPartition potential_null_symbol_inference_without_inner_inferred_partition =
-        potential_null_symbol_inference_without_inner_inferred.partitionedBy(inner_symbols);
-    for (auto & conjunct : potential_null_symbol_inference_without_inner_inferred_partition.getScopeEqualities())
+    EqualityPartition potential_null_symbol_inference_without_inner_inferred_partition
+        = potential_null_symbol_inference_without_inner_inferred.partitionedBy(inner_symbols);
+    for (const auto & conjunct : potential_null_symbol_inference_without_inner_inferred_partition.getScopeEqualities())
     {
         inner_pushdown_conjuncts.emplace_back(conjunct);
     }
@@ -1112,29 +1165,29 @@ OuterJoinResult PredicateVisitor::processOuterJoin(
     // TODO: we can further improve simplifying the equalities by considering other relationships from the outer side
     EqualityPartition join_equality_partition = EqualityInference::newInstance(join_predicate, context).partitionedBy(inner_symbols);
 
-    for (auto & conjunct : join_equality_partition.getScopeEqualities())
+    for (const auto & conjunct : join_equality_partition.getScopeEqualities())
     {
         inner_pushdown_conjuncts.emplace_back(conjunct);
     }
-    for (auto & conjunct : join_equality_partition.getScopeComplementEqualities())
+    for (const auto & conjunct : join_equality_partition.getScopeComplementEqualities())
     {
         join_conjuncts.emplace_back(conjunct);
     }
-    for (auto & conjunct : join_equality_partition.getScopeStraddlingEqualities())
+    for (const auto & conjunct : join_equality_partition.getScopeStraddlingEqualities())
     {
         join_conjuncts.emplace_back(conjunct);
     }
 
     // Add the equalities from the inferences back in
-    for (auto & conjunct : equality_partition.getScopeEqualities())
+    for (const auto & conjunct : equality_partition.getScopeEqualities())
     {
         outer_pushdown_conjuncts.emplace_back(conjunct);
     }
-    for (auto & conjunct : equality_partition.getScopeComplementEqualities())
+    for (const auto & conjunct : equality_partition.getScopeComplementEqualities())
     {
         post_join_conjuncts.emplace_back(conjunct);
     }
-    for (auto & conjunct : equality_partition.getScopeStraddlingEqualities())
+    for (const auto & conjunct : equality_partition.getScopeStraddlingEqualities())
     {
         post_join_conjuncts.emplace_back(conjunct);
     }
@@ -1196,7 +1249,7 @@ void PredicateVisitor::tryNormalizeOuterToInnerJoin(JoinNode & node, const Const
     using Kind = ASTTableJoin::Kind;
     using Strictness = ASTTableJoin::Strictness;
 
-    const auto & step = *node.getStep();
+    auto & step = *node.getStep();
     Kind kind = step.getKind();
     Strictness strictness = step.getStrictness();
 
@@ -1213,7 +1266,7 @@ void PredicateVisitor::tryNormalizeOuterToInnerJoin(JoinNode & node, const Const
         std::unordered_map<String, Field> result;
 
         // note we cannot use type information of `source` node as outer join will change the column types of non-outer side
-        for (const auto & name: source->getStep()->getOutputStream().header.getNames())
+        for (const auto & name : source->getStep()->getOutputStream().header.getNames())
             if (column_types.count(name))
                 result.emplace(name, column_types.at(name)->getDefault());
 
@@ -1233,9 +1286,7 @@ void PredicateVisitor::tryNormalizeOuterToInnerJoin(JoinNode & node, const Const
         kind = useInnerForLeftSide(kind);
     }
 
-    auto new_step = std::dynamic_pointer_cast<JoinStep>(step.copy(context));
-    new_step->setKind(kind);
-    node.setStep(new_step);
+    step.setKind(kind);
 }
 
 bool PredicateVisitor::canConvertOuterToInner(
@@ -1277,15 +1328,15 @@ bool PredicateVisitor::isRegularJoin(const JoinStep & step)
     return isAll(strictness) || isAny(strictness);
 }
 
-ASTPtr EffectivePredicateExtractor::extract(PlanNodePtr & node, CTEInfo & cte_info, ContextMutablePtr & context)
+ASTPtr EffectivePredicateExtractor::extract(PlanNodePtr & node, ContextMutablePtr & context)
 {
-    EffectivePredicateVisitor visitor{cte_info};
+    EffectivePredicateVisitor visitor{};
     return VisitorUtil::accept(node, visitor, context);
 }
 
-ASTPtr EffectivePredicateExtractor::extract(PlanNodeBase & node, CTEInfo & cte_info, ContextMutablePtr & context)
+ASTPtr EffectivePredicateExtractor::extract(PlanNodeBase & node, ContextMutablePtr & context)
 {
-    EffectivePredicateVisitor visitor{cte_info};
+    EffectivePredicateVisitor visitor{};
     return VisitorUtil::accept(node, visitor, context);
 }
 
@@ -1390,13 +1441,26 @@ ASTPtr EffectivePredicateVisitor::visitFilterNode(FilterNode & node, ContextMuta
 {
     ASTPtr underlying_predicate = process(node, context);
 
-    const auto & step= *node.getStep();
+    const auto & step = *node.getStep();
     auto predicate = step.getFilter();
 
     // Remove non-deterministic conjuncts
     predicate = ExpressionDeterminism::filterDeterministicConjuncts(predicate, context);
-    std::vector<ConstASTPtr> predicates{predicate, underlying_predicate};
-    return PredicateUtils::combineConjuncts(predicates);
+
+    // Remove dynamic filters
+    std::vector<ConstASTPtr> predicates = PredicateUtils::extractConjuncts(predicate);
+    std::vector<ConstASTPtr> removed_dynamic_filters;
+    for (auto & pre : predicates)
+    {
+        if (!RuntimeFilterUtils::isInternalRuntimeFilter(pre))
+        {
+            removed_dynamic_filters.emplace_back(pre);
+        }
+    }
+
+    // Adds on underlying_predicate
+    removed_dynamic_filters.emplace_back(underlying_predicate);
+    return PredicateUtils::combineConjuncts(removed_dynamic_filters);
 }
 
 ASTPtr EffectivePredicateVisitor::visitAggregatingNode(AggregatingNode & node, ContextMutablePtr & context)
@@ -1420,13 +1484,11 @@ ASTPtr EffectivePredicateVisitor::visitAggregatingNode(AggregatingNode & node, C
 
 ASTPtr EffectivePredicateVisitor::visitJoinNode(JoinNode &, ContextMutablePtr &)
 {
-    // TODO implement
     return PredicateConst::TRUE_VALUE;
 }
 
 ASTPtr EffectivePredicateVisitor::visitExchangeNode(ExchangeNode &, ContextMutablePtr &)
 {
-    // TODO implement
     return PredicateConst::TRUE_VALUE;
 }
 
@@ -1442,7 +1504,6 @@ ASTPtr EffectivePredicateVisitor::visitMergeSortingNode(MergeSortingNode & node,
 
 ASTPtr EffectivePredicateVisitor::visitUnionNode(UnionNode &, ContextMutablePtr &)
 {
-    // TODO implement
     return PredicateConst::TRUE_VALUE;
 }
 
@@ -1466,7 +1527,8 @@ ASTPtr EffectivePredicateVisitor::process(PlanNodeBase & node, ContextMutablePtr
     return VisitorUtil::accept(node.getChildren()[0], *this, context);
 }
 
-ASTPtr EffectivePredicateVisitor::pullExpressionThroughSymbols(ASTPtr & expression, std::vector<String> symbols, ContextMutablePtr & context)
+ASTPtr
+EffectivePredicateVisitor::pullExpressionThroughSymbols(ASTPtr & expression, std::vector<String> symbols, ContextMutablePtr & context)
 {
     EqualityInference equality_inference = EqualityInference::newInstance(expression, context);
 
@@ -1490,10 +1552,9 @@ ASTPtr EffectivePredicateVisitor::pullExpressionThroughSymbols(ASTPtr & expressi
     return PredicateUtils::combineConjuncts(effective_conjuncts);
 }
 
-ASTPtr EffectivePredicateVisitor::visitCTERefNode(CTERefNode & node, ContextMutablePtr & context)
+ASTPtr EffectivePredicateVisitor::visitCTERefNode(CTERefNode &, ContextMutablePtr &)
 {
-    const auto * step = dynamic_cast<const CTERefStep *>(node.getStep().get());
-    return VisitorUtil::accept(step->toInlinedPlanNode(cte_info, context), *this, context);
+    return PredicateConst::TRUE_VALUE;
 }
 
 }

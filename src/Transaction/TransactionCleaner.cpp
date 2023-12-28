@@ -15,14 +15,19 @@
 
 #include <Transaction/TransactionCleaner.h>
 
+#include <Disks/DiskByteS3.h>
 #include <Catalog/Catalog.h>
 #include <Common/serverLocality.h>
 #include <MergeTreeCommon/CnchTopologyMaster.h>
-// #include <MergeTreeCommon/CnchServerClientPool.h>
+#include <CloudServices/CnchServerClientPool.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH_fwd.h>
+#include <Interpreters/Context.h>
 #include <Transaction/TransactionCoordinatorRcCnch.h>
 #include <Transaction/TxnTimestamp.h>
 #include <Transaction/TransactionCommon.h>
+#include <Transaction/Actions/S3AttachMetaFileAction.h>
+#include <Transaction/Actions/S3AttachMetaAction.h>
+#include <Transaction/Actions/S3DetachMetaAction.h>
 
 namespace DB
 {
@@ -51,8 +56,19 @@ void TransactionCleaner::cleanTransaction(const TransactionCnchPtr & txn)
         return;
 
     if (!txn_record.ended())
-        txn->abort();
-
+    {
+        try
+        {
+            txn->abort();
+        }
+        catch (...)
+        {
+            /// if abort transaction failed (e.g., bytekv is not stable at this moment),
+            /// we are not 100% sure how is the status going, we let dm to make the correct decision.
+            txn->force_clean_by_dm = true;
+            throw;
+        }
+    }
     if (!txn->async_post_commit)
     {
         TxnCleanTask task(txn->getTransactionID(), CleanTaskPriority::HIGH, txn_record.status());
@@ -99,30 +115,54 @@ void TransactionCleaner::cleanCommittedTxn(const TransactionRecord & txn_record)
         for (const auto & [uuid, resources] : undo_buffer)
         {
             LOG_DEBUG(log, "Get undo buffer of the table {}\n", uuid);
-            auto host_port = global_context.getCnchTopologyMaster()->getTargetServer(uuid, false);
+
+            StoragePtr table = catalog->tryGetTableByUUID(global_context, uuid, TxnTimestamp::maxTS(), true);
+            if (!table)
+                continue;
+
+            auto host_port = global_context.getCnchTopologyMaster()->getTargetServer(uuid, table->getServerVwName(), false);
             auto rpc_address = host_port.getRPCAddress();
             if (!isLocalServer(rpc_address, std::to_string(global_context.getRPCPort())))
             {
                 // TODO: need to fix for multi-table txn
                 LOG_DEBUG(log, "Forward clean task for txn {} to server {}", txn_record.txnID().toUInt64(), rpc_address);
-                // global_context.getCnchServerClientPool().get(rpc_address)->cleanTransaction(txn_record);
+                global_context.getCnchServerClientPool().get(rpc_address)->cleanTransaction(txn_record);
                 return;
             }
-            StoragePtr table = catalog->tryGetTableByUUID(global_context, uuid, TxnTimestamp::maxTS(), true);
-            if (!table)
-                continue;
 
             UndoResourceNames names = integrateResources(resources);
+
+            /// Collect extra parts to update commit time
+            /// We don't want to add it into integrateResources since when clean aborted
+            /// transaction, we need some extra logic rather than just delete it from catalog
+            S3AttachMetaAction::collectUndoResourcesForCommit(resources, names);
+            /// Clean detach parts for s3 committed
+            S3DetachMetaAction::commitByUndoBuffer(global_context, table, resources);
+            /// Clean s3 meta file
+            S3AttachMetaFileAction::commitByUndoBuffer(global_context, resources);
+
             auto intermediate_parts = catalog->getDataPartsByNames(names.parts, table, 0);
             auto undo_bitmaps = catalog->getDeleteBitmapByKeys(table, names.bitmaps);
             auto staged_parts = catalog->getStagedDataPartsByNames(names.staged_parts, table, 0);
+
+            if (intermediate_parts.size() != names.parts.size()
+                || undo_bitmaps.size() != names.bitmaps.size()
+                || staged_parts.size() != names.staged_parts.size())
+            {
+                 throw Exception("the metadata size in kv is not matched with the record size in undo buffer", ErrorCodes::LOGICAL_ERROR);
+            }
 
             {
                 std::lock_guard lock(task.mutex);
                 task.undo_size = intermediate_parts.size() + undo_bitmaps.size();
             }
-
             catalog->setCommitTime(table, Catalog::CommitItems{intermediate_parts, undo_bitmaps, staged_parts}, txn_record.commitTs(), txn_record.txnID());
+
+            // clean vfs if necessary
+            for (const auto & resource : resources)
+            {
+                resource.commit(global_context);
+            }
         }
 
         catalog->clearUndoBuffer(txn_record.txnID());
@@ -177,6 +217,11 @@ void TransactionCleaner::cleanAbortedTxn(const TransactionRecord & txn_record)
             if (!storage)
                 throw Exception("Table is not of MergeTree class", ErrorCodes::LOGICAL_ERROR);
 
+            // Clean attach parts for s3 aborted
+            S3AttachMetaAction::abortByUndoBuffer(global_context, table, resources);
+            // Clean detach parts for s3 aborted
+            S3DetachMetaAction::abortByUndoBuffer(global_context, table, resources);
+
             UndoResourceNames names = integrateResources(resources);
             auto intermediate_parts = catalog->getDataPartsByNames(names.parts, table, 0);
             auto undo_bitmaps = catalog->getDeleteBitmapByKeys(table, names.bitmaps);
@@ -188,7 +233,7 @@ void TransactionCleaner::cleanAbortedTxn(const TransactionRecord & txn_record)
             }
 
             // skip part cache to avoid blocking by write lock of part cache for long time
-            catalog->clearParts(table, Catalog::CommitItems{intermediate_parts, undo_bitmaps, staged_parts}, true);
+            catalog->clearParts(table, Catalog::CommitItems{intermediate_parts, undo_bitmaps, staged_parts});
 
             // clean vfs
             for (const auto & resource : resources)

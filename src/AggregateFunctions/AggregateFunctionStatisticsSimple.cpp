@@ -26,7 +26,7 @@ AggregateFunctionPtr createAggregateFunctionStatisticsUnary(
     AggregateFunctionPtr res;
     DataTypePtr data_type = argument_types[0];
     if (isDecimal(data_type))
-        res.reset(createWithDecimalType<FunctionTemplate>(*data_type, *data_type, argument_types));
+        res.reset(createWithDecimalType<FunctionTemplate>(*data_type, argument_types));
     else
         res.reset(createWithNumericType<FunctionTemplate>(*data_type, argument_types));
 
@@ -71,8 +71,11 @@ void registerAggregateFunctionsStatisticsSimple(AggregateFunctionFactory & facto
     /// Synonims for compatibility.
     factory.registerAlias("VAR_SAMP", "varSamp", AggregateFunctionFactory::CaseInsensitive);
     factory.registerAlias("VAR_POP", "varPop", AggregateFunctionFactory::CaseInsensitive);
+    factory.registerAlias("VARIANCE", "varPop", AggregateFunctionFactory::CaseInsensitive);
     factory.registerAlias("STDDEV_SAMP", "stddevSamp", AggregateFunctionFactory::CaseInsensitive);
     factory.registerAlias("STDDEV_POP", "stddevPop", AggregateFunctionFactory::CaseInsensitive);
+    factory.registerAlias("STDDEV", "stddevPop", AggregateFunctionFactory::CaseInsensitive);
+    factory.registerAlias("STD", "stddevPop", AggregateFunctionFactory::CaseInsensitive);
     factory.registerAlias("COVAR_SAMP", "covarSamp", AggregateFunctionFactory::CaseInsensitive);
     factory.registerAlias("COVAR_POP", "covarPop", AggregateFunctionFactory::CaseInsensitive);
 }

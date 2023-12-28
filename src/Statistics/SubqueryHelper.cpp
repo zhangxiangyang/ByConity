@@ -34,6 +34,8 @@ static ContextMutablePtr createQueryContext(ContextPtr context)
     changes.emplace_back("dialect_type", "CLICKHOUSE");
     changes.emplace_back("database_atomic_wait_for_drop_and_detach_synchronously", true);
     changes.emplace_back("enable_deterministic_sample_by_range", true);
+    changes.emplace_back("uniform_sample_by_range", true);
+    changes.emplace_back("insert_distributed_sync", true);
     query_context->applySettingsChanges(changes);
 
     return query_context;
@@ -86,16 +88,10 @@ Block SubqueryHelper::getNextBlock()
     }
 
     Block block;
-    auto ok = impl->executor->pull(block);
-    impl->executor->rethrowExceptionIfHas();
-    if (!ok)
+    while (!block && impl->executor->pull(block))
     {
-        return {};
     }
-    else
-    {
-        return block;
-    }
+    return block;
 }
 
 void executeSubQuery(ContextPtr old_context, const String & sql)

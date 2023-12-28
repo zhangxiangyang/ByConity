@@ -69,8 +69,10 @@ IMergeTreeDataPart::MergeTreeReaderPtr MergeTreeDataPartCompact::getReader(
     UncompressedCache * uncompressed_cache,
     MarkCache * mark_cache,
     const MergeTreeReaderSettings & reader_settings,
+    MergeTreeIndexExecutor * /* index_executor */,
     const ValueSizeMap & avg_value_size_hints,
-    const ReadBufferFromFileBase::ProfileCallback & profile_callback) const
+    const ReadBufferFromFileBase::ProfileCallback & profile_callback,
+    [[maybe_unused]] const ProgressCallback & internal_progress_cb) const
 {
     auto ptr = std::static_pointer_cast<const MergeTreeDataPartCompact>(shared_from_this());
     return std::make_unique<MergeTreeReaderCompact>(
@@ -85,7 +87,8 @@ IMergeTreeDataPart::MergeTreeWriterPtr MergeTreeDataPartCompact::getWriter(
     const std::vector<MergeTreeIndexPtr> & indices_to_recalc,
     const CompressionCodecPtr & default_codec_,
     const MergeTreeWriterSettings & writer_settings,
-    const MergeTreeIndexGranularity & computed_index_granularity) const
+    const MergeTreeIndexGranularity & computed_index_granularity,
+    const BitmapBuildInfo & /* bitmap_build_info */) const
 {
     /// Handle implicit col when merging. Because it will use Vertical algorithm when there has map column and all map columns will in gathering column, each implicit map column will be handled one by one.
     if (columns_list.size() == 1 && isMapImplicitKeyNotKV(columns_list.front().name))
@@ -212,16 +215,8 @@ bool MergeTreeDataPartCompact::hasColumnFiles(const NameAndTypePair & column) co
     {
         for (auto & [file, _] : getChecksums()->files)
         {
-            if (versions->enable_compact_map_data)
-            {
-                if (isMapCompactFileNameOfSpecialMapName(file, column.name))
-                    return true;
-            }
-            else
-            {
-                if (isMapImplicitFileNameOfSpecialMapName(file, column.name))
-                    return true;
-            }
+            if (isMapImplicitFileNameOfSpecialMapName(file, column.name))
+                return true;
         }
         return false;
     }
@@ -304,6 +299,11 @@ void MergeTreeDataPartCompact::checkConsistency(bool require_part_metadata) cons
                     ErrorCodes::BAD_SIZE_OF_FILE_IN_DATA_PART);
         }
     }
+}
+
+bool MergeTreeDataPartCompact::isStoredOnRemoteDisk() const
+{
+    return storage.isRemote();
 }
 
 MergeTreeDataPartCompact::~MergeTreeDataPartCompact()

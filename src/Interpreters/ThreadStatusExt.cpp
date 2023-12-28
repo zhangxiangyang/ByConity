@@ -9,6 +9,7 @@
 #include <Common/QueryProfiler.h>
 #include <Common/ThreadProfileEvents.h>
 #include <Common/TraceCollector.h>
+#include <Common/time.h>
 #include <common/errnoToString.h>
 
 #if defined(OS_LINUX)
@@ -38,6 +39,7 @@ void ThreadStatus::applyQuerySettings()
     const Settings & settings = query_context_ptr->getSettingsRef();
 
     query_id = query_context_ptr->getCurrentQueryId();
+    xid = query_context_ptr->tryGetCurrentTransactionID();
     initQueryProfiler();
 
     untracked_memory_limit = settings.max_untracked_memory;
@@ -165,22 +167,6 @@ void ThreadStatus::attachQuery(const ThreadGroupStatusPtr & thread_group_, bool 
     setupState(thread_group_);
 }
 
-inline UInt64 time_in_nanoseconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(timepoint.time_since_epoch()).count();
-}
-
-inline UInt64 time_in_microseconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::microseconds>(timepoint.time_since_epoch()).count();
-}
-
-
-inline UInt64 time_in_seconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::seconds>(timepoint.time_since_epoch()).count();
-}
-
 void ThreadStatus::initPerformanceCounters()
 {
     performance_counters_finalized = false;
@@ -269,6 +255,12 @@ void ThreadStatus::finalizePerformanceCounters()
         if (global_context_ptr && query_context_ptr)
         {
             const auto & settings = query_context_ptr->getSettingsRef();
+
+            if (settings.log_queries && settings.log_max_io_thread_queries)
+            {
+                tryUpdateMaxIOThreadProfile();
+            }
+
             if (settings.log_queries && settings.log_query_threads)
             {
                 const auto now = std::chrono::system_clock::now();
@@ -381,6 +373,7 @@ void ThreadStatus::detachQuery(bool exit_if_already_detached, bool thread_exits)
     memory_tracker.setParent(thread_group->memory_tracker.getParent());
 
     query_id.clear();
+    xid = 0;
     query_context.reset();
     thread_trace_context.trace_id = 0;
     thread_trace_context.span_id = 0;
@@ -453,6 +446,20 @@ void ThreadStatus::logToQueryThreadLog(QueryThreadLog & thread_log, const String
     }
 
     thread_log.add(elem);
+}
+
+void ThreadStatus::tryUpdateMaxIOThreadProfile()
+{
+    auto current_thread_profile = performance_counters.getPartiallyAtomicSnapshot();
+    if (!thread_group)
+        return;
+    std::lock_guard lock(thread_group->mutex);
+    if (current_thread_profile.getIOReadTime() > thread_group->max_io_thread_profile_counters.getIOReadTime())
+    {
+        thread_group->max_io_time_thread_ms = (time_in_microseconds(std::chrono::system_clock::now()) - query_start_time_microseconds) / 1000;
+        thread_group->max_io_time_thread_name = getThreadName();
+        thread_group->max_io_thread_profile_counters = std::move(current_thread_profile);
+    }
 }
 
 void CurrentThread::initializeQuery()

@@ -48,6 +48,11 @@ namespace DB::DaemonManager::BRPCMetrics
     bvar::Window<bvar::Adder<int>> g_executeImpl_GlobalGC_error_minute("DaemonManager_Internal", "executeImpl_GlobalGC_error", & g_executeImpl_GlobalGC_error, 60);
     bvar::Window<bvar::Adder<int>> g_executeImpl_GlobalGC_minute("DaemonManager_Internal", "executeImpl_GlobalGC", & g_executeImpl_GlobalGC, 60);
 
+    bvar::Adder< int > g_executeImpl_AutoStatistics_error;
+    bvar::Adder< int > g_executeImpl_AutoStatistics;
+    bvar::Window<bvar::Adder<int>> g_executeImpl_AutoStatistics_error_minute("DaemonManager_Internal", "executeImpl_AutoStatistics_error", & g_executeImpl_AutoStatistics_error, 60);
+    bvar::Window<bvar::Adder<int>> g_executeImpl_AutoStatistics_minute("DaemonManager_Internal", "executeImpl_AutoStatistics", & g_executeImpl_AutoStatistics, 60);
+
     bvar::Adder< int > g_executeImpl_TxnGC_error;
     bvar::Adder< int > g_executeImpl_TxnGC;
     bvar::Window<bvar::Adder<int>> g_executeImpl_TxnGC_error_minute("DaemonManager_Internal", "executeImpl_TxnGC_error", & g_executeImpl_TxnGC_error, 60);
@@ -57,5 +62,10 @@ namespace DB::DaemonManager::BRPCMetrics
     bvar::Adder< int > g_executeImpl_Clustering;
     bvar::Window<bvar::Adder<int>> g_executeImpl_Clustering_error_minute("DaemonManager_Internal", "executeImpl_Clustering_error", & g_executeImpl_Clustering_error, 60);
     bvar::Window<bvar::Adder<int>> g_executeImpl_Clustering_minute("DaemonManager_Internal", "executeImpl_Clustering", & g_executeImpl_Clustering, 60);
+
+    bvar::Adder< int > g_executeImpl_MaterializedMySQL_error;
+    bvar::Adder< int > g_executeImpl_MaterializedMySQL;
+    bvar::Window<bvar::Adder<int>> g_executeImpl_MaterializedMySQL_error_minute("DaemonManager_Internal", "executeImpl_MaterializedMySQL_error", & g_executeImpl_MaterializedMySQL_error, 60);
+    bvar::Window<bvar::Adder<int>> g_executeImpl_MaterializedMySQL_minute("DaemonManager_Internal", "executeImpl_MaterializedMySQL", & g_executeImpl_MaterializedMySQL, 60);
 }/// end namespace
 

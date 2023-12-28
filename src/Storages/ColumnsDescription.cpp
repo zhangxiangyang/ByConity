@@ -46,6 +46,7 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/MapHelpers.h>
 #include <Common/Exception.h>
+#include <Common/RowExistsColumnInfo.h>
 #include <Interpreters/Context.h>
 #include <Storages/IStorage.h>
 #include <Common/typeid_cast.h>
@@ -117,6 +118,30 @@ void ColumnDescription::writeText(WriteBuffer & buf) const
             DB::writeText("KV", buf);
             flag ^= TYPE_MAP_KV_STORE_FLAG;
         }
+        else if (flag & TYPE_BITENGINE_ENCODE_FLAG)
+        {
+            writeChar('\t', buf);
+            writeString("BitEngineEncode", buf);
+            flag ^= TYPE_BITENGINE_ENCODE_FLAG;
+        }
+        else if (flag & TYPE_BLOOM_FLAG)
+        {
+            writeChar('\t', buf);
+            DB::writeText("BLOOM", buf);
+            flag ^= TYPE_BLOOM_FLAG;
+        }
+        else if (flag & TYPE_BITMAP_INDEX_FLAG)
+        {
+            writeChar('\t', buf);
+            DB::writeText("BitmapIndex", buf);
+            flag ^= TYPE_BITMAP_INDEX_FLAG;
+        }
+        else if (flag & TYPE_SEGMENT_BITMAP_INDEX_FLAG)
+        {
+            writeChar('\t', buf);
+            DB::writeText("SegmentBitmapIndex", buf);
+            flag ^= TYPE_SEGMENT_BITMAP_INDEX_FLAG;
+        }
     }
 
     if (!comment.empty())
@@ -184,6 +209,10 @@ void ColumnDescription::readText(ReadBuffer & buf)
     }
 }
 
+bool ColumnDescription::hasBitEngineKeyStringInComment() const
+{
+    return (!comment.empty() && startsWith(comment, "+BITENGINE_KEY_STRING"));
+}
 
 ColumnsDescription::ColumnsDescription(NamesAndTypesList ordinary)
 {
@@ -468,6 +497,11 @@ NamesAndTypesList ColumnsDescription::getByNames(GetFlags flags, const Names & n
         else if (name == "_part_row_number")
         {
             res.emplace_back("_part_row_number", std::make_shared<DataTypeUInt64>());
+            continue;
+        }
+        else if (name == RowExistsColumn::ROW_EXISTS_COLUMN.name)
+        {
+            res.emplace_back(RowExistsColumn::ROW_EXISTS_COLUMN);
             continue;
         }
         else if (with_subcolumns)
@@ -773,6 +807,26 @@ Block validateColumnsDefaultsAndGetSampleBlock(ASTPtr default_expr_list, const N
         ex.addMessage("default expression and column type are incompatible.");
         throw;
     }
+}
+
+Names ColumnsDescription::getNamesOfOrdinary() const
+{
+    Names ret;
+    for (const auto & col : columns)
+        if (col.default_desc.kind == ColumnDefaultKind::Default)
+            ret.emplace_back(col.name);
+    return ret;
+}
+
+bool ColumnsDescription::isBitEngineKeyStringColumn(const String & column_name) const
+{
+    const auto it = columns.get<1>().find(column_name);
+
+    if (it != columns.get<1>().end())
+    {
+        return it->hasBitEngineKeyStringInComment();
+    }
+    return false;
 }
 
 }

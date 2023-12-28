@@ -274,6 +274,8 @@ DataTypeFactory::DataTypeFactory()
     registerDataTypeByteMap(*this);
 #endif
     registerDataTypeBitMap64(*this);
+    registerDataTypeSketchBinary(*this);
+    registerDataTypeDomainBool(*this);
 }
 
 DataTypeFactory & DataTypeFactory::instance()

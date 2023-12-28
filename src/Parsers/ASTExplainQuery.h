@@ -42,6 +42,14 @@ public:
         QueryElement, /// 'EXPLAIN ELEMENT ...'
         PlanSegment, /// 'EXPLAIN PLANSEGMENT ...'
         OptimizerPlan, /// 'EXPLAIN OPT_PLAN ...'
+        PreWhereEffect, /// 'EXPLAIN PREWHERE_EFFECT ...'
+        DistributedAnalyze, /// 'EXPLAIN ANALYZE DISTRIBUTED SELECT...'
+        Distributed, /// 'EXPLAIN DISTRIBUTED SELECT...'
+        LogicalAnalyze,    /// 'EXPLAIN ANALYZE SELECT...'
+        PipelineAnalyze,    /// 'EXPLAIN ANALYZE PIPELINE SELECT...'
+        TraceOptimizer,    /// 'EXPLAIN TRACE_OPT SELECT...'
+        TraceOptimizerRule,    /// 'EXPLAIN TRACE_OPT RULE SELECT...'
+        MetaData, // 'EXPLAIN METADATA...'
     };
 
     explicit ASTExplainQuery(ExplainKind kind_) : kind(kind_) {}
@@ -51,8 +59,12 @@ public:
     ASTPtr clone() const override
     {
         auto res = std::make_shared<ASTExplainQuery>(*this);
+
         res->children.clear();
-        res->children.push_back(children[0]->clone());
+        if (query)
+            res->setExplainedQuery(query);
+        if (ast_settings)
+            res->setSettings(ast_settings);
         cloneOutputOptions(*res);
         return res;
     }
@@ -108,6 +120,14 @@ private:
             case QueryElement: return "EXPLAIN ELEMENT";
             case PlanSegment: return "EXPLAIN PLANSEGMENT";
             case OptimizerPlan: return "EXPLAIN OPT_PLAN";
+            case PreWhereEffect: return "EXPLAIN PREWHERE_EFFECT";
+            case DistributedAnalyze: return "EXPLAIN ANALYZE DISTRIBUTED";
+            case LogicalAnalyze: return "EXPLAIN ANALYZE";
+            case PipelineAnalyze: return "EXPLAIN ANALYZE PIPELINE";
+            case Distributed: return "EXPLAIN DISTRIBUTED";
+            case TraceOptimizer: return "EXPLAIN TRACE_OPT";
+            case TraceOptimizerRule: return "EXPLAIN TRACE_OPT RULE";
+            case MetaData: return "EXPLAIN METADATA";
         }
 
         __builtin_unreachable();

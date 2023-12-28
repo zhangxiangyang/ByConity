@@ -22,6 +22,7 @@
 #include <Columns/ColumnString.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/getLeastSupertype.h>
+#include <Functions/FunctionsConversion.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/GatherUtils/Algorithms.h>
@@ -74,34 +75,38 @@ public:
                     + ", should be at least 2.",
                 ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 
-        if (arguments.size() > FormatImpl::argument_threshold)
+        if (arguments.size() > FormatStringImpl::argument_threshold)
             throw Exception(
                 "Number of arguments for function " + getName() + " doesn't match: passed " + toString(arguments.size())
-                    + ", should be at most " + std::to_string(FormatImpl::argument_threshold),
+                    + ", should be at most " + std::to_string(FormatStringImpl::argument_threshold),
                 ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
-
-        for (const auto arg_idx : collections::range(0, arguments.size()))
-        {
-            const auto * arg = arguments[arg_idx].get();
-            if (!isStringOrFixedString(arg))
-                throw Exception{"Illegal type " + arg->getName() + " of argument " + std::to_string(arg_idx + 1) + " of function "
-                                    + getName(),
-                                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
-        }
 
         return std::make_shared<DataTypeString>();
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
+        ColumnsWithTypeAndName args;
+
+        /// convert all columns to ColumnString.
+        auto convert = std::make_shared<FunctionToString>();
+        auto type_string = std::make_shared<DataTypeString>();
+        for (const auto & arg: arguments)
+        {
+            ColumnPtr col = arg.column;
+            if (!isStringOrFixedString(arg.type))
+                col = convert->executeImpl({arg}, type_string, input_rows_count);
+            args.emplace_back(col, type_string, arg.name);
+        }
+
         /// Format function is not proven to be faster for two arguments.
         /// Actually there is overhead of 2 to 5 extra instructions for each string for checking empty strings in FormatImpl.
         /// Though, benchmarks are really close, for most examples we saw executeBinary is slightly faster (0-3%).
         /// For 3 and more arguments FormatImpl is much faster (up to 50-60%).
         if (arguments.size() == 2)
-            return executeBinary(arguments, input_rows_count);
+            return executeBinary(args, input_rows_count);
         else
-            return executeFormatImpl(arguments, input_rows_count);
+            return executeFormatImpl(args, input_rows_count);
     }
 
 protected:
@@ -174,7 +179,7 @@ protected:
         for (size_t i = 0; i < num_arguments; ++i)
             pattern += "{}";
 
-        FormatImpl::formatExecute(
+        FormatStringImpl::formatExecute(
             has_column_string,
             has_column_fixed_string,
             std::move(pattern),
@@ -190,38 +195,9 @@ protected:
     }
 };
 
-template<typename Name>
-class ConcatWsImpl : public ConcatImpl<Name, false>
-{
-public:
-    static FunctionPtr create(ContextPtr /*context*/) { return std::make_shared<ConcatWsImpl>(); }
-
-    using ConcatImpl<Name, false>::executeFormatImpl;
-
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
-    {
-        ColumnsWithTypeAndName new_arguments((arguments.size() << 1) - 3);
-
-        for (size_t i = 0; i < new_arguments.size(); ++i)
-        {
-            if (i & 1)
-                new_arguments[i] = arguments[0];
-            else
-                new_arguments[i] = arguments[(i >> 1) + 1];
-        }
-
-        return executeFormatImpl(new_arguments, input_rows_count);
-    }
-};
-
-
 struct NameConcat
 {
     static constexpr auto name = "concat";
-};
-struct NameConcatWs
-{
-    static constexpr auto name = "concatWs";
 };
 struct NameConcatAssumeInjective
 {
@@ -229,7 +205,6 @@ struct NameConcatAssumeInjective
 };
 
 using FunctionConcat = ConcatImpl<NameConcat, false>;
-using FunctionConcatWs = ConcatWsImpl<NameConcatWs>;
 using FunctionConcatAssumeInjective = ConcatImpl<NameConcatAssumeInjective, true>;
 
 
@@ -275,11 +250,9 @@ private:
 
 }
 
-void registerFunctionsConcat(FunctionFactory & factory)
+REGISTER_FUNCTION(Concat)
 {
     factory.registerFunction<ConcatOverloadResolver>(FunctionFactory::CaseInsensitive);
-    factory.registerFunction<FunctionConcatWs>();
-    factory.registerAlias("concat_ws", NameConcatWs::name);
     factory.registerFunction<FunctionConcatAssumeInjective>();
 }
 

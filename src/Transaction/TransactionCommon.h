@@ -233,6 +233,7 @@ struct UndoResource
     /// domain level logics
     bool isLegacy() const { return pb_model.placeholders_size() == 0; }
     void clean(Catalog::Catalog & catalog, MergeTreeMetaBase * storage) const;
+    void commit(const Context & context) const;
 
 private:
     static inline std::atomic<UInt64> counter{0};
@@ -392,6 +393,7 @@ struct TransactionRecord
     }
     bool hasMainTableUUID() const { return pb_model.has_main_table_uuid(); }
     String toString() const { return pb_model.ShortDebugString(); }
+    bool isInactive() const { return pb_model.status() == CnchTransactionStatus::Inactive; }
 };
 
 }

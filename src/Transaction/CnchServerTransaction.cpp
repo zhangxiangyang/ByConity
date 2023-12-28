@@ -56,6 +56,7 @@ namespace ErrorCodes
     extern const int CNCH_TRANSACTION_ABORT_ERROR;
     extern const int INSERTION_LABEL_ALREADY_EXISTS;
     extern const int FAILED_TO_PUT_INSERTION_LABEL;
+    extern const int BRPC_TIMEOUT;
     // extern const int BAD_CAST;
 }
 
@@ -81,6 +82,15 @@ std::vector<ActionPtr> & CnchServerTransaction::getPendingActions()
     auto lock = getLock();
     return actions;
 }
+
+static void commitModifiedCount(Statistics::AutoStats::ModifiedCounter& counter)
+{
+    if (counter.empty()) return;
+
+    auto& instance = Statistics::AutoStats::AutoStatisticsMemoryRecord::instance();
+    instance.append(counter);
+}
+
 
 TxnTimestamp CnchServerTransaction::commitV1()
 {
@@ -108,7 +118,7 @@ TxnTimestamp CnchServerTransaction::commitV1()
         setStatus(CnchTransactionStatus::Finished);
         setCommitTime(commit_ts);
         LOG_DEBUG(log, "Successfully committed transaction (v1 api): {}\n", txn_record.txnID().toUInt64());
-
+        commitModifiedCount(this->modified_counter);
         return commit_ts;
     }
     catch (...)
@@ -134,12 +144,29 @@ TxnTimestamp CnchServerTransaction::commitV2()
     try
     {
         precommit();
+        assertLockAcquired();
         return commit();
     }
     catch (const Exception & e)
     {
         if (!(getContext()->getSettings().ignore_duplicate_insertion_label && e.code() == ErrorCodes::INSERTION_LABEL_ALREADY_EXISTS))
             tryLogCurrentException(log, __PRETTY_FUNCTION__);
+
+        if (e.code() == ErrorCodes::BRPC_TIMEOUT)
+        {
+            try
+            {
+                auto commit_ts = abort();
+                /// the txn has been sucessfully committed for the timeout case
+                if (txn_record.status() == CnchTransactionStatus::Finished)
+                    return commit_ts;
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log, __PRETTY_FUNCTION__);
+            }
+        }
+
         rollback();
         throw;
     }
@@ -202,6 +229,7 @@ TxnTimestamp CnchServerTransaction::commit()
                     ProfileEvents::increment(ProfileEvents::CnchTxnFinishedTransactionRecord);
                     LOG_DEBUG(log, "Successfully committed Kafka transaction {} at {} with {} offsets number, elapsed {} ms",
                                      txn_record.txnID().toUInt64(), commit_ts, tpl.size(), stop_watch.elapsedMilliseconds());
+                    commitModifiedCount(this->modified_counter);
                     return commit_ts;
                 }
                 else
@@ -211,6 +239,47 @@ TxnTimestamp CnchServerTransaction::commit()
                     retry = 0;
                     throw Exception(
                         "Kafka transaction " + txn_record.txnID().toString()
+                            + " commit failed because txn record has been changed by other transactions",
+                        ErrorCodes::CNCH_TRANSACTION_COMMIT_ERROR);
+                }
+            }
+            else if (isPrimary() && !binlog.binlog_file.empty())
+            {
+                if (binlog_name.empty())
+                    throw Exception("Binlog name should not be empty while try to commit binlog", ErrorCodes::LOGICAL_ERROR);
+
+                auto binlog_metadata = global_context->getCnchCatalog()->getMaterializedMySQLBinlogMetadata(binlog_name);
+                if (!binlog_metadata)
+                    throw Exception("Cannot get metadata for binlog #" + binlog_name, ErrorCodes::LOGICAL_ERROR);
+
+                binlog_metadata->set_binlog_file(binlog.binlog_file);
+                binlog_metadata->set_binlog_position(binlog.binlog_position);
+                binlog_metadata->set_executed_gtid_set(binlog.executed_gtid_set);
+                binlog_metadata->set_meta_version(binlog.meta_version);
+
+                // CAS operation
+                TransactionRecord target_record = getTransactionRecord();
+                target_record.setStatus(CnchTransactionStatus::Finished)
+                    .setCommitTs(commit_ts)
+                    .setMainTableUUID(getMainTableUUID());
+                Stopwatch stop_watch;
+                auto success = global_context->getCnchCatalog()->setTransactionRecordStatusWithBinlog(txn_record, target_record, binlog_name, binlog_metadata);
+
+                txn_record = std::move(target_record);
+                if (success)
+                {
+                    ProfileEvents::increment(ProfileEvents::CnchTxnCommitted);
+                    ProfileEvents::increment(ProfileEvents::CnchTxnFinishedTransactionRecord);
+                    LOG_DEBUG(log, "Successfully committed MaterializedMySQL transaction {} at {} with binlog: {}, elapsed {} ms.", txn_record.txnID(), commit_ts, binlog_name, stop_watch.elapsedMilliseconds());
+                    return commit_ts;
+                }
+                else
+                {
+                    LOG_DEBUG(log, "Failed to commit MaterializedMySQL transaction: {}, abort it directly", txn_record.txnID());
+                    setStatus(CnchTransactionStatus::Aborted);
+                    retry = 0;
+                    throw Exception(
+                        "MaterializedMySQL transaction " + txn_record.txnID().toString()
                             + " commit failed because txn record has been changed by other transactions",
                         ErrorCodes::CNCH_TRANSACTION_COMMIT_ERROR);
                 }
@@ -255,7 +324,7 @@ TxnTimestamp CnchServerTransaction::commit()
                     ProfileEvents::increment(ProfileEvents::CnchTxnCommitted);
                     ProfileEvents::increment(ProfileEvents::CnchTxnFinishedTransactionRecord);
                     LOG_DEBUG(log, "Successfully committed transaction {} at {}\n", txn_record.txnID().toUInt64(), commit_ts);
-                    //unlock();
+                    commitModifiedCount(this->modified_counter);
                     return commit_ts;
                 }
                 else // CAS failed
@@ -266,6 +335,7 @@ TxnTimestamp CnchServerTransaction::commit()
                         ProfileEvents::increment(ProfileEvents::CnchTxnCommitted);
                         ProfileEvents::increment(ProfileEvents::CnchTxnFinishedTransactionRecord);
                         LOG_DEBUG(log, "Transaction {} has been successfully committed in previous trials.\n", txn_record.txnID().toUInt64());
+                        commitModifiedCount(this->modified_counter);
                         return txn_record.commitTs();
                     }
                     else
@@ -348,7 +418,7 @@ TxnTimestamp CnchServerTransaction::abort()
         }
         else if (txn_record.status() == CnchTransactionStatus::Aborted)
         {
-            LOG_WARNING(log, "Transaction {} has been committed\n", txn_record.txnID().toUInt64());
+            LOG_WARNING(log, "Transaction {} has been aborted\n", txn_record.txnID().toUInt64());
         }
         else
         {
@@ -423,7 +493,7 @@ void CnchServerTransaction::clean(TxnCleanTask & task)
 
             for (const auto & [uuid, resources] : undo_buffer)
             {
-                StoragePtr table = catalog->getTableByUUID(*getContext(), uuid, txn_id, true);
+                StoragePtr table = catalog->getTableByUUID(*global_context, uuid, txn_id, true);
                 auto * storage = dynamic_cast<MergeTreeMetaBase *>(table.get());
                 if (!storage)
                     throw Exception("Table is not of MergeTree class", ErrorCodes::LOGICAL_ERROR);
@@ -460,5 +530,11 @@ void CnchServerTransaction::removeIntermediateData()
     LOG_DEBUG(log, "Secondary transaction failed, will remove all intermediate data during rollback");
     std::for_each(actions.begin(), actions.end(), [](auto & action) { action->abort(); });
     actions.clear();
+}
+
+void CnchServerTransaction::incrementModifiedCount(const Statistics::AutoStats::ModifiedCounter& new_counts)
+{
+    auto lock = getLock();
+    modified_counter.merge(new_counts);
 }
 }

@@ -22,6 +22,7 @@
 #pragma once
 
 #include <common/defines.h>
+#include <cstdint>
 
 #define DBMS_DEFAULT_HOST "localhost"
 #define DBMS_DEFAULT_PORT 9000
@@ -41,6 +42,8 @@
 
 /// The size of the I/O buffer by default.
 #define DBMS_DEFAULT_BUFFER_SIZE 1048576ULL
+
+#define PADDING_FOR_SIMD 64
 
 /** Which blocks by default read the data (by number of rows).
   * Smaller values give better cache locality, less consumption of RAM, but more overhead to process the query.
@@ -100,7 +103,7 @@
 #define DBMS_DEFAULT_LOCK_ACQUIRE_TIMEOUT_SEC 120
 
 /// Default limit on recursion depth of recursive descend parser.
-#define DBMS_DEFAULT_MAX_PARSER_DEPTH 1000
+#define DBMS_DEFAULT_MAX_PARSER_DEPTH 2000
 
 /// Max depth of hierarchical dictionary
 #define DBMS_HIERARCHICAL_DICTIONARY_MAX_DEPTH 1000
@@ -112,6 +115,13 @@
 /// Version of ClickHouse inter server BRPC protocol.
 /// It's not necessary to increase this version number in most cases
 /// unless the serialization of plan segment has changed.
-#define DBMS_BRPC_PROTOCOL_VERSION 1
+#define DBMS_BRPC_PROTOCOL_MAJOR_VERSION 1
+#define DBMS_BRPC_PROTOCOL_MINOR_VERSION 1
 
 #define TEST_KNOB_FORCE_META_REBUILD 0x08ull
+
+/// SERVER VW
+constexpr auto DEFAULT_SERVER_VW_NAME = "server_vw_default";
+
+// Statistics
+constexpr uint64_t DEFAULT_KLL_SKETCH_LOG_K = 1600;

@@ -15,22 +15,28 @@
 
 #include <Optimizer/ExpressionInterpreter.h>
 
-#include <Common/FieldVisitorConvertToNumber.h>
+#include <Columns/ColumnAggregateFunction.h>
+#include <Columns/ColumnArray.h>
+#include <Columns/ColumnMap.h>
+#include <Columns/ColumnSet.h>
+#include <Columns/IColumn.h>
+#include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeNullable.h>
-#include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeSet.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/FunctionsLogical.h>
-#include <Functions/InternalFunctionsDynamicFilter.h>
+#include <Functions/InternalFunctionRuntimeFilter.h>
+#include <Interpreters/ActionsVisitor.h>
+#include <Interpreters/convertFieldToType.h>
+#include <Interpreters/join_common.h>
 #include <Optimizer/FunctionInvoker.h>
 #include <Optimizer/PredicateUtils.h>
 #include <Optimizer/Utils.h>
-#include <Interpreters/convertFieldToType.h>
-#include <Interpreters/ActionsVisitor.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/formatAST.h>
+#include <Common/FieldVisitorConvertToNumber.h>
 
 namespace DB
 {
@@ -64,8 +70,8 @@ static DataTypePtr makeNullableByArgumentTypes(const InterpretIMResults & argume
 {
     DataTypePtr result = std::make_shared<T>();
 
-    if (std::any_of(arguments.begin(), arguments.end(), [](auto & arg) { return arg.type->isNullable();}))
-        result = makeNullable(result);
+    if (std::any_of(arguments.begin(), arguments.end(), [](auto & arg) { return isNullableOrLowCardinalityNullable(arg.type);}))
+        result = JoinCommon::tryConvertTypeToNullable(result);
 
     return result;
 }
@@ -74,6 +80,26 @@ static bool isBoolCompatibleType(const DataTypePtr & type)
 {
     auto nonnull_type = removeNullable(removeLowCardinality(type));
     return isUInt8(nonnull_type) || isNothing(nonnull_type);
+}
+
+static bool inFunctionIsPositive(const String & func_name)
+{
+    return func_name == "in" || func_name == "globalIn" || func_name == "nullIn" || func_name == "globalNullIn";
+}
+
+static bool inFunctionIsNegative(const String & func_name)
+{
+    return func_name == "notIn" || func_name == "globalNotIn" || func_name == "notNullIn" || func_name == "globalNotNullIn";
+}
+
+static bool inFunctionIsNullSkipped(const String & func_name)
+{
+    return func_name == "in" || func_name == "globalIn" || func_name == "notIn" || func_name == "globalNotIn";
+}
+
+static bool isInFunction(const String & func_name)
+{
+    return inFunctionIsPositive(func_name) || inFunctionIsNegative(func_name);
 }
 
 namespace function_simplify_rules_
@@ -109,8 +135,12 @@ using namespace FunctionsLogicalDetail;
 template <typename FunctionName, typename FunctionImpl>
 struct LogicalFunctionRewriter
 {
-    static bool apply(const ASTFunction & function, InterpretIMResults argument_results, InterpretIMResult & rewrite_result,
-                      const ContextMutablePtr & context)
+    static bool apply(
+        const ASTFunction & function,
+        const ASTPtr & node,
+        InterpretIMResults argument_results,
+        InterpretIMResult & rewrite_result,
+        const ContextMutablePtr & context)
     {
         if (function.name != FunctionName::name)
             return false;
@@ -156,7 +186,7 @@ struct LogicalFunctionRewriter
             if (FunctionImpl::isSaturatedValueTernary(const_value))
             {
                 // `x AND 0` returns `0`
-                rewrite_result = {std::make_shared<DataTypeUInt8>(), ternary_to_field(const_value)};
+                rewrite_result = {std::make_shared<DataTypeUInt8>(), node, ternary_to_field(const_value)};
                 return true;
             }
             else if (FunctionImpl::isNeutralValueTernary(const_value))
@@ -166,7 +196,7 @@ struct LogicalFunctionRewriter
             else
             {
                 // `x AND NULL` return `x AND NULL`
-                argument_results.emplace_back(makeNullable(std::make_shared<DataTypeNothing>()), Null());
+                argument_results.emplace_back(JoinCommon::tryConvertTypeToNullable(std::make_shared<DataTypeNothing>()), node, Null());
             }
         }
 
@@ -202,35 +232,41 @@ using RewriteOr = LogicalFunctionRewriter<NameOr, OrImpl>;
 // suppose x is a non-nullable column, infer
 //   x IS NULL      ==> FALSE
 //   x IS NOT NULL  ==> TRUE
-bool simplifyNullPrediction(const ASTFunction & function, const InterpretIMResults & argument_results, InterpretIMResult & simplify_result)
+bool simplifyNullPrediction(
+    const ASTFunction & function, const ASTPtr & node, const InterpretIMResults & argument_results, InterpretIMResult & simplify_result)
 {
     bool is_null = function.name == "isNull";
     bool is_not_null = function.name == "isNotNull";
 
-    if (!(is_null || is_not_null) || argument_results.front().type->isNullable())
+    if (!(is_null || is_not_null) || isNullableOrLowCardinalityNullable(argument_results.front().type))
         return false;
 
-    simplify_result = {std::make_shared<DataTypeUInt8>(), is_null ? 0U : 1U};
+    simplify_result = {std::make_shared<DataTypeUInt8>(), node, is_null ? 0U : 1U};
     return true;
 }
 
 // `a = a` ==> TRUE
-bool simplifyTrivialEquals(const ASTFunction & function, const InterpretIMResults & argument_results, InterpretIMResult & simplify_result)
+bool simplifyTrivialEquals(
+    const ASTFunction & function, const ASTPtr & node, const InterpretIMResults & argument_results, InterpretIMResult & simplify_result)
 {
     String left, right;
 
     if (function.name == "equals" && isIdentifier(argument_results[0], left) &&
         isIdentifier(argument_results[1], right) && left == right)
     {
-        simplify_result = {std::make_shared<DataTypeUInt8>(), 1U};
+        simplify_result = {std::make_shared<DataTypeUInt8>(), node, 1U};
         return true;
     }
 
     return false;
 }
 
-bool simplifyIf(const ASTFunction & function, const InterpretIMResults & argument_results, InterpretIMResult & simplify_result,
-                bool & reevaluate)
+bool simplifyIf(
+    const ASTFunction & function,
+    const ASTPtr & node,
+    const InterpretIMResults & argument_results,
+    InterpretIMResult & simplify_result,
+    bool & reevaluate)
 {
     if (function.name != "if")
         return false;
@@ -240,7 +276,7 @@ bool simplifyIf(const ASTFunction & function, const InterpretIMResults & argumen
     // if(isNull(`ws_order_number`), NULL, cast(multiIf(`build_side_non_null_symbol` = 1, 1, NULL, 0, 0), 'UInt8'))
     if (isBoolValue<false>(argument_results[1]) && isBoolValue<false>(argument_results[2]))
     {
-        simplify_result = {std::make_shared<DataTypeUInt8>(), 0U};
+        simplify_result = {std::make_shared<DataTypeUInt8>(), node, Field{0U}};
         return true;
     }
 
@@ -254,6 +290,61 @@ bool simplifyIf(const ASTFunction & function, const InterpretIMResults & argumen
     }
 
     return false;
+}
+
+bool simplifyMultiIf(
+    const ASTFunction & function,
+    const ASTPtr &,
+    const InterpretIMResults & argument_results,
+    InterpretIMResult & simplify_result,
+    const ContextMutablePtr & context)
+{
+    if (function.name != "multiIf" || argument_results.size() < 3 || argument_results.size() % 2 == 0)
+        return false;
+
+    InterpretIMResult new_default;
+    InterpretIMResults new_argument_results;
+    bool found_new_default = false;
+
+    for (size_t i = 0; i+1 < argument_results.size(); i += 2)
+    {
+        if (isBoolValue<false>(argument_results[i]))
+        {
+            continue;
+        }
+        else if (isBoolValue<true>(argument_results[i]))
+        {
+            new_default = argument_results[i+1];
+            found_new_default = true;
+            break;
+        }
+        else
+        {
+            new_argument_results.emplace_back(argument_results[i]);
+            new_argument_results.emplace_back(argument_results[i+1]);
+        }
+    }
+
+    if (new_argument_results.empty())
+    {
+        simplify_result = found_new_default ? new_default : argument_results.back();
+        return true;
+    }
+
+    if (found_new_default)
+        new_argument_results.emplace_back(new_default);
+    else
+        new_argument_results.emplace_back(argument_results.back());
+
+    if (new_argument_results.size() == argument_results.size())
+        return false;
+
+    // arguments' type may be changed by some simplify rules, so refresh current node's type
+    auto function_builder = FunctionFactory::instance().get(function.name, context);
+    FunctionBasePtr function_base = function_builder->build(convertToFunctionBuilderParams(new_argument_results));
+
+    simplify_result = {function_base->getResultType(), makeFunction(function.name, new_argument_results, context)};
+    return true;
 }
 }
 
@@ -312,17 +403,82 @@ InterpretResult ExpressionInterpreter::evaluate(const ConstASTPtr & expression) 
 {
     auto im_result = visit(expression);
 
-    if (im_result.isAST())
+    if (im_result.isAST() || !im_result.isSuitablyRepresentedByValue())
         return {im_result.type, im_result.ast};
     else
         return {im_result.type, im_result.getField()};
 }
 
-InterpretIMResult::InterpretIMResult(DataTypePtr type_, const Field & field)
+ASTPtr InterpretResult::convertToAST(const ContextMutablePtr & ctx) const
 {
-    type = std::move(type_);
+    if (isAST())
+        return ast;
+
+    return LiteralEncoder::encode(getField(), type, ctx);
+}
+
+InterpretIMResult::InterpretIMResult(DataTypePtr type_, ASTPtr ast_, const Field & field) : type(std::move(type_)), ast(std::move(ast_))
+{
     // TODO: we don't have to call convertFieldToType if we have done in Parser/Analyzer
     value = type->createColumnConst(1, convertFieldToType(field, *type));
+}
+
+bool InterpretIMResult::isNull() const
+{
+    assert(isValue());
+
+    ColumnPtr column = value;
+
+    if (const auto * column_const = checkAndGetColumn<ColumnConst>(*column))
+        column = column_const->getDataColumnPtr();
+    if (const auto * column_lc = checkAndGetColumn<ColumnLowCardinality>(*column))
+        column = column_lc->convertToFullColumn();
+
+    if (const auto * column_null = checkAndGetColumn<ColumnNullable>(*column))
+        return column_null->isNullAt(0);
+
+    return false;
+}
+
+bool InterpretIMResult::isSuitablyRepresentedByValue() const
+{
+    assert(isValue());
+
+    ColumnPtr column = value;
+
+    if (const auto * column_const = checkAndGetColumn<ColumnConst>(*column))
+        column = column_const->getDataColumnPtr();
+    if (const auto * column_lc = checkAndGetColumn<ColumnLowCardinality>(*column))
+        column = column_lc->convertToFullColumn();
+    if (const auto * column_null = checkAndGetColumn<ColumnNullable>(*column))
+        column = column_null->getNestedColumnPtr();
+
+    if (checkColumn<ColumnAggregateFunction>(*column))
+        return false;
+
+    if (checkColumn<ColumnSet>(*column))
+        return false;
+
+    if (const auto * column_array = checkAndGetColumn<ColumnArray>(*column))
+        return column_array->sizeAt(0) <= 100;
+
+    if (const auto * column_map = checkAndGetColumn<ColumnMap>(*column))
+        return column_map->byteSizeAt(0) <= 1000;
+
+    return true;
+}
+
+ASTPtr InterpretIMResult::convertToAST(const ContextMutablePtr & ctx) const
+{
+    assert(ast != nullptr);
+
+    if (isAST())
+        return ast;
+
+    if (!isSuitablyRepresentedByValue())
+        return ast;
+
+    return LiteralEncoder::encode(getField(), type, ctx);
 }
 
 InterpretIMResult ExpressionInterpreter::visit(const ConstASTPtr & node) const
@@ -334,29 +490,9 @@ InterpretIMResult ExpressionInterpreter::visit(const ConstASTPtr & node) const
     if (const auto * ast_func = node->as<ASTFunction>())
     {
         const auto & func_name = ast_func->name;
-        const static NameSet functions_not_evaluate
-            {
-                "arrayJoin",
-
-                "arraySetCheck",
-                "arraySetGet",
-                "arraySetGetAny",
-
-                InternalFunctionDynamicFilter::name,
-
-                "str_to_map",
-                "getMapKeys",
-
-                // TODO: support nullIn
-                "nullIn",
-                "notNullIn",
-                "globalNullIn",
-                "globalNotNullIn"
-            };
-
-        if (functions_not_evaluate.count(func_name))
+        if (func_name == InternalFunctionRuntimeFilter::name)
             return originalNode(node);
-        if (func_name == "in" || func_name == "globalIn" || func_name == "notIn" || func_name == "globalNotIn")
+        if (isInFunction(func_name))
             return visitInFunction(*ast_func, node);
         return visitOrdinaryFunction(*ast_func, node);
     }
@@ -366,14 +502,14 @@ InterpretIMResult ExpressionInterpreter::visit(const ConstASTPtr & node) const
 
 InterpretIMResult ExpressionInterpreter::visitASTLiteral(const ASTLiteral & literal, const ConstASTPtr & node) const
 {
-    return {getType(node), literal.value};
+    return {getType(node), node->clone(), literal.value};
 }
 
 InterpretIMResult ExpressionInterpreter::visitASTIdentifier(const ASTIdentifier & identifier, const ConstASTPtr & node) const
 {
     if (auto it = setting.identifier_values.find(identifier.name());
         it != setting.identifier_values.end())
-        return {getType(node), it->second};
+        return {getType(node), node->clone(), it->second};
 
     return originalNode(node);
 }
@@ -399,7 +535,13 @@ InterpretIMResult ExpressionInterpreter::visitOrdinaryFunction(const ASTFunction
         ExpressionTypes arguments_type_provider;
 
         if (has_lambda_argument)
-            arguments_type_provider = type_analyzer.getExpressionTypes(node);
+        {
+            // Temporarily disable optimize for functions with lambda expressions,
+            // until we support optimize lambda expressions itself. This is to not break
+            // 40080_array_join_with_lambda_expression.
+            // arguments_type_provider = type_analyzer.getExpressionTypes(node);
+            return originalNode(node);
+        }
 
         for (const auto & child: function.arguments->children)
         {
@@ -411,7 +553,7 @@ InterpretIMResult ExpressionInterpreter::visitOrdinaryFunction(const ASTFunction
 
                 if (argument_result.isAST())
                     all_const = false;
-                else if (argument_result.getField().isNull())
+                else if (argument_result.isNull())
                     has_null_argument = true;
             }
             else
@@ -420,6 +562,8 @@ InterpretIMResult ExpressionInterpreter::visitOrdinaryFunction(const ASTFunction
             argument_results.push_back(std::move(argument_result));
         }
     }
+
+    ASTPtr simplified_node = makeFunction(function.name, argument_results, context);
 
     auto function_builder = FunctionFactory::instance().get(function.name, context);
     auto function_builder_params = convertToFunctionBuilderParams(argument_results);
@@ -449,20 +593,13 @@ InterpretIMResult ExpressionInterpreter::visitOrdinaryFunction(const ASTFunction
                 res_col = res_col->cloneResized(1);
 
             if (res_col->size() == 1)
-            {
-                try
-                {
-                    (*res_col)[0];
-                    return {function_ret_type, res_col};
-                }
-                catch (Exception & ) {}
-            }
+                return {function_ret_type, simplified_node, res_col};
         }
     }
 
     // === Null simplify ===
     if (has_null_argument && function_builder->useDefaultImplementationForNulls() && setting.enable_null_simplify)
-        return {makeNullable(std::make_shared<DataTypeNothing>()), Null()};
+        return {JoinCommon::tryConvertTypeToNullable(std::make_shared<DataTypeNothing>()), simplified_node, Null()};
 
     // === Function simplify ===
     using namespace function_simplify_rules_;
@@ -474,16 +611,16 @@ InterpretIMResult ExpressionInterpreter::visitOrdinaryFunction(const ASTFunction
     if (setting.enable_function_simplify)
     {
         // TODO: simplify CASE expr
-        simplified =
-            RewriteAnd::apply(function, argument_results, simplify_result, context) ||
-            RewriteOr::apply(function, argument_results, simplify_result, context) ||
-            simplifyNullPrediction(function, argument_results, simplify_result) ||
-            simplifyTrivialEquals(function, argument_results, simplify_result) ||
-            simplifyIf(function, argument_results, simplify_result, reevaluate);
+        simplified = RewriteAnd::apply(function, simplified_node, argument_results, simplify_result, context)
+            || RewriteOr::apply(function, simplified_node, argument_results, simplify_result, context)
+            || simplifyNullPrediction(function, simplified_node, argument_results, simplify_result)
+            || simplifyTrivialEquals(function, simplified_node, argument_results, simplify_result)
+            || simplifyIf(function, simplified_node, argument_results, simplify_result, reevaluate)
+            || simplifyMultiIf(function, simplified_node, argument_results, simplify_result, context);
     }
 
     if (!simplified)
-        return {function_ret_type, makeFunction(function.name, argument_results, context)};
+        return {function_ret_type, simplified_node};
     else if (!reevaluate)
         return simplify_result;
     else
@@ -499,9 +636,10 @@ InterpretIMResult ExpressionInterpreter::visitInFunction(const ASTFunction & fun
     const auto & right_arg = function.arguments->children[1];
     auto left_arg_result = visit(left_arg);
     auto rewritten_left_arg = left_arg_result.convertToAST(context);
+    auto rewritten_in_func = makeASTFunction(function.name, rewritten_left_arg, right_arg);
 
     if (left_arg_result.isAST() && !setting.enable_function_simplify)
-        return {std::make_shared<DataTypeUInt8>(), makeASTFunction(function.name, rewritten_left_arg, right_arg)};
+        return {getType(rewritten_in_func), rewritten_in_func};
 
     // build set for IN statement(see also ActionsVisitor)
     SetPtr set;
@@ -540,14 +678,14 @@ InterpretIMResult ExpressionInterpreter::visitInFunction(const ASTFunction & fun
         columns_with_types.emplace_back(left_arg_result.value, left_arg_result.type, "");
         columns_with_types.emplace_back(const_column_set, std::make_shared<DataTypeSet>(), "");
         auto result = FunctionInvoker::execute(function.name, columns_with_types, context);
-        return {result.type, result.value};
+        return {result.type, rewritten_in_func, result.value};
     }
 
     // convert Set to AST
     auto set_columns = set->getSetElements();
     // TODO: support (x, y) IN ((1, 2), (3, 4))
     if (set_columns.size() != 1)
-        return {std::make_shared<DataTypeUInt8>(), makeASTFunction(function.name, rewritten_left_arg, right_arg)};
+        return {getType(rewritten_in_func), rewritten_in_func};
 
     auto & set_column = set_columns[0];
     ASTs set_values;
@@ -555,18 +693,23 @@ InterpretIMResult ExpressionInterpreter::visitInFunction(const ASTFunction & fun
     for (size_t i = 0; i < set_column->size(); ++i)
         set_values.push_back(LiteralEncoder::encodeForComparisonExpr((*set_column)[i], left_arg_result.type, context));
 
-    // rewrite `x IN 1` to `x = 1`
-    if (set_values.size() == 1)
+    // in some cases, there are no values filled in the set, e.g. IN NULL/NOT IN NULL, keep the original expression
+    if (set_values.empty())
     {
-        // TODO: x IN NULL?
+        return {getType(rewritten_in_func), rewritten_in_func};
+    }
+    // rewrite `x IN 1` to `x = 1`, notice `NULL nullIn (NULL)` should return 1 so it can't be rewritten
+    else if (set_values.size() == 1 && inFunctionIsNullSkipped(function.name))
+    {
         auto result_type = makeNullableByArgumentTypes<DataTypeUInt8>({left_arg_result});
-        String comparison_op = (function.name == "in" || function.name == "globalIn") ? "equals" : "notEquals";
+        String comparison_op = inFunctionIsPositive(function.name) ? "equals" : "notEquals";
         auto comparison_func = makeASTFunction(comparison_op, rewritten_left_arg, set_values.front());
         return {result_type, comparison_func};
     }
 
     auto tuple_func = makeASTFunction("tuple", set_values);
-    return {std::make_shared<DataTypeUInt8>(), makeASTFunction(function.name, rewritten_left_arg, tuple_func)};
+    auto simplified_in_func = makeASTFunction(function.name, rewritten_left_arg, tuple_func);
+    return {getType(simplified_in_func), simplified_in_func};
 }
 
 }

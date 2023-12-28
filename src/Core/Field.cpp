@@ -19,18 +19,19 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
-#include <IO/ReadBuffer.h>
-#include <IO/WriteBuffer.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
-#include <IO/ReadBufferFromString.h>
-#include <IO/readDecimalText.h>
-#include <Core/Field.h>
 #include <Core/DecimalComparison.h>
+#include <Core/Field.h>
+#include <IO/ReadBuffer.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteBuffer.h>
+#include <IO/WriteHelpers.h>
+#include <IO/readDecimalText.h>
+#include <Protos/plan_node_utils.pb.h>
+#include <Common/FieldVisitorCompatibleBinary.h>
 #include <Common/FieldVisitorDump.h>
 #include <Common/FieldVisitorToString.h>
 #include <Common/FieldVisitorWriteBinary.h>
-
 
 namespace DB
 {
@@ -38,6 +39,29 @@ namespace ErrorCodes
 {
     extern const int CANNOT_RESTORE_FROM_FIELD_DUMP;
     extern const int DECIMAL_OVERFLOW;
+}
+
+const char * Field::Types::toString(Which which)
+{
+    switch (which)
+    {
+        case NegativeInfinity:
+            return "-Inf";
+        case PositiveInfinity:
+            return "+Inf";
+        case ByteMap:
+            return "Map";
+
+        default: {
+            // this API returns a reference to String, so data() is safe
+            const char * name = WhichConverter::toString(which).data();
+            if (!name)
+            {
+                throw Exception("Bad type of Field", ErrorCodes::BAD_TYPE_OF_FIELD);
+            }
+            return name;
+        }
+    }
 }
 
 inline Field getBinaryValue(UInt8 type, ReadBuffer & buf)
@@ -305,79 +329,67 @@ void writeFieldText(const Field & x, WriteBuffer & buf)
     buf.write(res.data(), res.size());
 }
 
-void writeFieldBinary(const Field & field, WriteBuffer & buf)
+// used for both protobuf and original serde
+void writeFieldBinaryBlobImpl(const Field & field, Field::Types::Which type, WriteBuffer & buf)
 {
-    auto type = field.getType();
     switch (type)
     {
         case Field::Types::Null:
         {
-            writeBinary(UInt8(type), buf);
             return;
         }
         case Field::Types::UInt64:
         {
-            writeBinary(UInt8(type), buf);
             writeBinary(field.get<UInt64>(), buf);
             return;
         }
         case Field::Types::Int64:
         {
-            writeBinary(UInt8(type), buf);
             writeBinary(field.get<Int64>(), buf);
             return;
         }
         case Field::Types::Float64:
         {
-            writeBinary(UInt8(type), buf);
             writeBinary(field.get<Float64>(), buf);
             return;
         }
         case Field::Types::UInt128:
         {
-            writeBinary(UInt8(type), buf);
             writeBinary(field.get<UInt128>(), buf);
             return;
         }
         case Field::Types::Int128:
         {
-            writeBinary(UInt8(type), buf);
             writeBinary(field.get<Int128>(), buf);
             return;
         }
         case Field::Types::UInt256:
         {
-            writeBinary(UInt8(type), buf);
             writeBinary(field.get<UInt256>(), buf);
             return;
         }
         case Field::Types::Int256:
         {
-            writeBinary(UInt8(type), buf);
             writeBinary(field.get<Int256>(), buf);
             return;
         }
         case Field::Types::String:
         {
-            writeBinary(UInt8(type), buf);
             writeBinary(field.get<String>(), buf);
             return;
         }
         case Field::Types::Array:
         {
-            writeBinary(UInt8(type), buf);
             writeBinary(field.get<Array>(), buf);
             return;
         }
         case Field::Types::Tuple:
         {
-            writeBinary(UInt8(type), buf);
             writeBinary(field.get<Tuple>(), buf);
             return;
         }
         case Field::Types::Decimal32:
         {
-            writeBinary(UInt8(type), buf);
             auto df = field.get<DecimalField<Decimal32>>();
             writeBinary(df.getValue(), buf);
             writeBinary(df.getScale(), buf);
@@ -385,7 +397,6 @@ void writeFieldBinary(const Field & field, WriteBuffer & buf)
         }
         case Field::Types::Decimal64:
         {
-            writeBinary(UInt8(type), buf);
             auto df = field.get<DecimalField<Decimal64>>();
             writeBinary(df.getValue(), buf);
             writeBinary(df.getScale(), buf);
@@ -393,7 +404,6 @@ void writeFieldBinary(const Field & field, WriteBuffer & buf)
         }
         case Field::Types::Decimal128:
         {
-            writeBinary(UInt8(type), buf);
             auto df = field.get<DecimalField<Decimal128>>();
             writeBinary(df.getValue(), buf);
             writeBinary(df.getScale(), buf);
@@ -401,10 +411,26 @@ void writeFieldBinary(const Field & field, WriteBuffer & buf)
         }
         case Field::Types::Decimal256:
         {
-            writeBinary(UInt8(type), buf);
             auto df = field.get<DecimalField<Decimal256>>();
             writeBinary(df.getValue(), buf);
             writeBinary(df.getScale(), buf);
+            return;
+        }
+        case Field::Types::Map:
+        {
+            auto df = field.get<Map>();
+            writeBinary(df, buf);
+            return;
+        }
+        case Field::Types::AggregateFunctionState:
+        {
+            writeStringBinary(field.get<AggregateFunctionStateData>().name, buf);
+            writeStringBinary(field.get<AggregateFunctionStateData>().data, buf);
+            return;
+        }
+        case Field::Types::ByteMap:
+        {
+            writeBinary(field.get<ByteMap>(), buf);
             return;
         }
         default:
@@ -412,12 +438,9 @@ void writeFieldBinary(const Field & field, WriteBuffer & buf)
     }
 }
 
-void readFieldBinary(Field & field, ReadBuffer & buf)
+// used for both protobuf and original serde
+void readFieldBinaryBlobImpl(Field & field, Field::Types::Which type, ReadBuffer & buf)
 {
-    UInt8 read_type = 0;
-    readBinary(read_type, buf);
-    auto type = Field::Types::Which(read_type);
-
     switch (type)
     {
         case Field::Types::Null:
@@ -531,9 +554,65 @@ void readFieldBinary(Field & field, ReadBuffer & buf)
             field = DecimalField<Decimal256>(value, scale);
             return;
         }
+        case Field::Types::Map:
+        {
+            Map value;
+            readBinary(value, buf);
+            field = value;
+            return;
+        }
+        case Field::Types::AggregateFunctionState:
+        {
+            AggregateFunctionStateData value;
+            DB::readStringBinary(value.name, buf);
+            DB::readStringBinary(value.data, buf);
+            field = value;
+            return;
+        }
+        case Field::Types::ByteMap:
+        {
+            ByteMap value;
+            readBinary(value, buf);
+            field = value;
+            return;
+        }
         default:
             throw Exception("Bad type of Field when serializing.", ErrorCodes::BAD_TYPE_OF_FIELD);
     }
+}
+
+void writeFieldBinary(const Field & field, WriteBuffer & buf)
+{
+    auto type = field.getType();
+    writeBinary(static_cast<UInt8>(type), buf);
+
+    Field::dispatch([&buf](const auto & value) { FieldVisitorCompatibleWriteBinary()(value, buf); }, field);
+}
+
+void readFieldBinary(Field & field, ReadBuffer & buf)
+{
+    UInt8 read_type = 0;
+    readBinary(read_type, buf);
+    auto type = static_cast<Field::Types::Which>(read_type);
+
+    field = Field::dispatch(FieldVisitorCompatibleReadBinary(buf), type);
+}
+
+void Field::toProto(Protos::Field & proto) const
+{
+    auto type = this->getType();
+    auto proto_type = Field::Types::WhichConverter::toProto(type);
+    proto.set_type(proto_type);
+    WriteBufferFromOwnString buf;
+    writeFieldBinaryBlobImpl(*this, type, buf);
+    proto.set_blob(std::move(buf.str()));
+}
+
+void Field::fillFromProto(const Protos::Field & proto)
+{
+    auto type = Field::Types::WhichConverter::fromProto(proto.type());
+    ReadBufferFromString buf(proto.blob());
+    readFieldBinaryBlobImpl(*this, type, buf);
 }
 
 String Field::dump() const

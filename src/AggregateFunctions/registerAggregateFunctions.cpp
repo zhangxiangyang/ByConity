@@ -30,12 +30,14 @@ namespace DB
 struct Settings;
 
 class AggregateFunctionFactory;
+void registerAggregateFunctionArbitrary(AggregateFunctionFactory &);
 void registerAggregateFunctionAvg(AggregateFunctionFactory &);
 void registerAggregateFunctionAvgWeighted(AggregateFunctionFactory &);
 void registerAggregateFunctionCount(AggregateFunctionFactory &);
 void registerAggregateFunctionDeltaSum(AggregateFunctionFactory &);
 void registerAggregateFunctionDeltaSumTimestamp(AggregateFunctionFactory &);
 void registerAggregateFunctionGroupArray(AggregateFunctionFactory &);
+void registerAggregateFunctionGroupConcat(AggregateFunctionFactory &);
 void registerAggregateFunctionGroupUniqArray(AggregateFunctionFactory &);
 void registerAggregateFunctionGroupArrayInsertAt(AggregateFunctionFactory &);
 void registerAggregateFunctionsQuantile(AggregateFunctionFactory &);
@@ -79,8 +81,8 @@ void registerAggregateFunctionRetentionLoss(AggregateFunctionFactory &);
 void registerAggregateFunctionGenArray(AggregateFunctionFactory & factory);
 void registerAggregateFunctionGenArrayMonth(AggregateFunctionFactory & factory);
 void registerAggregateFunctionAttributionAnalysis(AggregateFunctionFactory &);
-void registerAggregateFunctionAttributionAnalysisMerge(AggregateFunctionFactory &);
-void registerAggregateFunctionAttributionCorrelationMerge(AggregateFunctionFactory &);
+void registerAggregateFunctionAttributionAnalysisFuse(AggregateFunctionFactory &);
+void registerAggregateFunctionAttributionCorrelationFuse(AggregateFunctionFactory &);
 void registerAggregateFunctionFinderFunnel(AggregateFunctionFactory & factory);
 void registerAggregateFunctionFinderGroupFunnel(AggregateFunctionFactory & factory);
 void registerAggregateFunctionFunnelRep(AggregateFunctionFactory & factory);
@@ -101,11 +103,21 @@ void registerAggregateFunctionsBitmapExpressionCalculation(AggregateFunctionFact
 void registerAggregateFunctionsBitmapMaxLevel(AggregateFunctionFactory & factory);
 void registerAggregateFunctionsBitMapJoin(AggregateFunctionFactory & factory);
 void registerAggregateFunctionsBitMapJoinAndCard(AggregateFunctionFactory & factory);
-void registerAggregateFunctionCpcSketch(AggregateFunctionFactory & factory);
+void registerAggregateFunctionHllSketch(AggregateFunctionFactory & factory);
 void registerAggregateFunctionKllSketch(AggregateFunctionFactory & factory);
 void registerAggregateFunctionNdvBuckets(AggregateFunctionFactory & factory);
 void registerAggregateFunctionNdvBucketsExtend(AggregateFunctionFactory & factory);
 void registerAggregateFunctionNothing(AggregateFunctionFactory & factory);
+void registerAggregateFunctionHllSketchEstimate(AggregateFunctionFactory &);
+void registerAggregateFunctionAuc(AggregateFunctionFactory &);
+void registerAggregateFunctionFastAuc(AggregateFunctionFactory &);
+void registerAggregateFunctionFastAuc2(AggregateFunctionFactory &);
+void registerAggregateFunctionFastAuc3(AggregateFunctionFactory &);
+void registerAggregateFunctionRegAuc(AggregateFunctionFactory &);
+void registerAggregateFunctionRegAucV2(AggregateFunctionFactory &);
+void registerAggregateFunctionDebiasAuc(AggregateFunctionFactory &);
+void registerAggregateFunctionEcpmAuc(AggregateFunctionFactory &);
+void registerAggregateFunctionNdcg(AggregateFunctionFactory &);
 
 class AggregateFunctionCombinatorFactory;
 void registerAggregateFunctionCombinatorIf(AggregateFunctionCombinatorFactory &);
@@ -129,12 +141,14 @@ void registerAggregateFunctions()
     {
         auto & factory = AggregateFunctionFactory::instance();
 
+        registerAggregateFunctionArbitrary(factory);
         registerAggregateFunctionAvg(factory);
         registerAggregateFunctionAvgWeighted(factory);
         registerAggregateFunctionCount(factory);
         registerAggregateFunctionDeltaSum(factory);
         registerAggregateFunctionDeltaSumTimestamp(factory);
         registerAggregateFunctionGroupArray(factory);
+        registerAggregateFunctionGroupConcat(factory);
         registerAggregateFunctionGroupUniqArray(factory);
         registerAggregateFunctionGroupArrayInsertAt(factory);
         registerAggregateFunctionsQuantile(factory);
@@ -180,8 +194,8 @@ void registerAggregateFunctions()
         registerAggregateFunctionGenArray(factory);
         registerAggregateFunctionGenArrayMonth(factory);
         registerAggregateFunctionAttributionAnalysis(factory);
-        registerAggregateFunctionAttributionAnalysisMerge(factory);
-        registerAggregateFunctionAttributionCorrelationMerge(factory);
+        registerAggregateFunctionAttributionAnalysisFuse(factory);
+        registerAggregateFunctionAttributionCorrelationFuse(factory);
         registerAggregateFunctionFinderFunnel(factory);
         registerAggregateFunctionFinderGroupFunnel(factory);
         registerAggregateFunctionFunnelRep(factory);
@@ -206,11 +220,21 @@ void registerAggregateFunctions()
         registerAggregateFunctionsBitmapMaxLevel(factory);
         registerAggregateFunctionsBitMapJoin(factory);
         registerAggregateFunctionsBitMapJoinAndCard(factory);
-        registerAggregateFunctionCpcSketch(factory);
+        registerAggregateFunctionHllSketch(factory);
         registerAggregateFunctionKllSketch(factory);
         registerAggregateFunctionNdvBuckets(factory);
         registerAggregateFunctionNdvBucketsExtend(factory);
         registerAggregateFunctionNothing(factory);
+        registerAggregateFunctionHllSketchEstimate(factory);
+        registerAggregateFunctionAuc(factory);
+        registerAggregateFunctionFastAuc(factory);
+        registerAggregateFunctionFastAuc2(factory);
+        registerAggregateFunctionFastAuc3(factory);
+        registerAggregateFunctionRegAuc(factory);
+        registerAggregateFunctionRegAucV2(factory);
+        registerAggregateFunctionDebiasAuc(factory);
+        registerAggregateFunctionEcpmAuc(factory);
+        registerAggregateFunctionNdcg(factory);
     }
 
     {

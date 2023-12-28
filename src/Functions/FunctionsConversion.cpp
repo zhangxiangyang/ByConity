@@ -26,9 +26,7 @@
 namespace DB
 {
 
-void registerFunctionFixedString(FunctionFactory & factory);
-
-void registerFunctionsConversion(FunctionFactory & factory)
+REGISTER_FUNCTION(Conversion)
 {
     factory.registerFunction<FunctionToUInt8>();
     factory.registerFunction<FunctionToUInt16>();
@@ -51,19 +49,24 @@ void registerFunctionsConversion(FunctionFactory & factory)
     factory.registerFunction<FunctionToDecimal256>();
 
     factory.registerFunction<FunctionToDate>();
+    /// Hive compatibility alias.
+    factory.registerFunction<FunctionToDate>("to_date", FunctionFactory::CaseInsensitive);
     /// MysQL compatibility alias.
     factory.registerFunction<FunctionToDate>("DATE", FunctionFactory::CaseInsensitive);
     factory.registerFunction<FunctionToDate32>();
     factory.registerFunction<FunctionToTime>();
+    /// MysQL compatibility alias.
+    factory.registerFunction<FunctionToTime>("TIME", FunctionFactory::CaseInsensitive);
     factory.registerFunction<FunctionToDateTime>();
     factory.registerFunction<FunctionToDateTime32>();
+    factory.registerFunction<FunctionToDateTime32>("timestamp", FunctionFactory::CaseInsensitive);
     factory.registerFunction<FunctionToDateTime64>();
     factory.registerFunction<FunctionToUUID>();
     factory.registerFunction<FunctionToString>();
 
-    registerFunctionFixedString(factory);
 
     factory.registerFunction<FunctionToUnixTimestamp>();
+    factory.registerAlias("unix_timestamp", NameToUnixTimestamp::name, FunctionFactory::CaseInsensitive);
 
     factory.registerFunction<CastOverloadResolver<CastType::nonAccurate>>(FunctionFactory::CaseInsensitive);
     factory.registerFunction<CastOverloadResolver<CastType::accurate>>();

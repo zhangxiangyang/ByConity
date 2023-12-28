@@ -14,21 +14,22 @@
  */
 
 #pragma once
+#include <optional>
 #include <Catalog/DataModelPartWrapper_fwd.h>
-#include <Common/HostWithPorts.h>
+#include <CloudServices/CnchWorkerClient.h>
 #include <Core/Types.h>
 #include <Interpreters/StorageID.h>
 #include <Interpreters/WorkerGroupHandle.h>
+#include <Storages/DataPart_fwd.h>
 #include <Storages/IStorage_fwd.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH_fwd.h>
-#include <Storages/Hive/HiveDataPart_fwd.h>
 #include <Transaction/TxnTimestamp.h>
 #include <Poco/Logger.h>
+#include <Common/HostWithPorts.h>
 
 
 namespace DB
 {
-
 class ServerResourceLockManager
 {
 public:
@@ -54,16 +55,12 @@ private:
 
 struct SendLock
 {
-    SendLock(const std::string & address_, ServerResourceLockManager & manager_)
-        : address(address_), manager(manager_)
+    SendLock(const std::string & address_, ServerResourceLockManager & manager_) : address(address_), manager(manager_)
     {
         manager.add(address);
     }
 
-    ~SendLock()
-    {
-        manager.remove(address);
-    }
+    ~SendLock() { manager.remove(address); }
 
     std::string address;
     ServerResourceLockManager & manager;
@@ -73,48 +70,65 @@ struct AssignedResource
 {
     explicit AssignedResource(const StoragePtr & storage);
 
+    AssignedResource(AssignedResource && resource);
+
     StoragePtr storage;
     String worker_table_name;
     String create_table_query;
     bool sent_create_query{false};
-
-    /// offloading info
-    HostWithPortsVec buffer_workers;
+    bool replicated{false};
 
     /// parts info
     ServerDataPartsVector server_parts;
-    HiveDataPartsCNCHVector hive_parts;
+    FileDataPartsCNCHVector file_parts;
+    HiveFiles hive_parts;
     std::set<Int64> bucket_numbers;
 
     std::unordered_set<String> part_names;
 
     void addDataParts(const ServerDataPartsVector & parts);
-    void addDataParts(const HiveDataPartsCNCHVector & parts);
+    void addDataParts(const FileDataPartsCNCHVector & parts);
+    void addDataParts(const HiveFiles & parts);
 
     bool empty() const { return sent_create_query && server_parts.empty(); }
 };
 
+// Send resources separately by UUID
+struct ResourceOption
+{
+    std::unordered_set<UUID> table_ids;
+};
+
+struct ResourceStageInfo
+{
+    std::unordered_set<UUID> sent_resource;
+    void filterResource(std::optional<ResourceOption> resource_option);
+};
 class CnchServerResource
 {
 public:
     explicit CnchServerResource(TxnTimestamp curr_txn_id)
-        : txn_id(curr_txn_id)
-        , log(&Poco::Logger::get("SessionResource(" + txn_id.toString() + ")"))
-    {}
+        : txn_id(curr_txn_id), log(&Poco::Logger::get("SessionResource(" + txn_id.toString() + ")"))
+    {
+    }
 
     ~CnchServerResource();
 
-    void addCreateQuery(const ContextPtr & context, const StoragePtr & storage, const String & create_query, const String & worker_table_name);
-    void setAggregateWorker(HostWithPorts aggregate_worker_)
-    {
-        aggregate_worker = std::move(aggregate_worker_);
-    }
+    void addCreateQuery(
+        const ContextPtr & context,
+        const StoragePtr & storage,
+        const String & create_query,
+        const String & worker_table_name,
+        bool create_local_table = true);
+    void setAggregateWorker(HostWithPorts aggregate_worker_) { aggregate_worker = std::move(aggregate_worker_); }
 
     void setWorkerGroup(WorkerGroupHandle worker_group_)
     {
         if (!worker_group)
             worker_group = std::move(worker_group_);
     }
+
+    void skipCleanWorker() { skip_clean_worker = true; }
 
     template <typename T>
     void addDataParts(const UUID & storage_id, const std::vector<T> & data_parts, const std::set<Int64> & required_bucket_numbers = {})
@@ -127,23 +141,31 @@ public:
             assigned_resource.bucket_numbers = required_bucket_numbers;
     }
 
-    void addBufferWorkers(const UUID & storage_id, const HostWithPortsVec & buffer_workers);
-
     /// Send resource to worker
     void sendResource(const ContextPtr & context, const HostWithPorts & worker);
     /// allocate and send resource to worker_group
-    void sendResource(const ContextPtr & context);
+    void sendResources(const ContextPtr & context, std::optional<ResourceOption> resource_option = std::nullopt);
 
-    /// remove all resource in server
-    void removeAll();
+    /// WorkerAction should not throw
+    using WorkerAction
+        = std::function<std::vector<brpc::CallId>(CnchWorkerClientPtr, const std::vector<AssignedResource> &, const ExceptionHandlerPtr &)>;
+    void sendResources(const ContextPtr & context, WorkerAction act);
+    void cleanResource();
+
+    void setSendMutations(bool send_mutations_) { send_mutations = send_mutations_; }
 
 private:
     auto getLock() const { return std::lock_guard(mutex); }
     auto getLockForSend(const String & address) const { return SendLock{address, lock_manager}; }
     void cleanTaskInWorker(bool clean_resource = false) const;
 
+    void cleanResourceInWorker();
+
     /// move resource from assigned_table_resource to assigned_worker_resource
-    void allocateResource(const ContextPtr & context, std::lock_guard<std::mutex> &);
+    void allocateResource(
+        const ContextPtr & context,
+        std::lock_guard<std::mutex> &,
+        std::optional<ResourceOption> resource_option = std::nullopt);
 
     void sendCreateQueries(const ContextPtr & context);
     void sendDataParts(const ContextPtr & context);
@@ -159,8 +181,13 @@ private:
     std::unordered_map<UUID, AssignedResource> assigned_table_resource;
     std::unordered_map<HostWithPorts, std::vector<AssignedResource>> assigned_worker_resource;
 
+    ResourceStageInfo resource_stage_info;
+
+    bool skip_clean_worker{false};
     Poco::Logger * log;
     mutable ServerResourceLockManager lock_manager;
+
+    bool send_mutations{false};
 };
 
 }

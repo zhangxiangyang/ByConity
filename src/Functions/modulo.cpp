@@ -25,20 +25,56 @@ struct ModuloByConstantImpl
     : BinaryOperation<A, B, ModuloImpl<A, B>>
 {
     using Op = ModuloImpl<A, B>;
+    using BaseType = BinaryOperation<A, B, ModuloImpl<A, B>>;
     using ResultType = typename Op::ResultType;
     static const constexpr bool allow_fixed_string = false;
 
     template <OpCase op_case>
-    static void NO_INLINE process(const A * __restrict a, const B * __restrict b, ResultType * __restrict c, size_t size)
+    static void NO_INLINE process(const A * __restrict a, const B * __restrict b, ResultType * __restrict c, size_t size, const NullMap * right_nullmap, UInt8 * res_nullmap)
     {
-        if constexpr (op_case == OpCase::Vector)
-            for (size_t i = 0; i < size; ++i)
-                c[i] = Op::template apply<ResultType>(a[i], b[i]);
-        else if constexpr (op_case == OpCase::LeftConstant)
-            for (size_t i = 0; i < size; ++i)
-                c[i] = Op::template apply<ResultType>(*a, b[i]);
-        else
+        if constexpr (op_case == OpCase::RightConstant)
+        {
+            if (right_nullmap && (*right_nullmap)[0])
+                return;
+            if (res_nullmap && undec(*b) == 0)
+                return;
+
             vectorConstant(a, *b, c, size);
+        }
+        else
+        {
+            if (right_nullmap && res_nullmap)
+            {
+                for (size_t i = 0; i < size; ++i)
+                {
+                    if ((*right_nullmap)[i])
+                        c[i] = ResultType();
+                    else if (!BaseType::handleZeroDivision(b, i, c, res_nullmap))
+                       apply<op_case>(a, b, c, i);
+                }
+            }
+            else if (right_nullmap && !res_nullmap)
+            {
+                for (size_t i = 0; i < size; ++i)
+                {
+                    if ((*right_nullmap)[i])
+                        c[i] = ResultType();
+                    else
+                        apply<op_case>(a, b, c, i);
+                }
+            }
+            else if (!right_nullmap && res_nullmap)
+            {
+                for (size_t i = 0; i < size; ++i)
+                {
+                    if (!BaseType::handleZeroDivision(b, i, c, res_nullmap))
+                        apply<op_case>(a, b, c, i);
+                }
+            }
+            else
+                for (size_t i = 0; i < size; ++i)
+                    apply<op_case>(a, b, c, i);
+        }
     }
 
     static ResultType process(A a, B b) { return Op::template apply<ResultType>(a, b); }
@@ -94,6 +130,16 @@ struct ModuloByConstantImpl
                 dst[i] = src[i] & mask;
         }
     }
+
+private:
+    template <OpCase op_case>
+    static inline void apply(const A * __restrict a, const B * __restrict b, ResultType * __restrict c, size_t i)
+    {
+        if constexpr (op_case == OpCase::Vector)
+            c[i] = Op::template apply<ResultType>(a[i], b[i]);
+        else
+            c[i] = Op::template apply<ResultType>(*a, b[i]);
+    }
 };
 
 template <typename A, typename B>
@@ -133,16 +179,17 @@ template <> struct BinaryOperationImpl<Int32, Int64, ModuloImpl<Int32, Int64>> :
 struct NameModulo { static constexpr auto name = "modulo"; };
 using FunctionModulo = BinaryArithmeticOverloadResolver<ModuloImpl, NameModulo, false>;
 
-void registerFunctionModulo(FunctionFactory & factory)
+REGISTER_FUNCTION(Modulo)
 {
     factory.registerFunction<FunctionModulo>();
     factory.registerAlias("mod", "modulo", FunctionFactory::CaseInsensitive);
+    factory.registerAlias("pmod", "modulo", FunctionFactory::CaseInsensitive);
 }
 
 struct NameModuloLegacy { static constexpr auto name = "moduloLegacy"; };
 using FunctionModuloLegacy = BinaryArithmeticOverloadResolver<ModuloLegacyImpl, NameModuloLegacy, false>;
 
-void registerFunctionModuloLegacy(FunctionFactory & factory)
+REGISTER_FUNCTION(ModuloLegacy)
 {
     factory.registerFunction<FunctionModuloLegacy>();
 }

@@ -26,8 +26,6 @@
 #include <MergeTreeCommon/MergeTreeMetaBase.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <Storages/MergeTree/PartitionPruner.h>
-#include <Parsers/ASTSampleRatio.h>
-#include <boost/rational.hpp>   /// For calculations related to sampling coefficients.
 #include <QueryPlan/ReadFromMergeTree.h>
 
 namespace DB
@@ -36,17 +34,6 @@ namespace DB
 class KeyCondition;
 
 using PartitionIdToMaxBlock = std::unordered_map<String, Int64>;
-using RelativeSize = boost::rational<ASTSampleRatio::BigNum>;
-
-struct MergeTreeDataSelectSamplingData
-{
-    bool use_sampling = false;
-    bool read_nothing = false;
-    Float64 used_sample_factor = 1.0;
-    std::shared_ptr<ASTFunction> filter_function;
-    ActionsDAGPtr filter_expression;
-    RelativeSize relative_sample_size = 0;
-};
 
 /** Executes SELECT queries on data from the merge tree.
   */
@@ -80,12 +67,13 @@ public:
         ContextPtr context,
         UInt64 max_block_size,
         unsigned num_streams,
-        std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read = nullptr) const;
+        std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read = nullptr,
+        MergeTreeDataSelectAnalysisResultPtr merge_tree_select_result_ptr = nullptr) const;
 
     /// Get an estimation for the number of marks we are going to read.
     /// Reads nothing. Secondary indexes are not used.
     /// This method is used to select best projection for table.
-    size_t estimateNumMarksToRead(
+    MergeTreeDataSelectAnalysisResultPtr estimateNumMarksToRead(
         MergeTreeMetaBase::DataPartsVector parts,
         const Names & column_names,
         const StorageMetadataPtr & metadata_snapshot_base,
@@ -123,6 +111,7 @@ private:
         const MergeTreeReaderSettings & reader_settings,
         size_t & total_granules,
         size_t & granules_dropped,
+        roaring::Roaring & filter_bitmap,
         Poco::Logger * log);
 
     struct PartFilterCounters
@@ -182,7 +171,7 @@ public:
     static std::optional<std::unordered_set<String>> filterPartsByVirtualColumns(
         const MergeTreeMetaBase & data,
         const MergeTreeMetaBase::DataPartsVector & parts,
-        const ASTPtr & query,
+        const SelectQueryInfo & query_info,
         ContextPtr context);
 
     /// Filter parts using minmax index and partition key.
@@ -241,7 +230,13 @@ public:
         bool sample_factor_column_queried,
         Poco::Logger * log);
 
-    static MarkRanges sampleByRange(const MergeTreeMetaBase::DataPartPtr& part, const MarkRanges & ranges, const RelativeSize & relative_sample_size, bool deterministic);
+    static MarkRanges sampleByRange(
+        const MergeTreeMetaBase::DataPartPtr & part,
+        const MarkRanges & ranges,
+        const RelativeSize & relative_sample_size,
+        bool deterministic,
+        bool uniform);
+
     static MarkRanges sliceRange(const MarkRange & range, const UInt64 & sample_size);
 
     /// Check query limits: max_partitions_to_read, max_concurrent_queries.

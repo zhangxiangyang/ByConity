@@ -68,6 +68,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CANNOT_PARSE_DATE;
+    extern const int CANNOT_PARSE_BOOL;
     extern const int CANNOT_PARSE_DATETIME;
     extern const int CANNOT_PARSE_UUID;
     extern const int CANNOT_READ_ARRAY_FROM_TEXT;
@@ -205,6 +206,15 @@ inline void assertChar(char symbol, ReadBuffer & buf)
     ++buf.position();
 }
 
+inline bool checkCharCaseInsensitive(char c, ReadBuffer & buf)
+{
+    char a;
+    if (!buf.peek(a) || !equalsCaseInsensitive(a, c))
+        return false;
+    buf.ignore();
+    return true;
+}
+
 inline void assertString(const String & s, ReadBuffer & buf)
 {
     assertString(s.c_str(), buf);
@@ -261,20 +271,45 @@ inline void readBoolText(bool & x, ReadBuffer & buf)
     x = tmp != '0';
 }
 
-inline void readBoolTextWord(bool & x, ReadBuffer & buf)
+inline void readBoolTextWord(bool & x, ReadBuffer & buf, bool support_upper_case = false)
 {
     if (buf.eof())
         throwReadAfterEOF();
 
-    if (*buf.position() == 't')
+    switch (*buf.position())
     {
-        assertString("true", buf);
-        x = true;
-    }
-    else
-    {
-        assertString("false", buf);
-        x = false;
+        case 't':
+            assertString("true", buf);
+            x = true;
+            break;
+        case 'f':
+            assertString("false", buf);
+            x = false;
+            break;
+        case 'T':
+        {
+            if (support_upper_case)
+            {
+                assertString("TRUE", buf);
+                x = true;
+                break;
+            }
+            else
+                [[fallthrough]];
+        }
+        case 'F':
+        {
+            if (support_upper_case)
+            {
+                assertString("FALSE", buf);
+                x = false;
+                break;
+            }
+            else
+                [[fallthrough]];
+        }
+        default:
+            throw ParsingException("Unexpected Bool value", ErrorCodes::CANNOT_PARSE_BOOL);
     }
 }
 
@@ -1015,10 +1050,35 @@ inline ReturnType readDateTimeTextImpl(DateTime64 & datetime64, UInt32 scale, Re
 inline bool readTimeTextImpl(time_t & t, ReadBuffer & buf)
 {
     static constexpr auto TimeStringInputSize = 8;
-    const char * s = buf.position();
-    if (buf.buffer().end() < s + TimeStringInputSize) {
+    static constexpr auto DateTimeMinSize = 18;
+    static constexpr auto DateTimeMaxSize = 30;
+    static constexpr auto DateSize = 10;
+
+    const char * begin_pos = buf.position();
+    auto * const end_pos = buf.buffer().end();
+    if (end_pos < begin_pos + TimeStringInputSize)
+    {
         return false;
     }
+    if (end_pos >= begin_pos + DateSize && begin_pos[4] == '-' && begin_pos[7] == '-')
+    {
+        if (end_pos <= begin_pos + DateTimeMinSize)
+        {
+            // In date format yyyy-mm-dd. Ignore remaining characters
+            // return 00:00:00
+            t = 0;
+            buf.position() += end_pos - begin_pos;
+            return true;
+        }
+        else if (end_pos > begin_pos + DateTimeMinSize && end_pos < begin_pos + DateTimeMaxSize)
+        {
+            // Give a minor effort to parse date time string
+            // yyyy-mm-dd HH:MM:SS.NNNNNNNNN 11 chars to skip
+            buf.ignore(DateSize + 1);
+        }
+    }
+
+    const char * s = buf.position();
     if (s[2] != ':' && s[5] != ':') {
         return false;
     }
@@ -1127,7 +1187,12 @@ inline void readBinary(std::pair<String, String> & x, ReadBuffer & buf)
     readBinary(x.first, buf);
     readBinary(x.second, buf);
 }
-
+template <typename T>
+inline void readBinary(std::pair<T, T> & x, ReadBuffer & buf)
+{
+    readBinary(x.first, buf);
+    readBinary(x.second, buf);
+}
 
 template <typename T>
 inline std::enable_if_t<is_arithmetic_v<T> && (sizeof(T) <= 8), void>
@@ -1265,6 +1330,9 @@ void readBinary(std::vector<T> & x, ReadBuffer & buf)
     for (size_t i = 0; i < size; ++i)
         readBinary(x[i], buf);
 }
+
+template<>
+void readBinary(std::vector<bool> & x, ReadBuffer & buf);
 
 template <typename T>
 void readQuoted(std::vector<T> & x, ReadBuffer & buf)

@@ -40,8 +40,6 @@ public:
 
     void runImpl() override;
 
-    void stop() override;
-
     /**
      * Check whether target dedup worker instance is valid.
      */
@@ -50,6 +48,8 @@ public:
     DedupWorkerStatus getDedupWorkerStatus();
 
 private:
+
+    void clearData() override;
 
     void iterate(StoragePtr & istorage);
 
@@ -64,7 +64,8 @@ private:
 
     String getDedupWorkerDebugInfo();
 
-    mutable std::mutex worker_client_mutex;
+    mutable bthread::Mutex worker_client_mutex;
+    CnchWorkerClientPoolPtr worker_pool;
     CnchWorkerClientPtr worker_client;
     StorageID worker_storage_id;
 

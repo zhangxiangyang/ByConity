@@ -17,13 +17,14 @@
 
 #include <CloudServices/CnchDedupHelper.h>
 #include <CloudServices/CnchPartsHelper.h>
-#include <CloudServices/commitCnchParts.h>
+#include <CloudServices/CnchDataWriter.h>
 #include <Interpreters/PartLog.h>
 #include <MergeTreeCommon/MergeTreeDataDeduper.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/IMergeTreeDataPart_fwd.h>
 #include <Storages/StorageCloudMergeTree.h>
 #include <Storages/StorageCnchMergeTree.h>
+#include <Storages/BitEngine/BitEngineDictionaryManager.h>
 #include <Transaction/CnchWorkerTransaction.h>
 #include <WorkerTasks/ManipulationType.h>
 
@@ -60,47 +61,41 @@ Block CloudMergeTreeBlockOutputStream::getHeader() const
     return metadata_snapshot->getSampleBlock();
 }
 
+void CloudMergeTreeBlockOutputStream::writePrefix()
+{
+    auto max_threads = context->getSettingsRef().max_threads_for_cnch_dump;
+    LOG_DEBUG(log, "dump with {} threads", max_threads);
+    cnch_writer.initialize(max_threads);
+}
+
 void CloudMergeTreeBlockOutputStream::write(const Block & block)
 {
     Stopwatch watch;
-    LOG_DEBUG(storage.getLogger(), "Start to write new block");
-    auto parts = convertBlockIntoDataParts(block);
+    LOG_DEBUG(storage.getLogger(), "Start to write new block of size: {}", block.rows());
+    auto temp_parts = convertBlockIntoDataParts(block);
     /// Generate delete bitmaps, delete bitmap is valid only when using delete_flag info for unique table
     LocalDeleteBitmaps bitmaps;
     const auto & txn = context->getCurrentTransaction();
-    for (const auto & part : parts)
+    for (const auto & part : temp_parts)
     {
-        auto delete_bitmap = part->getDeleteBitmap(/*is_new_part*/ true);
+        auto delete_bitmap = part->getDeleteBitmap(/*allow_null*/ true);
         if (delete_bitmap && delete_bitmap->cardinality())
         {
             bitmaps.emplace_back(LocalDeleteBitmap::createBase(
                 part->info, std::const_pointer_cast<Roaring>(delete_bitmap), txn->getPrimaryTransactionID().toUInt64()));
+            part->delete_flag = true;
         }
     }
     LOG_DEBUG(storage.getLogger(), "Finish converting block into parts, elapsed {} ms", watch.elapsedMilliseconds());
     watch.restart();
 
-    MutableMergeTreeDataPartsCNCHVector res;
+    IMutableMergeTreeDataPartsVector temp_staged_parts;
     if (to_staging_area)
     {
-        auto dumped = cnch_writer.dumpAndCommitCnchParts({}, bitmaps, /*staged_parts*/ parts);
-        res = std::move(dumped.staged_parts);
+        temp_staged_parts.swap(temp_parts);
     }
-    else
-    {
-        auto dumped = cnch_writer.dumpAndCommitCnchParts(parts, bitmaps);
-        res = std::move(dumped.parts);
-    }
-    LOG_DEBUG(
-        storage.getLogger(),
-        "Dump and commit {} parts, {} bitmaps, elapsed {} ms, pushing {} parts to preload vector.",
-        res.size(),
-        bitmaps.size(),
-        watch.elapsedMilliseconds(),
-        res.size());
 
-    // batch all part to preload_parts for batch preloading in writeSuffix
-    std::move(res.begin(), res.end(), std::back_inserter(preload_parts));
+    cnch_writer.schedule(temp_parts, bitmaps, temp_staged_parts);
 }
 
 MergeTreeMutableDataPartsVector CloudMergeTreeBlockOutputStream::convertBlockIntoDataParts(const Block & block, bool use_inner_block_id)
@@ -133,54 +128,39 @@ MergeTreeMutableDataPartsVector CloudMergeTreeBlockOutputStream::convertBlockInt
     IMutableMergeTreeDataPartsVector parts;
     LOG_DEBUG(storage.getLogger(), "size of part_blocks {}", part_blocks.size());
 
-    auto txn_id = context->getCurrentTransactionID();
+    const auto & txn = context->getCurrentTransaction();
+    auto primary_txn_id = txn->getPrimaryTransactionID();
 
     // Get all blocks of partition by expression
     for (auto & block_with_partition : part_blocks)
     {
         Row original_partition{block_with_partition.partition};
-        auto bucketed_part_blocks = writer.splitBlockPartitionIntoPartsByClusterKey(block_with_partition, context->getSettingsRef().max_partitions_per_insert_block, metadata_snapshot, context);
+
+        /// We need to dedup in block before split block by cluster key when unique table supports cluster key because cluster key may be different with unique key. Otherwise, we will lost the insert order.
+        if (metadata_snapshot->hasUniqueKey()
+            && (merge_tree_settings->partition_level_unique_keys || storage.merging_params.partitionValueAsVersion()))
+        {
+            FilterInfo filter_info = dedupWithUniqueKey(block_with_partition.block);
+            if (filter_info.num_filtered)
+                block_with_partition.block = CnchDedupHelper::filterBlock(block_with_partition.block, filter_info);
+        }
+
+        auto bucketed_part_blocks = writer.splitBlockPartitionIntoPartsByClusterKey(
+            block_with_partition, context->getSettingsRef().max_partitions_per_insert_block, metadata_snapshot, context);
         LOG_TRACE(storage.getLogger(), "size of bucketed_part_blocks {}", bucketed_part_blocks.size());
-        const auto & txn = context->getCurrentTransaction();
 
         for (auto & bucketed_block_with_partition : bucketed_part_blocks)
         {
             Stopwatch watch;
-
             bucketed_block_with_partition.partition = Row(original_partition);
-            if (metadata_snapshot->hasUniqueKey()
-                && (merge_tree_settings->partition_level_unique_keys || storage.merging_params.partitionValueAsVersion()))
-            {
-                FilterInfo filter_info = dedupWithUniqueKey(bucketed_block_with_partition.block);
-                if (filter_info.num_filtered)
-                    bucketed_block_with_partition.block = CnchDedupHelper::filterBlock(bucketed_block_with_partition.block, filter_info);
-            }
 
-            DeleteBitmapPtr bitmap = std::make_shared<Roaring>();
-            if (metadata_snapshot->hasUniqueKey() && bucketed_block_with_partition.block.has(StorageInMemoryMetadata::DELETE_FLAG_COLUMN_NAME))
-            {
-                /// Convert delete_flag info into delete bitmap
-                const auto & delete_flag_column = bucketed_block_with_partition.block.getByName(StorageInMemoryMetadata::DELETE_FLAG_COLUMN_NAME);
-                for (size_t rowid = 0; rowid < delete_flag_column.column->size(); ++rowid)
-                {
-                    if (delete_flag_column.column->getBool(rowid))
-                        bitmap->add(rowid);
-                }
-            }
-
-            /// Remove func columns
-            for (auto & [name, _] : metadata_snapshot->getFuncColumns())
-                if (bucketed_block_with_partition.block.has(name))
-                    bucketed_block_with_partition.block.erase(name);
+            if (storage.isBitEngineMode())
+                writeImplicitColumnForBitEngine(bucketed_block_with_partition, {});
 
             auto block_id = use_inner_block_id ? increment.get() : context->getTimestamp();
 
             MergeTreeMutableDataPartPtr temp_part
-                = writer.writeTempPart(bucketed_block_with_partition, metadata_snapshot, context, block_id, txn_id);
-
-            /// Only add delete bitmap if it's not empty.
-            if (bitmap->cardinality())
-                temp_part->setDeleteBitmap(bitmap);
+                = writer.writeTempPart(bucketed_block_with_partition, metadata_snapshot, context, block_id, primary_txn_id);
 
             if (txn->isSecondary())
                 temp_part->secondary_txn_id = txn->getTransactionID();
@@ -201,6 +181,19 @@ MergeTreeMutableDataPartsVector CloudMergeTreeBlockOutputStream::convertBlockInt
 
 void CloudMergeTreeBlockOutputStream::writeSuffix()
 {
+    cnch_writer.finalize();
+    auto & dumped_data = cnch_writer.res;
+
+    if (!dumped_data.parts.empty())
+    {
+        preload_parts = std::move(dumped_data.parts);
+    }
+
+    if (!dumped_data.staged_parts.empty())
+    {
+        std::move(std::begin(dumped_data.staged_parts), std::end(dumped_data.staged_parts), std::back_inserter(preload_parts));
+    }
+
     try
     {
         writeSuffixImpl();
@@ -218,6 +211,8 @@ void CloudMergeTreeBlockOutputStream::writeSuffix()
 
 void CloudMergeTreeBlockOutputStream::writeSuffixImpl()
 {
+    cnch_writer.preload(preload_parts);
+
     if (!metadata_snapshot->hasUniqueKey() || to_staging_area)
     {
         /// case1(normal table): commit all the temp parts as visible parts
@@ -232,14 +227,6 @@ void CloudMergeTreeBlockOutputStream::writeSuffixImpl()
         /// and then remove duplicate keys between visible parts and temp parts.
         writeSuffixForUpsert();
     }
-
-    if (!preload_parts.empty())
-    {
-        /// auto testlog = std::make_shared<TestLog>(const_cast<Context &>(context));
-        /// TEST_START(testlog);
-        /// tryPreloadChecksumsAndPrimaryIndex(storage, std::move(preload_parts), ManipulationType::Insert, context);
-        /// TEST_END(testlog, "Finish tryPreloadChecksumsAndPrimaryIndex in batch mode");
-    }
 }
 
 void CloudMergeTreeBlockOutputStream::writeSuffixForInsert()
@@ -252,10 +239,13 @@ void CloudMergeTreeBlockOutputStream::writeSuffixForInsert()
         txn->commitV2();
         LOG_DEBUG(storage.getLogger(), "Finishing insert values commit in cnch server.");
     }
-    else if (dynamic_pointer_cast<CnchWorkerTransaction>(txn))
+    else if (auto worker_txn = dynamic_pointer_cast<CnchWorkerTransaction>(txn))
     {
+        if (worker_txn->hasEnableExplicitCommit())
+            return;
+
         auto kafka_table_id = txn->getKafkaTableID();
-        if (!kafka_table_id.empty())
+        if (!kafka_table_id.empty() && !worker_txn->hasEnableExplicitCommit())
         {
             txn->setMainTableUUID(UUIDHelpers::toUUID(storage.getSettings()->cnch_table_uuid.value));
             Stopwatch watch;
@@ -263,12 +253,43 @@ void CloudMergeTreeBlockOutputStream::writeSuffixForInsert()
             LOG_TRACE(
                 storage.getLogger(), "Committed Kafka transaction {} elapsed {} ms", txn->getTransactionID(), watch.elapsedMilliseconds());
         }
+        else if (context->getClientInfo().query_kind == ClientInfo::QueryKind::INITIAL_QUERY)
+        {
+            /// INITIAL_QUERY means the query is sent from client (and to worker directly), so commit it instantly.
+            Stopwatch watch;
+            txn->commitV2();
+            LOG_TRACE(
+                storage.getLogger(),
+                "Committed transaction {} elapsed {} ms.", txn->getTransactionID(), watch.elapsedMilliseconds());
+        }
         else
         {
             /// TODO: I thought the multiple branches should be unified.
             /// And a exception should be threw in the last `else` clause, otherwise there might be some potential bugs.
         }
     }
+}
+
+namespace
+{
+    struct BlockUniqueKeyComparator
+    {
+        const ColumnsWithTypeAndName & keys;
+        explicit BlockUniqueKeyComparator(const ColumnsWithTypeAndName & keys_) : keys(keys_) { }
+
+        bool operator()(size_t lhs, size_t rhs) const
+        {
+            for (auto & key : keys)
+            {
+                int cmp = key.column->compareAt(lhs, rhs, *key.column, /*nan_direction_hint=*/1);
+                if (cmp < 0)
+                    return true;
+                if (cmp > 0)
+                    return false;
+            }
+            return false;
+        }
+    };
 }
 
 void CloudMergeTreeBlockOutputStream::writeSuffixForUpsert()
@@ -321,26 +342,41 @@ void CloudMergeTreeBlockOutputStream::writeSuffixForUpsert()
         return;
     }
 
-    /// acquire locks for all the written partitions
-    NameOrderedSet sorted_partitions;
-    for (auto & part : preload_parts)
-        sorted_partitions.insert(part->info.partition_id);
-
-    CnchDedupHelper::DedupScope scope = storage.getSettings()->partition_level_unique_keys
-        ? CnchDedupHelper::DedupScope::Partitions(sorted_partitions)
-        : CnchDedupHelper::DedupScope::Table();
-
-    std::vector<LockInfoPtr> locks_to_acquire = CnchDedupHelper::getLocksToAcquire(
-        scope, txn->getTransactionID(), storage, storage.getSettings()->dedup_acquire_lock_timeout.value.totalMilliseconds());
+    CnchLockHolderPtr cnch_lock;
+    MergeTreeDataPartsCNCHVector visible_parts, staged_parts;
+    bool force_normal_dedup = false;
     Stopwatch lock_watch;
-    CnchLockHolder cnch_lock(*context, std::move(locks_to_acquire));
-    cnch_lock.lock();
+    do
+    {
+        CnchDedupHelper::DedupScope scope = CnchDedupHelper::getDedupScope(*cnch_table, preload_parts, force_normal_dedup);
 
-    ts = context->getTimestamp(); /// must get a new ts after locks are acquired
-    MergeTreeDataPartsCNCHVector visible_parts = CnchDedupHelper::getVisiblePartsToDedup(scope, *cnch_table, ts);
-    MergeTreeDataPartsCNCHVector staged_parts = CnchDedupHelper::getStagedPartsToDedup(scope, *cnch_table, ts);
+        std::vector<LockInfoPtr> locks_to_acquire = CnchDedupHelper::getLocksToAcquire(
+            scope, txn->getTransactionID(), *cnch_table, storage.getSettings()->unique_acquire_write_lock_timeout.value.totalMilliseconds());
+        lock_watch.restart();
+        cnch_lock = txn->createLockHolder(std::move(locks_to_acquire));
+        if (!cnch_lock->tryLock())
+            throw Exception("Failed to acquire lock for txn " + txn->getTransactionID().toString(), ErrorCodes::CNCH_LOCK_ACQUIRE_FAILED);
 
-    MergeTreeDataDeduper deduper(storage, context);
+        lock_watch.restart();
+        ts = context->getTimestamp(); /// must get a new ts after locks are acquired
+        visible_parts = CnchDedupHelper::getVisiblePartsToDedup(scope, *cnch_table, ts);
+        staged_parts = CnchDedupHelper::getStagedPartsToDedup(scope, *cnch_table, ts);
+
+        /// In some case, visible parts or staged parts doesn't have same bucket definition or not a bucket part, we need to convert bucket lock to normal lock.
+        /// Otherwise, it may lead to duplicated data.
+        if (scope.isBucketLock() && !cnch_table->getSettings()->enable_bucket_level_unique_keys
+            && !CnchDedupHelper::checkBucketParts(*cnch_table, visible_parts, staged_parts))
+        {
+            force_normal_dedup = true;
+            cnch_lock->unlock();
+            LOG_TRACE(log, "Check bucket parts failed, switch to normal lock to dedup.");
+            continue;
+        }
+        else
+            break;
+    } while (true);
+
+    MergeTreeDataDeduper deduper(*cnch_table, context);
     LocalDeleteBitmaps bitmaps_to_dump = deduper.dedupParts(
         txn->getTransactionID(),
         CnchPartsHelper::toIMergeTreeDataPartsVector(visible_parts),
@@ -359,28 +395,6 @@ void CloudMergeTreeBlockOutputStream::writeSuffixForUpsert()
         txn->getTransactionID(),
         watch.elapsedMilliseconds(),
         lock_watch.elapsedMilliseconds());
-}
-
-namespace
-{
-    struct BlockUniqueKeyComparator
-    {
-        const ColumnsWithTypeAndName & keys;
-        explicit BlockUniqueKeyComparator(const ColumnsWithTypeAndName & keys_) : keys(keys_) { }
-
-        bool operator()(size_t lhs, size_t rhs) const
-        {
-            for (auto & key : keys)
-            {
-                int cmp = key.column->compareAt(lhs, rhs, *key.column, /*nan_direction_hint=*/1);
-                if (cmp < 0)
-                    return true;
-                if (cmp > 0)
-                    return false;
-            }
-            return false;
-        }
-    };
 }
 
 CloudMergeTreeBlockOutputStream::FilterInfo CloudMergeTreeBlockOutputStream::dedupWithUniqueKey(const Block & block)
@@ -452,5 +466,80 @@ CloudMergeTreeBlockOutputStream::FilterInfo CloudMergeTreeBlockOutputStream::ded
             throw Exception("The size of unique string keys out of limit", ErrorCodes::UNIQUE_KEY_STRING_SIZE_LIMIT_EXCEEDED);
     }
     return res;
+}
+
+void CloudMergeTreeBlockOutputStream::writeImplicitColumnForBitEngine(
+    BlockWithPartition & partition_block,
+    const BitengineWriteSettings & write_settings)
+{
+    auto & block = partition_block.block;
+    ColumnsWithTypeAndName columns = block.getColumnsWithTypeAndName();
+    ColumnsWithTypeAndName encoded_columns;
+    Names source_column_names;  /// used in a feature to discard source bitmap columns
+
+    for (auto & column : columns)
+    {
+        if (!isBitmap64(column.type))
+            continue;
+
+        /// check whether the column is a legal BitEngine column in table
+        if (!storage.isBitEngineEncodeColumn(column.name))
+            continue;
+
+        source_column_names.emplace_back(column.name);
+
+        try
+        {
+            auto encoded_column = storage.getBitEngineDictionaryManager()->encodeColumn(
+                    column, column.name, partition_block.bucket_info.bucket_number,
+                    context, write_settings);
+
+            encoded_columns.push_back(encoded_column);
+        }
+        catch(Exception & e)
+        {
+            // LOG_ERROR(&Logger::get("MergedBlockOutputStream"), "BitEngine encode column exception: " << e.message());
+            // tryLogCurrentException(&Logger::get("MergedBlockOutputStream"), __PRETTY_FUNCTION__);
+            throw Exception("BitEngine encode exception. reason: " + String(e.message()), ErrorCodes::LOGICAL_ERROR);
+        }
+    }
+
+    /// add newly encoded column to the block
+    /// only_recode is used for PREATTACH PARTITION, only source_column is read and only the encoded_column is written to disk
+    /// and if only_recode = false, both source_column and encode_column will be written to disk
+    if (!encoded_columns.empty())
+    {
+        for (auto & encoded_column : encoded_columns)
+        {
+            block.insertUnique(encoded_column);
+        }
+    }
+
+    /// used for discard the source_column, we use an empty column to replace the original source_column
+    /// and there's an empty column on the disk, in this case, only_recode = false
+    if (!encoded_columns.empty())
+    {
+        auto replace_source_column = [&](const String & col_name) {
+            size_t rows = block.rows();
+            ColumnWithTypeAndName & col = block.getByName(col_name);
+            auto new_column = col.type->createColumn();
+            new_column->insertManyDefaults(rows);
+            col.column = std::move(new_column);
+        };
+
+        if (storage.getSettings()->bitengine_discard_source_bitmap)
+        {
+            std::for_each(source_column_names.begin(), source_column_names.end(),
+                replace_source_column);
+        }
+        else
+        {
+            for (auto & name : source_column_names)
+            {
+                if (storage.getBitEngineDictionaryManager()->isKeyStringDictioanry(name))
+                    replace_source_column(name);
+            }
+        }
+    }
 }
 }

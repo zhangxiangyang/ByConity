@@ -267,14 +267,18 @@ void SelectStreamFactory::createForShard(
         if (!table_func_ptr)
             remote_query_executor->setMainTable(main_table);
 
-        remote_pipes.emplace_back(createRemoteSourcePipe(remote_query_executor, add_agg_info, add_totals, add_extremes, async_read));
+        remote_pipes.emplace_back(createRemoteSourcePipe(remote_query_executor, add_agg_info, add_totals, add_extremes, async_read, context->getSettingsRef().resize_number_after_remote_source));
         remote_pipes.back().addInterpreterContext(context);
         addConvertingActions(remote_pipes.back(), header);
     };
 
     const auto & settings = context->getSettingsRef();
 
-    if (settings.prefer_localhost_replica && shard_info.isLocal())
+    /**
+        prefer_localost_replica in cnch is useless and is buggy.
+        and in worker we query from remote to reuse send WorkerResource flow to send/load datapart
+    */
+    if (main_table && settings.prefer_localhost_replica && shard_info.isLocal() && (context->getServerType() != ServerType::cnch_worker))
     {
         StoragePtr main_table_storage;
 
@@ -283,9 +287,9 @@ void SelectStreamFactory::createForShard(
             TableFunctionPtr table_function_ptr = TableFunctionFactory::instance().get(table_func_ptr, context);
             main_table_storage = table_function_ptr->execute(table_func_ptr, context, table_function_ptr->getName());
         }
-        else
+        else if(main_table)
         {
-            auto resolved_id = context->resolveStorageID(main_table);
+            auto resolved_id = context->tryResolveStorageID(main_table);
             main_table_storage = DatabaseCatalog::instance().tryGetTable(resolved_id, context);
         }
 
@@ -323,7 +327,7 @@ void SelectStreamFactory::createForShard(
             return;
         }
 
-        UInt32 local_delay = replicated_storage->getAbsoluteDelay();
+        UInt64 local_delay = replicated_storage->getAbsoluteDelay();
 
         if (local_delay < max_allowed_delay)
         {
@@ -412,7 +416,7 @@ void SelectStreamFactory::createForShard(
                 auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
                     std::move(connections), modified_query, header, context, throttler, scalars, external_tables, stage);
 
-                return createRemoteSourcePipe(remote_query_executor, add_agg_info, add_totals, add_extremes, async_read);
+                return createRemoteSourcePipe(remote_query_executor, add_agg_info, add_totals, add_extremes, async_read, context->getSettingsRef().resize_number_after_remote_source);
             }
         };
 

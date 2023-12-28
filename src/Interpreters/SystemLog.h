@@ -117,6 +117,7 @@ class MutationLog;
 class KafkaLog;
 class ProcessorsProfileLog;
 class ZooKeeperLog;
+class AutoStatsTaskLog;
 
 
 class ISystemLog
@@ -165,6 +166,9 @@ struct SystemLogs
 
     /// Used to log processors profiling
     std::shared_ptr<ProcessorsProfileLog> processors_profile_log;
+
+    /// Used to log auto statistics task log
+    std::shared_ptr<AutoStatsTaskLog> auto_stats_task_log;
 
     std::vector<ISystemLog *> logs;
 };
@@ -571,8 +575,8 @@ void SystemLog<LogElement>::prepareTable()
         auto ordinary_columns = LogElement::getNamesAndTypes();
         auto alias_columns = LogElement::getNamesAndAliases();
         auto query_context = Context::createCopy(context);
-        auto current_query = InterpreterCreateQuery::formatColumns(ordinary_columns, alias_columns,
-                                                                   ParserSettings::valueOf(query_context->getSettingsRef().dialect_type));
+        auto current_query = InterpreterCreateQuery::formatColumns(
+            ordinary_columns, alias_columns, ParserSettings::valueOf(query_context->getSettingsRef()));
 
         if (old_query->getTreeHash() != current_query->getTreeHash())
         {
@@ -619,7 +623,7 @@ void SystemLog<LogElement>::prepareTable()
         /// Create the table.
         LOG_DEBUG(log, "Creating new table {} for {}", description, LogElement::name());
         auto query_context = Context::createCopy(context);
-        auto create = getCreateTableQuery(ParserSettings::valueOf(query_context->getSettingsRef().dialect_type));
+        auto create = getCreateTableQuery(ParserSettings::valueOf(query_context->getSettingsRef()));
 
         query_context->makeQueryContext();
 
@@ -700,6 +704,7 @@ protected:
     const String cnch_table_name;
     UUID uuid;
     bool is_stop = false;
+    String server_vw_name;
 
     void prepareTable() override;
 
@@ -723,6 +728,7 @@ CnchSystemLog<LogElement>::CnchSystemLog(ContextPtr global_context_,
 {
     StoragePtr cnch_table = getContext()->getCnchCatalog()->getTable(*getContext(), database_name_, cnch_table_name, TxnTimestamp::maxTS());
     uuid = cnch_table->getStorageUUID();
+    server_vw_name = cnch_table->getServerVwName();
 
     if (global_context_->getServerType() == ServerType::cnch_server)
         table = std::move(cnch_table);
@@ -838,8 +844,8 @@ void CnchSystemLog<LogElement>::prepareTable()
 
         auto ordinary_columns = LogElement::getNamesAndTypes();
         auto alias_columns = LogElement::getNamesAndAliases();
-        auto current_query = InterpreterCreateQuery::formatColumns(ordinary_columns, alias_columns,
-                                                                   ParserSettings::valueOf(getContext()->getSettingsRef().dialect_type));
+        auto current_query = InterpreterCreateQuery::formatColumns(
+            ordinary_columns, alias_columns, ParserSettings::valueOf(getContext()->getSettingsRef()));
 
         if (old_query->getTreeHash() != current_query->getTreeHash())
         {
@@ -866,7 +872,7 @@ void CnchSystemLog<LogElement>::writeToCnchTable(Block & block, ContextMutablePt
     insert->table_id = table_id;
     ASTPtr query_ptr(insert.release());
 
-    auto host_with_port = getContext()->getCnchTopologyMaster()->getTargetServer(UUIDHelpers::UUIDToString(uuid), false);
+    auto host_with_port = getContext()->getCnchTopologyMaster()->getTargetServer(UUIDHelpers::UUIDToString(uuid), server_vw_name, false);
     auto host_address = host_with_port.getHost();
     auto host_port = host_with_port.rpc_port;
     auto server_client = query_context->getCnchServerClient(host_address, host_port);
@@ -956,7 +962,7 @@ StoragePtr CnchSystemLog<LogElement>::createCloudMergeTreeInMemory(const Storage
     ColumnsDescription columns = InterpreterCreateQuery::getColumnsDescription(*ast_create_query.columns_list->columns, context, /* attach= */ true);
 
     ContextMutablePtr mutable_context = Context::createCopy(context);
-    StoragePtr res = StorageFactory::instance().get(ast_create_query, "", mutable_context, mutable_context->getGlobalContext(), columns, {}, false);
+    StoragePtr res = StorageFactory::instance().get(ast_create_query, "", mutable_context, mutable_context->getGlobalContext(), columns, {}, {}, {}, false);
     return res;
 }
 

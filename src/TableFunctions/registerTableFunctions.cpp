@@ -42,7 +42,6 @@ void registerTableFunctions()
 
 #if USE_AWS_S3
     registerTableFunctionS3(factory);
-    registerTableFunctionS3Cluster(factory);
     registerTableFunctionCOS(factory);
 #endif
 
@@ -61,6 +60,12 @@ void registerTableFunctions()
 
 #if USE_LIBPQXX
     registerTableFunctionPostgreSQL(factory);
+#endif
+
+#if USE_HIVE
+    registerTableFunctionCnchHive(factory);
+    // registerTableFunctionCloudHive(factory);
+    registerTableFunctionHiveMetadata(factory);
 #endif
 
     registerTableFunctionDictionary(factory);

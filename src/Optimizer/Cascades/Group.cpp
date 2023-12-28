@@ -19,8 +19,10 @@
 #include <Optimizer/Cascades/CascadesOptimizer.h>
 #include <Optimizer/Cascades/GroupExpression.h>
 #include <Optimizer/Rule/Transformation/JoinEnumOnGraph.h>
-#include <QueryPlan/CTERefStep.h>
 #include <QueryPlan/AnyStep.h>
+#include <QueryPlan/CTERefStep.h>
+#include <Optimizer/Property/ConstantsDeriver.h>
+#include <Optimizer/DataDependency/DataDependencyDeriver.h>
 
 namespace DB
 {
@@ -37,7 +39,8 @@ void Group::addExpression(const GroupExprPtr & expression, CascadesContext & con
     {
         logical_expressions.emplace_back(expression);
         if (!(expression->getStep()->getType() == IQueryPlanStep::Type::Join
-              && dynamic_cast<const JoinStep &>(*expression->getStep()).supportReorder(context.isSupportFilter())))
+              && dynamic_cast<const JoinStep &>(*expression->getStep()).supportReorder(context.isSupportFilter())
+              && !dynamic_cast<const JoinStep &>(*expression->getStep()).isOrdered()))
         {
             join_sets.insert(JoinSet(id));
         }
@@ -45,15 +48,16 @@ void Group::addExpression(const GroupExprPtr & expression, CascadesContext & con
         if (expression->getStep()->getType() == IQueryPlanStep::Type::Join)
         {
             simple_children = false;
-            UInt32 children_table_scans = context.getMemo().getGroupById(expression->getChildrenGroups()[0])->max_table_scans
-                + context.getMemo().getGroupById(expression->getChildrenGroups()[0])->max_table_scans;
-            max_table_scans = std::max(max_table_scans, children_table_scans);
         }
 
         if (expression->getStep()->getType() == IQueryPlanStep::Type::TableScan)
         {
             is_table_scan = true;
-            max_table_scans = std::max(max_table_scans, 1u);
+            max_table_scans = std::max(max_table_scans, 1ul);
+            if (stats_derived && statistics.has_value())
+            {
+                max_table_scan_rows = std::max(max_table_scan_rows, (*statistics)->getRowCount());
+            }
         }
         if (expression->getStep()->getType() == IQueryPlanStep::Type::Projection && expression->getChildrenGroups().size() == 1)
         {
@@ -62,28 +66,51 @@ void Group::addExpression(const GroupExprPtr & expression, CascadesContext & con
 
         if (expression->getStep()->getType() == IQueryPlanStep::Type::CTERef)
         {
-            const auto & with_clause_step = dynamic_cast<const CTERefStep &>(*expression->getStep());
-            const auto & cte_def_contains_cte_ids = context.getMemo().getCTEDefGroupByCTEId(with_clause_step.getId())->getCTESet();
-            cte_set.emplace(with_clause_step.getId());
+            const auto & cte_ref_step = dynamic_cast<const CTERefStep &>(*expression->getStep());
+            auto cte_def_group = context.getMemo().getCTEDefGroupByCTEId(cte_ref_step.getId());
+            const auto & cte_def_contains_cte_ids = cte_def_group->getCTESet();
+            cte_set.emplace(cte_ref_step.getId());
             cte_set.insert(cte_def_contains_cte_ids.begin(), cte_def_contains_cte_ids.end());
+
+            max_table_scans = std::max(max_table_scans, cte_def_group->getMaxTableScans());
+            max_table_scan_rows = std::max(max_table_scan_rows, cte_def_group->getMaxTableScanRows());
         }
+
+        UInt64 children_table_scans = 0;
+        UInt64 children_table_scan_rows = 0;
         for (auto group_id : expression->getChildrenGroups())
-            for (auto cte_id : context.getMemo().getGroupById(group_id)->getCTESet())
+        {
+            auto child_group = context.getMemo().getGroupById(group_id);
+            for (auto cte_id : child_group->getCTESet())
                 cte_set.emplace(cte_id);
+            children_table_scans += child_group->getMaxTableScans();
+            children_table_scan_rows += child_group->getMaxTableScanRows();
+        }
+        max_table_scans = std::max(max_table_scans, children_table_scans);
+        max_table_scan_rows = std::max(max_table_scan_rows, children_table_scan_rows);
     }
 
-    if (!stats_derived)
+    if (!stats_derived && context.isEnableCbo())
     {
         std::vector<PlanNodeStatisticsPtr> children_stats;
+        InclusionDependency inclusion_dependency;
         std::vector<bool> is_table_scans;
         for (const auto & child : expression->getChildrenGroups())
         {
+            inclusion_dependency = inclusion_dependency | context.getMemo().getGroupById(child)->getDataDependency().value_or(DataDependency{}).getInclusionDependencyRef();
             children_stats.emplace_back(context.getMemo().getGroupById(child)->getStatistics().value_or(nullptr));
             simple_children &= context.getMemo().getGroupById(child)->isSimpleChildren();
             is_table_scans.emplace_back(context.getMemo().getGroupById(child)->isTableScan());
         }
-        statistics = CardinalityEstimator::estimate(
-            expression->getStep(), context.getCTEInfo(), children_stats, context.getContext(), simple_children, is_table_scans);
+        statistics = CardinalityEstimator::estimate(expression->getStep(), context.getCTEInfo(), children_stats, context.getContext(), simple_children, is_table_scans, inclusion_dependency);
+
+        if (expression->getStep()->getType() == IQueryPlanStep::Type::TableScan)
+        {
+            if (statistics.has_value())
+            {
+                max_table_scan_rows = std::max(max_table_scan_rows, (*statistics)->getRowCount());
+            }
+        }
 
         stats_derived = true;
     }
@@ -97,12 +124,30 @@ void Group::addExpression(const GroupExprPtr & expression, CascadesContext & con
             {
                 children.emplace_back(context.getMemo().getGroupById(child)->getEquivalences());
             }
-            equivalences = SymbolEquivalencesDeriver::deriveEquivalences(expression->getStep(), children);
+            equivalences = SymbolEquivalencesDeriver::deriveEquivalences(expression->getStep(), std::move(children));
         }
         else
         {
             equivalences = std::make_shared<SymbolEquivalences>();
         }
+    }
+    if (!constants.has_value())
+    {
+        std::vector<Constants> children;
+        for (const auto & child : expression->getChildrenGroups())
+        {
+            children.emplace_back(context.getMemo().getGroupById(child)->getConstants().value_or(Constants{}));
+        }
+        constants = ConstantsDeriver::deriveConstants(expression->getStep(), children, context.getCTEInfo(), context.getContext());
+    }
+    if (!data_dependency.has_value())
+    {
+        std::vector<DataDependency> children;
+        for (const auto & child : expression->getChildrenGroups())
+        {
+            children.emplace_back(context.getMemo().getGroupById(child)->getDataDependency().value_or(DataDependency{}));
+        }
+        data_dependency = DataDependencyDeriver::deriveDataDependency(expression->getStep(), children, context.getCTEInfo(), context.getContext());
     }
 }
 

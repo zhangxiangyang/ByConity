@@ -69,8 +69,8 @@ namespace
         query->names->push_back(user.getName());
         query->attach = attach_mode;
 
-        if (user.allowed_client_hosts != AllowedClientHosts::AnyHostTag{})
-            query->hosts = user.allowed_client_hosts;
+        // if (user.allowed_client_hosts != AllowedClientHosts::AnyHostTag{})
+        //     query->hosts = user.allowed_client_hosts;
 
         if (user.default_roles != RolesOrUsersSet::AllTag{})
         {
@@ -173,6 +173,8 @@ namespace
             create_query_limits.duration = limits.duration;
             create_query_limits.randomize_interval = limits.randomize_interval;
             for (auto resource_type : collections::range(Quota::MAX_RESOURCE_TYPE))
+                // collections::range is end exclusive
+                // coverity[overrun-local]
                 create_query_limits.max[resource_type] = limits.max[resource_type];
             query->all_limits.push_back(create_query_limits);
         }

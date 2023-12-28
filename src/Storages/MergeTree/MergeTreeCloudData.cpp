@@ -57,6 +57,9 @@ MergeTreeCloudData::MergeTreeCloudData(
         date_column_name_,
         merging_params_,
         std::move(settings_),
+        /// notice: cardinality of cloud merge tree table name is very high (including xids)
+        /// so if it's used in logger name, can lead to memleak
+        UUIDHelpers::UUIDToString(table_id_.uuid) + " (CloudMergeTree)",
         false, /// require_part_metadata
         false  /// attach
     )
@@ -194,6 +197,13 @@ void MergeTreeCloudData::loadDataParts(MutableDataPartsVector & parts, UInt64)
 
     loadDataPartsInParallel(parts);
 
+    // iterate visible data parts, collect the projections from their previous parts
+    for (auto & part : parts)
+    {
+        if (part->state == DataPartState::Committed)
+            part->gatherProjections();
+    }
+
     calculateColumnSizesImpl();
 
     // check bitmap index; reuse cnch_parallel_prefetching to check in parallel.
@@ -243,7 +253,7 @@ void MergeTreeCloudData::unloadOldPartsByTimestamp(Int64 expired_ts)
 
 void MergeTreeCloudData::loadDataPartsInParallel(MutableDataPartsVector & parts)
 {
-    if (parts.empty())
+    if (parts.empty() || !getSettings()->enable_prefetch_checksums)
         return;
 
     auto cnch_parallel_prefetching = getSettings()->cnch_parallel_prefetching ? getSettings()->cnch_parallel_prefetching : 16;
@@ -378,7 +388,7 @@ void MergeTreeCloudData::deactivateOutdatedParts()
 
         if (curr_part->isPartial() && curr_part->containsExactly(*prev_part))
         {
-            if (const auto & p = curr_part->tryGetPreviousPart())
+            if (const auto & p = curr_part->tryGetPreviousPart(); p && p != prev_part)
                 throw Exception("Part " + curr_part->name + " has already owned prev_part: " + p->name, ErrorCodes::LOGICAL_ERROR);
             curr_part->setPreviousPart(prev_part);
             deactivate_part(prev_jt);

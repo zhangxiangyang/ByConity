@@ -106,13 +106,13 @@ public:
             throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "First argument for function {} must be map.", getName());
 
         /// TODO: fix Map<Int32, Int32> KV case
-        if (map->getKeyType()->getName() != arguments[1].type->getName())
-            throw Exception(
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                "Second argument which type is {} for function {} does not match map key type {}.",
-                arguments[1].type->getName(),
-                getName(),
-                map->getKeyType()->getName());
+        // if (map->getKeyType()->getName() != arguments[1].type->getName())
+        //     throw Exception(
+        //         ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+        //         "Second argument which type is {} for function {} does not match map key type {}.",
+        //         arguments[1].type->getName(),
+        //         getName(),
+        //         map->getKeyType()->getName());
 
         return map->getValueTypeForImplicitColumn();
     }
@@ -327,8 +327,8 @@ public:
             + " SETTINGS  max_threads = 1";
         String query = "SELECT groupUniqArrayArray(ks) AS keys FROM ( " + inner_query + " )";
 
-        auto stream = executeQuery(query, context->getQueryContext(), true).getInputStream();
-        auto res = stream->read();
+        auto block_io = executeQuery(query, context->getQueryContext(), true);
+        auto res = block_io.getInputStream()->read();
         if (res)
         {
             Field field;
@@ -364,6 +364,8 @@ public:
     /// throw error when argument[0] column is Nullable(String)
     /// TODO : add Function Convert Nullable(String) column to String column
     bool useDefaultImplementationForNulls() const override { return false; }
+
+    bool isSuitableForConstantFolding() const override { return false; }
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
@@ -407,10 +409,8 @@ public:
                 /// skip space
                 while (curr != end && *curr == ' ')
                     ++curr;
-                /// No matched value, discard this key
-                if (curr == end)
-                    break;
 
+                /// will parse empty value if curr == end
                 auto parsed_value = parseStringValue(curr, end, item_delimiter);
 
                 /// skip space
@@ -565,7 +565,8 @@ struct ExtractMapWrapper
     }
 };
 
-void registerFunctionsByteMap(FunctionFactory & factory)
+#ifndef USE_COMMUNITY_MAP
+REGISTER_FUNCTION(ByteMap)
 {
     factory.registerFunction<FunctionMapElement>();
     factory.registerFunction<FunctionMapKeys>();
@@ -579,5 +580,6 @@ void registerFunctionsByteMap(FunctionFactory & factory)
     factory.registerFunction<FunctionExtractMapKey>();
     factory.registerFunction<FunctionExtractMapColumn>();
 }
+#endif
 
 }

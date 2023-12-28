@@ -118,7 +118,8 @@ std::vector<std::pair<String, DiskPtr>> HDFSDumper::fetchPartsFromRemote(const D
 
     String source_dir = Poco::URI(remote_path).getPath();
     std::vector<String> remote_files;
-    hdfs_filesystem->list(source_dir, remote_files);
+    std::vector<size_t> file_sizes;
+    hdfs_filesystem->list(source_dir, remote_files, file_sizes);
     ThreadPool pool;
     for (auto & file_name : remote_files)
     {
@@ -204,7 +205,7 @@ void HDFSDumper::getFileFromRemote(const String & remote_path, const String & lo
 {
     LOG_DEBUG(log, "Downloading remote file {} to local {}", remote_path, local_path);
     // open remote file for read
-    ReadBufferFromByteHDFS read_buffer(remote_path, false, hdfs_params);
+    ReadBufferFromByteHDFS read_buffer(remote_path, hdfs_params, false);
 
     // open local file for write
     FILE * fout = std::fopen(local_path.data(), "w+");

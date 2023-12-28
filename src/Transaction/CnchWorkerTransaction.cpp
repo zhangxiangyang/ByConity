@@ -37,7 +37,7 @@ CnchWorkerTransaction::CnchWorkerTransaction(const ContextPtr & context_, CnchSe
     checkServerClient();
     auto [start_ts, txn_id] = server_client->createTransaction();
     TransactionRecord record;
-    record.setID(txn_id).setInitiator(txnInitiatorToString(CnchTransactionInitiator::Worker)).setStatus(CnchTransactionStatus::Running);
+    record.setID(txn_id).setInitiator(txnInitiatorToString(CnchTransactionInitiator::Worker)).setStatus(CnchTransactionStatus::Running).setType(CnchTransactionType::Implicit);
     setTransactionRecord(std::move(record));
     is_initiator = true;
 }
@@ -50,7 +50,7 @@ CnchWorkerTransaction::CnchWorkerTransaction(
     checkServerClient();
     auto [start_ts, txn_id] = server_client->createTransactionForKafka(kafka_table_id, kafka_consumer_index);
     TransactionRecord record;
-    record.setID(txn_id).setStatus(CnchTransactionStatus::Running).setInitiator(txnInitiatorToString(CnchTransactionInitiator::Kafka));
+    record.setID(txn_id).setStatus(CnchTransactionStatus::Running).setInitiator(txnInitiatorToString(CnchTransactionInitiator::Kafka)).setType(CnchTransactionType::Implicit);
     setTransactionRecord(std::move(record));
     is_initiator = true;
 }
@@ -61,8 +61,19 @@ CnchWorkerTransaction::CnchWorkerTransaction(const ContextPtr & context_, const 
     String initiator = txnInitiatorToString(CnchTransactionInitiator::Server);
     TransactionRecord record;
     record.read_only = true;
-    record.setID(txn_id).setPrimaryID(primary_txn_id).setInitiator(initiator).setStatus(CnchTransactionStatus::Running);
+    record.setID(txn_id).setPrimaryID(primary_txn_id).setInitiator(initiator).setStatus(CnchTransactionStatus::Running).setType(CnchTransactionType::Implicit);
     setTransactionRecord(std::move(record));
+}
+
+CnchWorkerTransaction::CnchWorkerTransaction(const ContextPtr & context_, const TxnTimestamp & txn_id, CnchServerClientPtr client, const TxnTimestamp & primary_txn_id)
+    : ICnchTransaction(context_), server_client(std::move(client))
+{
+    checkServerClient();
+    String initiator = txnInitiatorToString(CnchTransactionInitiator::Server);
+    TransactionRecord record;
+    record.setID(txn_id).setPrimaryID(primary_txn_id).setInitiator(initiator).setStatus(CnchTransactionStatus::Running).setType(CnchTransactionType::Implicit);
+    setTransactionRecord(std::move(record));
+    is_initiator = true;
 }
 
 CnchWorkerTransaction::CnchWorkerTransaction(const ContextPtr & context_, StorageID kafka_table_id_)
@@ -177,6 +188,7 @@ TxnTimestamp CnchWorkerTransaction::commitV2()
 
     try
     {
+        assertLockAcquired();
         return commit();
     }
     catch (Exception & e)
@@ -228,8 +240,9 @@ TxnTimestamp CnchWorkerTransaction::commitV2()
         {
             LOG_DEBUG(log, "Transaction {} commit failed\n", txn_record.txnID().toUInt64());
             tryLogCurrentException(log, __PRETTY_FUNCTION__);
-            rollback();
-            throw;
+            // depends on kv implementation, such as bytekv, some error codes are uncertain case like LOCK_TIMEOUT, 
+            // instead of call the rollback explicitly, it is better to let server executes the clean logic to make sure the correct state transition.
+            throw e;
         }
     }
     catch (...)

@@ -30,7 +30,7 @@ namespace DB
  * - Sideways Information Passing for Push-Style Query Processing
  *
  * todo
- * - magic set work with dynamic filter.
+ * - magic set work with runtime Filter.
  * - magic set work with CTE.
  * - implement more push down rules if needed.
  */
@@ -39,9 +39,8 @@ class MagicSetRule : public Rule
 public:
     RuleType getType() const override = 0;
     PatternPtr getPattern() const override = 0;
-
     const std::vector<RuleType> & blockRules() const override;
-    bool isEnabled(ContextPtr context) override { return context->getSettingsRef().enable_magic_set; }
+    bool isEnabled(ContextPtr context) const override { return context->getSettingsRef().enable_magic_set; }
 
     /*
      * Build Magic Set as special join: Y filter join X.
@@ -85,7 +84,6 @@ class MagicSetForAggregation : public MagicSetRule
 public:
     RuleType getType() const override { return RuleType::MAGIC_SET_FOR_AGGREGATION; }
     String getName() const override { return "MAGIC_SET_FOR_AGGREGATION"; }
-
     PatternPtr getPattern() const override;
 
 protected:
@@ -121,11 +119,22 @@ class MagicSetForProjectionAggregation : public MagicSetRule
 public:
     RuleType getType() const override { return RuleType::MAGIC_SET_FOR_PROJECTION_AGGREGATION; }
     String getName() const override { return "MAGIC_SET_FOR_PROJECTION_AGGREGATION"; }
-
     PatternPtr getPattern() const override;
 
 protected:
     TransformResult transformImpl(PlanNodePtr node, const Captures & captures, RuleContext & context) override;
 };
+
+// class MagicSetForJoinAggregation : public MagicSetRule
+// {
+// public:
+//     RuleType getType() const override { return RuleType::MAGIC_SET_FOR_JOIN_AGGREGATION; }
+//     String getName() const override { return "MAGIC_SET_FOR_JOIN_AGGREGATION"; }
+
+//     PatternPtr getPattern() const override;
+
+// protected:
+//     TransformResult transformImpl(PlanNodePtr node, const Captures & captures, RuleContext & context) override;
+// };
 
 }

@@ -16,12 +16,15 @@
 #include <CloudServices/CnchServerClient.h>
 #include <Protos/DataModelHelpers.h>
 #include <Protos/cnch_server_rpc.pb.h>
-
+#include <Parsers/ASTSerDerHelper.h>
 #include <brpc/channel.h>
 #include <brpc/controller.h>
 #include <Storages/StorageCnchMergeTree.h>
 #include <Storages/StorageCloudMergeTree.h>
 #include <Interpreters/CnchQueryMetrics/QueryWorkerMetricLog.h>
+#include <Protos/auto_statistics.pb.h>
+#include "common/types.h"
+#include "Storages/MergeTree/MarkRange.h"
 
 
 namespace DB
@@ -155,6 +158,10 @@ std::pair<TxnTimestamp, TxnTimestamp> CnchServerClient::createTransactionForKafk
 ServerDataPartsVector CnchServerClient::fetchDataParts(const String & remote_host, const ConstStoragePtr & table, const Strings & partition_list, const TxnTimestamp & ts)
 {
     brpc::Controller cntl;
+    if (const auto * storage = dynamic_cast<const MergeTreeMetaBase *>(table.get()))
+        cntl.set_timeout_ms(storage->getSettings()->cnch_meta_rpc_timeout_ms);
+    else
+        cntl.set_timeout_ms(8 * 1000);
     Protos::FetchDataPartsReq request;
     Protos::FetchDataPartsResp response;
 
@@ -174,6 +181,46 @@ ServerDataPartsVector CnchServerClient::fetchDataParts(const String & remote_hos
 
     const auto & storage = dynamic_cast<const MergeTreeMetaBase &>(*table);
     return createServerPartsFromModels(storage, response.parts());
+}
+
+PrunedPartitions CnchServerClient::fetchPartitions(
+    const String & remote_host,
+    const ConstStoragePtr & table,
+    const SelectQueryInfo & query_info,
+    const Names & column_names,
+    const TxnTimestamp & txn_id)
+{
+    brpc::Controller cntl;
+    if (const auto * storage = dynamic_cast<const MergeTreeMetaBase *>(table.get()))
+        cntl.set_timeout_ms(storage->getSettings()->cnch_meta_rpc_timeout_ms);
+    else
+        cntl.set_timeout_ms(8 * 1000);
+
+    Protos::FetchPartitionsReq request;
+    Protos::FetchPartitionsResp response;
+
+    request.set_remote_host(remote_host);
+    request.set_database(table->getDatabaseName());
+    request.set_table(table->getTableName());
+    WriteBufferFromOwnString buff;
+    serializeAST(query_info.query, buff);
+    request.set_predicate(buff.str());
+
+    for (const auto & name : column_names)
+        request.add_column_name_filter(name);
+
+    request.set_txnid(txn_id.toUInt64());
+
+    stub->fetchPartitions(&cntl, &request, & response, nullptr);
+
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+
+    UInt64 total_size = response.total_size();
+    Strings fetched_partitions;
+    for (const auto & partition : response.partitions())
+        fetched_partitions.push_back(partition);
+    return PrunedPartitions{fetched_partitions, total_size};
 }
 
 void buildRedirectCommitRequestBase(
@@ -246,7 +293,147 @@ void CnchServerClient::redirectSetCommitTime(
     RPCHelpers::checkResponse(response);
 }
 
-TxnTimestamp CnchServerClient::commitParts(
+void CnchServerClient::redirectAttachDetachedS3Parts(
+        const StoragePtr & to_table,
+        const UUID & from_table_uuid,
+        const UUID & to_table_uuid,
+        const IMergeTreeDataPartsVector & commit_parts,
+        const IMergeTreeDataPartsVector & commit_staged_parts,
+        const Strings & detached_part_names,
+        const Strings & detached_bitmap_names,
+        const DeleteBitmapMetaPtrVector & detached_bitmaps,
+        const DeleteBitmapMetaPtrVector & bitmaps,
+        const DB::Protos::DetachAttachType & type)
+{
+    brpc::Controller cntl;
+    Protos::RedirectAttachDetachedS3PartsReq request;
+    Protos::RedirectAttachDetachedS3PartsResp response;
+
+    if (UUIDHelpers::Nil != from_table_uuid)
+        RPCHelpers::fillUUID(from_table_uuid, *request.mutable_from_table_uuid());
+
+    RPCHelpers::fillUUID(to_table_uuid, *request.mutable_to_table_uuid());
+
+    if (to_table)
+    {
+        for (auto & part : commit_parts)
+            fillPartModel(*to_table, *part, *request.add_commit_parts());
+
+        for (auto & part : commit_staged_parts)
+            fillPartModel(*to_table, *part, *request.add_commit_staged_parts());
+    }
+
+    for (auto & part_name : detached_part_names)
+        request.add_detached_part_names(part_name);
+
+    for (auto & bitmap_name : detached_bitmap_names)
+        request.add_detached_bitmap_names(bitmap_name);
+
+    for (auto & bitmap_meta: detached_bitmaps)
+    {
+        auto * new_bitmap = request.add_detached_bitmaps();
+        new_bitmap->CopyFrom(*(bitmap_meta->getModel()));
+    }
+
+    for (auto & bitmap_meta: bitmaps)
+    {
+        auto * new_bitmap = request.add_bitmaps();
+        new_bitmap->CopyFrom(*(bitmap_meta->getModel()));
+    }
+
+    request.set_type(type);
+
+    stub->redirectAttachDetachedS3Parts(&cntl, &request, &response, nullptr);
+
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+}
+
+
+void CnchServerClient::redirectDetachAttachedS3Parts(
+        const StoragePtr & to_table,
+        const UUID & from_table_uuid,
+        const UUID & to_table_uuid,
+        const IMergeTreeDataPartsVector & attached_parts,
+        const IMergeTreeDataPartsVector & attached_staged_parts,
+        const IMergeTreeDataPartsVector & commit_parts,
+        const Strings & attached_part_names,
+        const Strings & attached_bitmap_names,
+        const DeleteBitmapMetaPtrVector & attached_bitmaps,
+        const DeleteBitmapMetaPtrVector & bitmaps,
+        const std::vector<std::pair<String, String>> & detached_part_metas,
+        const std::vector<std::pair<String, String>> & detached_bitmap_metas,
+        const DB::Protos::DetachAttachType & type)
+{
+    brpc::Controller cntl;
+    Protos::RedirectDetachAttachedS3PartsReq request;
+    Protos::RedirectDetachAttachedS3PartsResp response;
+
+    if (UUIDHelpers::Nil != from_table_uuid)
+        RPCHelpers::fillUUID(from_table_uuid, *request.mutable_from_table_uuid());
+
+    RPCHelpers::fillUUID(to_table_uuid, *request.mutable_to_table_uuid());
+
+    if (to_table)
+    {
+        for (auto & part : commit_parts)
+        {
+            // add empty part model if part is nullptr
+            auto new_added_part = request.add_commit_parts();
+            if (part)
+            {
+                fillPartModel(*to_table, *part, *new_added_part);
+            }
+        }
+
+        for (auto & part : attached_parts)
+            fillPartModel(*to_table, *part, *request.add_attached_parts());
+
+        for (auto & part : attached_staged_parts)
+            fillPartModel(*to_table, *part, *request.add_attached_staged_parts());
+    }
+
+    for (auto & part_name : attached_part_names)
+        request.add_attached_part_names(part_name);
+    for (auto & bitmap_name : attached_bitmap_names)
+        request.add_attached_bitmap_names(bitmap_name);
+
+
+    for (auto & bitmap_meta: attached_bitmaps)
+    {
+        auto * new_bitmap = request.add_attached_bitmaps();
+        new_bitmap->CopyFrom(*(bitmap_meta->getModel()));
+    }
+
+    for (auto & bitmap_meta: bitmaps)
+    {
+        auto * new_bitmap = request.add_bitmaps();
+        new_bitmap->CopyFrom(*(bitmap_meta->getModel()));
+    }
+
+    for (auto & [name, meta] : detached_part_metas)
+    {
+        Protos::DetachMeta * meta_model = request.add_detached_part_metas();
+        meta_model->set_name(name);
+        meta_model->set_meta(meta);
+    }
+
+    for (auto & [name, meta] : detached_bitmap_metas)
+    {
+        Protos::DetachMeta * meta_model = request.add_detached_bitmap_metas();
+        meta_model->set_name(name);
+        meta_model->set_meta(meta);
+    }
+
+    request.set_type(type);
+
+    stub->redirectDetachAttachedS3Parts(&cntl, &request, &response, nullptr);
+
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+}
+
+void CnchServerClient::commitParts(
     const TxnTimestamp & txn_id,
     ManipulationType type,
     MergeTreeMetaBase & storage,
@@ -256,12 +443,13 @@ TxnTimestamp CnchServerClient::commitParts(
     const String & task_id,
     const bool from_server,
     const String & consumer_group,
-    const cppkafka::TopicPartitionList & tpl)
+    const cppkafka::TopicPartitionList & tpl,
+    const MySQLBinLogInfo & binlog)
 {
     /// TODO: check txn_id & start_ts
 
     brpc::Controller cntl;
-    cntl.set_timeout_ms(10 * 1000); /// TODO: from config
+    cntl.set_timeout_ms(storage.getSettings()->cnch_meta_rpc_timeout_ms);
     Protos::CommitPartsReq request;
     Protos::CommitPartsResp response;
 
@@ -274,10 +462,18 @@ TxnTimestamp CnchServerClient::commitParts(
     }
     else
     {
-        StorageCloudMergeTree & cloud_storage = dynamic_cast<StorageCloudMergeTree &>(storage);
-        request.set_database(cloud_storage.getCnchDatabase());
-        request.set_table(cloud_storage.getCnchTable());
-        RPCHelpers::fillUUID(cloud_storage.getStorageUUID(), *request.mutable_uuid());
+        if (auto * cnch_storage = dynamic_cast<StorageCnchMergeTree *>(&storage))
+        {
+            request.set_database(cnch_storage->getDatabaseName());
+            request.set_table(cnch_storage->getTableName());
+            RPCHelpers::fillUUID(cnch_storage->getStorageUUID(), *request.mutable_uuid());
+        }
+        else if (auto * cloud_storage = dynamic_cast<StorageCloudMergeTree *>(&storage))
+        {
+            request.set_database(cloud_storage->getCnchDatabase());
+            request.set_table(cloud_storage->getCnchTable());
+            RPCHelpers::fillUUID(cloud_storage->getStorageUUID(), *request.mutable_uuid());
+        }
     }
 
     request.set_type(UInt32(type));
@@ -312,6 +508,16 @@ TxnTimestamp CnchServerClient::commitParts(
         }
     }
 
+    /// add binlog for MaterializedMySQL
+    if (!binlog.binlog_file.empty())
+    {
+        auto * binlog_req = request.mutable_binlog();
+        binlog_req->set_binlog_file(binlog.binlog_file);
+        binlog_req->set_binlog_position(binlog.binlog_position);
+        binlog_req->set_executed_gtid_set(binlog.executed_gtid_set);
+        binlog_req->set_meta_version(binlog.meta_version);
+    }
+
     /// add delete bitmaps for table with unique key
     for (const auto & delete_bitmap : delete_bitmaps)
     {
@@ -322,11 +528,11 @@ TxnTimestamp CnchServerClient::commitParts(
     stub->commitParts(&cntl, &request, &response, nullptr);
     assertController(cntl);
     RPCHelpers::checkResponse(response);
-
-    return response.commit_timestamp();
 }
 
-TxnTimestamp CnchServerClient::precommitParts(
+/* This method commits from worker side, it split the commit parts in multiple batches to avoid rpc timeout for too many parts.
+   Note, it only applys to ManipulationType which supports 2pc, now we already separate txn commit from part commit */
+void CnchServerClient::precommitParts(
     ContextPtr context,
     const TxnTimestamp & txn_id,
     ManipulationType type,
@@ -337,15 +543,9 @@ TxnTimestamp CnchServerClient::precommitParts(
     const String & task_id,
     const bool from_server,
     const String & consumer_group,
-    const cppkafka::TopicPartitionList & tpl)
+    const cppkafka::TopicPartitionList & tpl,
+    const MySQLBinLogInfo & binlog)
 {
-    // TODO: this method only apply to ManipulationType which supports 2pc
-    if (type != ManipulationType::Insert)
-    {
-        // fallback to 1pc
-        return commitParts(txn_id, type, storage, parts, delete_bitmaps, staged_parts, task_id, from_server, consumer_group, tpl);
-    }
-
     const UInt64 batch_size = context->getSettingsRef().catalog_max_commit_size;
 
     // Precommit parts in batches {batch_begin, batch_end}
@@ -386,11 +586,9 @@ TxnTimestamp CnchServerClient::precommitParts(
             task_id,
             from_server,
             consumer_group,
-            tpl);
+            tpl,
+            binlog);
     }
-
-    // no commit_time for precommit
-    return {};
 }
 
 google::protobuf::RepeatedPtrField<DB::Protos::DataModelTableInfo>
@@ -480,7 +678,7 @@ void CnchServerClient::acquireLock(const LockInfoPtr & lock)
     Protos::AcquireLockReq request;
     Protos::AcquireLockResp response;
     // TODO: set a big enough waiting time
-    cntl.set_timeout_ms(10 * lock->timeout);
+    cntl.set_timeout_ms(3000 + (10 * lock->timeout));
     cntl.set_max_retry(0);
 
     fillLockInfoModel(*lock, *request.mutable_lock());
@@ -498,6 +696,19 @@ void CnchServerClient::releaseLock(const LockInfoPtr & lock)
 
     fillLockInfoModel(*lock, *request.mutable_lock());
     stub->releaseLock(&cntl, &request, &response, nullptr);
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+}
+
+void CnchServerClient::assertLockAcquired(const TxnTimestamp & txn_id, LockID lock_id)
+{
+    brpc::Controller cntl;
+    Protos::AssertLockReq request;
+    Protos::AssertLockResp response;
+
+    request.set_txn_id(txn_id);
+    request.set_lock_id(lock_id);
+    stub->assertLockAcquired(&cntl, &request, &response, nullptr);
     assertController(cntl);
     RPCHelpers::checkResponse(response);
 }
@@ -532,15 +743,16 @@ std::set<UUID> CnchServerClient::getDeletingTablesInGlobalGC()
     return res;
 }
 
-bool CnchServerClient::removeMergeMutateTasksOnPartition(const StorageID & storage_id, const String & partition_id)
+bool CnchServerClient::removeMergeMutateTasksOnPartitions(const StorageID & storage_id, const std::unordered_set<String> & partitions)
 {
     brpc::Controller cntl;
-    Protos::RemoveMergeMutateTasksOnPartitionReq request;
+    Protos::RemoveMergeMutateTasksOnPartitionsReq request;
     RPCHelpers::fillStorageID(storage_id, *request.mutable_storage_id());
-    request.set_partition_id(partition_id);
-    Protos::RemoveMergeMutateTasksOnPartitionResp response;
+    for (const auto & p : partitions)
+        request.add_partitions(p);
+    Protos::RemoveMergeMutateTasksOnPartitionsResp response;
 
-    stub->removeMergeMutateTasksOnPartition(&cntl, &request, &response, nullptr);
+    stub->removeMergeMutateTasksOnPartitions(&cntl, &request, &response, nullptr);
 
     assertController(cntl);
     return response.ret();
@@ -591,6 +803,75 @@ bool CnchServerClient::scheduleGlobalGC(const std::vector<Protos::DataModelTable
     return response.ret();
 }
 
+std::unordered_map<UUID, UInt64> CnchServerClient::queryUdiCounter()
+{
+    brpc::Controller cntl;
+    Protos::QueryUdiCounterReq request;
+    Protos::QueryUdiCounterResp response;
+    stub->queryUdiCounter(&cntl, &request, &response, nullptr);
+    RPCHelpers::checkResponse(response);
+    assertController(cntl);
+    std::unordered_map<UUID, UInt64> result;
+    assert(response.tables_size() == response.udi_counts_size());
+    for (int i = 0; i < response.tables_size(); ++i)
+    {
+        auto uuid = RPCHelpers::createUUID(response.tables(i));
+        auto count = response.udi_counts(i);
+        result[uuid] = count;
+    }
+
+    return result;
+}
+
+void CnchServerClient::redirectUdiCounter(const std::unordered_map<UUID, UInt64> & data)
+{
+    brpc::Controller cntl;
+    Protos::RedirectUdiCounterReq request;
+    for (auto & [k, v] : data)
+    {
+        auto uuid_ptr = request.add_tables();
+        RPCHelpers::fillUUID(k, *uuid_ptr);
+        request.add_udi_counts(v);
+    }
+    Protos::RedirectUdiCounterResp response;
+    stub->redirectUdiCounter(&cntl, &request, &response, nullptr);
+    RPCHelpers::checkResponse(response);
+    assertController(cntl);
+}
+
+void CnchServerClient::scheduleDistributeUdiCount()
+{
+    brpc::Controller cntl;
+    Protos::ScheduleDistributeUdiCountReq request;
+    Protos::ScheduleDistributeUdiCountResp response;
+
+    stub->scheduleDistributeUdiCount(&cntl, &request, &response, nullptr);
+    RPCHelpers::checkResponse(response);
+    assertController(cntl);
+}
+
+void CnchServerClient::scheduleAutoStatsCollect()
+{
+    brpc::Controller cntl;
+    Protos::ScheduleAutoStatsCollectReq request;
+    Protos::ScheduleAutoStatsCollectResp response;
+
+    stub->scheduleAutoStatsCollect(&cntl, &request, &response, nullptr);
+    RPCHelpers::checkResponse(response);
+    assertController(cntl);
+}
+void CnchServerClient::redirectAsyncStatsTasks(google::protobuf::RepeatedPtrField<Protos::AutoStats::TaskInfoCore> tasks)
+{
+    brpc::Controller cntl;
+    Protos::RedirectAsyncStatsTasksReq request;
+    *request.mutable_tasks() = std::move(tasks);
+    Protos::RedirectAsyncStatsTasksResp response;
+
+    stub->redirectAsyncStatsTasks(&cntl, &request, &response, nullptr);
+    RPCHelpers::checkResponse(response);
+    assertController(cntl);
+}
+
 UInt64 CnchServerClient::getNumOfTablesCanSendForGlobalGC()
 {
     brpc::Controller cntl;
@@ -632,6 +913,31 @@ void CnchServerClient::submitQueryWorkerMetrics(const QueryWorkerMetricElementPt
     RPCHelpers::checkResponse(response);
 }
 
+void CnchServerClient::submitPreloadTask(const MergeTreeMetaBase & storage, const MutableMergeTreeDataPartsCNCHVector & parts, UInt64 timeout_ms)
+{
+    if (parts.empty())
+        return;
+
+    brpc::Controller cntl;
+    Protos::SubmitPreloadTaskReq request;
+    request.set_ts(time(nullptr));
+
+    Protos::SubmitPreloadTaskResp response;
+    if (timeout_ms)
+        cntl.set_timeout_ms(timeout_ms);
+
+    RPCHelpers::fillUUID(storage.getStorageUUID(), *request.mutable_uuid());
+    for (const auto & part : parts)
+    {
+        auto new_part = request.add_parts();
+        fillPartModel(storage, *part, *new_part);
+    }
+
+    stub->submitPreloadTask(&cntl, &request, &response, nullptr);
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+}
+
 UInt32 CnchServerClient::reportDeduperHeartbeat(const StorageID & cnch_storage_id, const String & worker_table_name)
 {
     brpc::Controller cntl;
@@ -667,6 +973,86 @@ void CnchServerClient::executeOptimize(const StorageID & storage_id, const Strin
     }
 
     stub->executeOptimize(&cntl, &request, &response, nullptr);
+
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+}
+
+void CnchServerClient::notifyAccessEntityChange(IAccessEntity::Type type, const String & name, const UUID & uuid)
+{
+    brpc::Controller cntl;
+    Protos::notifyAccessEntityChangeReq request;
+    Protos::notifyAccessEntityChangeResp response;
+
+    request.set_type(toString(type));
+    request.set_name(name);
+    RPCHelpers::fillUUID(uuid, *request.mutable_uuid());
+    stub->notifyAccessEntityChange(&cntl, &request, &response, nullptr);
+}
+
+#if USE_MYSQL
+void CnchServerClient::submitMaterializedMySQLDDLQuery(
+    const String & database_name, const String & sync_thread, const String & query, const MySQLBinLogInfo & binlog)
+{
+    brpc::Controller cntl;
+    Protos::SubmitMaterializedMySQLDDLQueryReq request;
+    Protos::SubmitMaterializedMySQLDDLQueryResp response;
+
+    request.set_database_name(database_name);
+    request.set_thread_key(sync_thread);
+    request.set_ddl_query(query);
+
+    request.set_binlog_file(binlog.binlog_file);
+    request.set_binlog_position(binlog.binlog_position);
+    request.set_executed_gtid_set(binlog.executed_gtid_set);
+    request.set_meta_version(binlog.meta_version);
+
+    stub->submitMaterializedMySQLDDLQuery(&cntl, &request, &response, nullptr);
+
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+}
+
+void CnchServerClient::reportHeartBeatForSyncThread(const String & database_name, const String & sync_thread)
+{
+    brpc::Controller cntl;
+    Protos::ReportHeartbeatForSyncThreadReq request;
+    Protos::ReportHeartbeatForSyncThreadResp response;
+
+    request.set_database_name(database_name);
+    request.set_thread_key(sync_thread);
+
+    stub->reportHeartbeatForSyncThread(&cntl, &request, &response, nullptr);
+
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+}
+
+void CnchServerClient::reportSyncFailedForSyncThread(const String & database_name, const String & sync_thread)
+{
+    brpc::Controller cntl;
+    Protos::ReportSyncFailedForSyncThreadReq request;
+    Protos::ReportSyncFailedForSyncThreadResp response;
+
+    request.set_database_name(database_name);
+    request.set_thread_key(sync_thread);
+
+    stub->reportSyncFailedForSyncThread(&cntl, &request, &response, nullptr);
+
+    assertController(cntl);
+    RPCHelpers::checkResponse(response);
+}
+#endif
+
+void CnchServerClient::forceRecalculateMetrics(const StorageID & storage_id)
+{
+    brpc::Controller cntl;
+    Protos::ForceRecalculateMetricsReq request;
+    Protos::ForceRecalculateMetricsResp response;
+
+    RPCHelpers::fillStorageID(storage_id, *request.mutable_storage_id());
+
+    stub->forceRecalculateMetrics(&cntl, &request, &response, nullptr);
 
     assertController(cntl);
     RPCHelpers::checkResponse(response);

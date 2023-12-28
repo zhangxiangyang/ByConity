@@ -15,7 +15,7 @@
 
 #include <Transaction/Actions/MergeMutateAction.h>
 #include <Catalog/Catalog.h>
-#include <CloudServices/commitCnchParts.h>
+#include <CloudServices/CnchDataWriter.h>
 #include <Storages/StorageCnchMergeTree.h>
 
 namespace DB
@@ -50,6 +50,11 @@ void MergeMutateAction::executeV1(TxnTimestamp commit_time)
 
 void MergeMutateAction::executeV2()
 {
+    if (executed)
+        return;
+
+    executed = true;
+    
     auto * cnch_table = dynamic_cast<StorageCnchMergeTree *>(table.get());
     if (!cnch_table)
         throw Exception("Expected StorageCnchMergeTree, but got: " + table->getName(), ErrorCodes::LOGICAL_ERROR);
@@ -70,7 +75,7 @@ void MergeMutateAction::abort()
 {
     // clear parts in kv
     // skip part cache to avoid blocking by write lock of part cache for long time
-    global_context.getCnchCatalog()->clearParts(table, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps, /*staged_parts*/{}}, true);
+    global_context.getCnchCatalog()->clearParts(table, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps, /*staged_parts*/{}});
 }
 
 void MergeMutateAction::updatePartData(MutableMergeTreeDataPartCNCHPtr part, [[maybe_unused]] TxnTimestamp commit_time)

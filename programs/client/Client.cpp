@@ -69,11 +69,18 @@
 #include <Core/Types.h>
 #include <Core/QueryProcessingStage.h>
 #include <Core/ExternalTable.h>
+#include <DataStreams/InternalTextLogsRowOutputStream.h>
+#include <DataStreams/NullBlockOutputStream.h>
+#include <Formats/FormatFactory.h>
+#include <Formats/registerFormats.h>
+#include <Functions/registerFunctions.h>
+#include <IO/Operators.h>
+#include <IO/VETosCommon.h>
+#include <IO/OutfileCommon.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromFileDescriptor.h>
 #include <IO/WriteBufferFromFileDescriptor.h>
-#include <IO/WriteBufferFromFile.h>
-#include <Storages/HDFS/WriteBufferFromHDFS.h>
+#include <IO/OutfileCommon.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ZlibDeflatingWriteBuffer.h>
@@ -145,7 +152,7 @@ namespace ErrorCodes
     extern const int UNRECOGNIZED_ARGUMENTS;
     extern const int SYNTAX_ERROR;
     extern const int TOO_DEEP_RECURSION;
-    extern const int ILLEGAL_OUTPUT_PATH;
+    extern const int CANNOT_PARSE_DOMAIN_VALUE_FROM_STRING;
 }
 
 
@@ -227,14 +234,9 @@ private:
 
     std::optional<String> out_path;
     /// The user can specify to redirect query output to a file.
-    std::optional<WriteBufferFromFile> out_file_buf;
-    BlockOutputStreamPtr block_out_stream;
-#if USE_HDFS
-    /// The user can specify to redirect query output to local file.
-    std::unique_ptr<WriteBufferFromHDFS> out_hdfs_raw;
-    std::optional<ZlibDeflatingWriteBuffer> out_hdfs_buf;
-#endif
+    OutfileTargetPtr outfile_target;
 
+    BlockOutputStreamPtr block_out_stream;
     /// The user could specify special file for server logs (stderr by default)
     std::unique_ptr<WriteBuffer> out_logs_buf;
     String server_logs_file;
@@ -333,15 +335,17 @@ private:
             query_id_formats.emplace_back("Query id:", " {query_id}\n");
 #if USE_HDFS
         /// Init HDFS3 client config path
-        std::string hdfs_config = config().getString("hdfs3_config", "");
+        std::string hdfs_config = context->getCnchConfigRef().getString("hdfs3_config", "");
         if (!hdfs_config.empty())
         {
             setenv("LIBHDFS3_CONF", hdfs_config.c_str(), 1);
         }
 
-        HDFSConnectionParams hdfs_params = HDFSConnectionParams::parseHdfsFromConfig(config());
+        HDFSConnectionParams hdfs_params = HDFSConnectionParams::parseHdfsFromConfig(context->getCnchConfigRef());
         context->setHdfsConnectionParams(hdfs_params);
 #endif
+        auto vetos_params = VETosConnectionParams::parseVeTosFromConfig(config());
+        context->setVETosConnectParams(vetos_params);
     }
 
 
@@ -1445,7 +1449,8 @@ private:
 
             if (have_error)
             {
-                fmt::print(stderr, "Error on processing query '{}': {}\n", ast_to_process->formatForErrorMessage(), exception->message());
+                if (likely(ast_to_process))
+                    fmt::print(stderr, "Error on processing query '{}': {}\n", ast_to_process->formatForErrorMessage(), exception->message());
 
                 // Try to reconnect after errors, for two reasons:
                 // 1. We might not have realized that the server died, e.g. if
@@ -1840,7 +1845,7 @@ private:
     ASTPtr parseQuery(const char *& pos, const char * end, bool allow_multi_statements)
     {
         const auto & settings = context->getSettingsRef();
-        ParserQuery parser(end, ParserSettings::valueOf(settings.dialect_type));
+        ParserQuery parser(end, ParserSettings::valueOf(settings));
         ASTPtr res;
 
         size_t max_length = 0;
@@ -1992,6 +1997,7 @@ private:
     {
         block_out_stream.reset();
         logs_out_stream.reset();
+        outfile_target.reset();
 
         if (pager_cmd)
         {
@@ -1999,19 +2005,7 @@ private:
             pager_cmd->wait();
         }
         pager_cmd = nullptr;
-
-        if (out_file_buf)
-        {
-            out_file_buf->next();
-            out_file_buf.reset();
-        }
-#if USE_HDFS
-        if (out_hdfs_buf)
-        {
-            out_hdfs_buf->finalize();
-            out_hdfs_buf.reset();
-        }
-#endif
+        
         if (out_logs_buf)
         {
             out_logs_buf->next();
@@ -2256,40 +2250,32 @@ private:
 
             /// The query can specify output format or output file.
             /// FIXME: try to prettify this cast using `as<>()`
-            if (const auto * query_with_output = dynamic_cast<const ASTQueryWithOutput *>(parsed_query.get()))
+            if (const auto * query_with_output = dynamic_cast<const ASTQueryWithOutput *>(parsed_query.get());
+                query_with_output && !context->getSettingsRef().outfile_in_server_with_tcp)
             {
                 if (query_with_output->out_file)
                 {
                     // const auto & out_file_node = query_with_output->out_file->as<ASTLiteral &>();
                     // const auto & out_file = out_file_node.value.safeGet<std::string>();
-
+                    if (context->getSettingsRef().enable_async_execution)
+                    {
+                        throw Exception(
+                            "If you enable async execution on select query, please set outfile_in_server_with_tcp to 1 and make sure the "
+                            "outfile path is not local",
+                            ErrorCodes::BAD_ARGUMENTS);
+                    }
                     out_path.emplace(typeid_cast<const ASTLiteral &>(*query_with_output->out_file).value.safeGet<std::string>());
-                    const Poco::URI out_uri(*out_path);
-                    const String & scheme = out_uri.getScheme();
-
-                    if(scheme.empty())
-                    {
-                        out_file_buf.emplace(*out_path, DBMS_DEFAULT_BUFFER_SIZE, O_WRONLY | O_EXCL | O_CREAT);
-                        out_buf = &*out_file_buf;
-                    }
-#if USE_HDFS
-                    else if(isHdfsOrCfsScheme(scheme))
-                    {
-                        out_hdfs_raw = std::make_unique<WriteBufferFromHDFS>(*out_path,
-                            context->getHdfsConnectionParams(),
-                            context->getSettingsRef().max_hdfs_write_buffer_size);
-                        int compression_level = Z_DEFAULT_COMPRESSION;
-                        out_hdfs_buf.emplace(std::move(out_hdfs_raw), DB::CompressionMethod::Gzip, compression_level);
-                        out_buf = &*out_hdfs_buf;
-                    }
-#endif
-                    else
-                    {
-                        throw Exception("Path: " + *out_path + " is illegal, only support write query result to local file or tos", ErrorCodes::ILLEGAL_OUTPUT_PATH);
-                    }
                     // We are writing to file, so default format is the same as in non-interactive mode.
                     if (is_interactive && is_default_format)
                         current_format = "TabSeparated";
+
+                    String compression_method_str;
+                    UInt64 compression_level = 1;
+
+                    OutfileTarget::setOutfileCompression(query_with_output, compression_method_str, compression_level);
+
+                    outfile_target = OutfileTarget::getOutfileTarget(*out_path, "", compression_method_str, compression_level);
+                    out_buf = outfile_target->getOutfileBuffer(context, true).get();
                 }
                 if (query_with_output->format != nullptr)
                 {
@@ -2442,8 +2428,14 @@ private:
     {
         progress_indication.clearProgressOutput();
 
-        if (block_out_stream)
+        if (block_out_stream) {
             block_out_stream->writeSuffix();
+
+            if (outfile_target)
+            {
+                outfile_target->flushFile();
+            }
+        }
 
         if (logs_out_stream)
             logs_out_stream->writeSuffix();
@@ -2459,6 +2451,17 @@ private:
 
     static void showClientVersion()
     {
+        std::cout << R"(
+            ______       _       _   _                      
+            | ___ \     | |     | | | |                     
+            | |_/ /_   _| |_ ___| |_| | ___  _   _ ___  ___ 
+            | ___ \ | | | __/ _ \  _  |/ _ \| | | / __|/ _ \
+            | |_/ / |_| | ||  __/ | | | (_) | |_| \__ \  __/
+            \____/ \__, |\__\___\_| |_/\___/ \__,_|___/\___|
+                    __/ |                                   
+                    |___/                                                                                                                                                                                                                                        
+            )" << std::endl;
+
         std::cout << DBMS_NAME << " client version " << VERSION_STRING << VERSION_OFFICIAL << "." << std::endl;
     }
 
@@ -2592,7 +2595,7 @@ public:
             ("database,d", po::value<std::string>(), "database")
             ("pager", po::value<std::string>(), "pager")
             ("disable_suggestion,A", "Disable loading suggestion data. Note that suggestion data is loaded asynchronously through a second connection to ClickHouse server. Also it is reasonable to disable suggestion if you want to paste a query with TAB characters. Shorthand option -A is for those who get used to mysql client.")
-            ("suggestion_limit", po::value<int>()->default_value(10000),
+            ("suggestion_limit", po::value<int>()->default_value(0),
                 "Suggestion limit for how many databases, tables and columns to fetch.")
             ("multiline,m", "multiline")
             ("multiquery,n", "multiquery")
@@ -2699,6 +2702,9 @@ public:
 
         context->makeGlobalContext();
         context->applySettingsChanges(cmd_settings.changes());
+
+        auto & client_info = context->getClientInfo();
+        client_info.initial_user = options["user"].as<std::string>();
 
         /// Copy settings-related program options to config.
         /// TODO: Is this code necessary?

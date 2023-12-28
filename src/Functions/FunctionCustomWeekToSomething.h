@@ -28,7 +28,7 @@
 #include <Functions/IFunction.h>
 #include <Functions/TransformDateTime64.h>
 #include <IO/WriteHelpers.h>
-
+#include <Interpreters/Context.h>
 
 namespace DB
 {
@@ -46,7 +46,14 @@ class FunctionCustomWeekToSomething : public IFunction
 {
 public:
     static constexpr auto name = Transform::name;
-    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionCustomWeekToSomething>(); }
+    ContextPtr context_ptr;
+    bool mysql_mode = false;
+    explicit FunctionCustomWeekToSomething(ContextPtr context, bool is_mysql_mode) : context_ptr(context), mysql_mode(is_mysql_mode) { }
+
+    static FunctionPtr create(ContextPtr context)
+    {
+        return std::make_shared<FunctionCustomWeekToSomething>(context, context->getSettingsRef().dialect_type == DialectType::MYSQL);
+    }
 
     String getName() const override { return name; }
 
@@ -57,17 +64,17 @@ public:
     {
         if (arguments.size() == 1)
         {
-            if (!isDate(arguments[0].type) && !isDate32(arguments[0].type)
-                && !isDateTime(arguments[0].type) && !isDateTime64(arguments[0].type))
+            if (!isDate(arguments[0].type) && !isDate32(arguments[0].type) && !isDateTime(arguments[0].type)
+                && !isDateTime64(arguments[0].type) && !isStringOrFixedString(arguments[0].type))
                 throw Exception(
                     "Illegal type " + arguments[0].type->getName() + " of argument of function " + getName()
-                        + ". Must be Date, Date32, DateTime or DateTime64.",
+                        + ". Must be Date, Date32, DateTime, DateTime64 or String.",
                     ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
         }
         else if (arguments.size() == 2)
         {
-            if (!isDate(arguments[0].type) && !isDate32(arguments[0].type)
-                && !isDateTime(arguments[0].type) && !isDateTime64(arguments[0].type))
+            if (!isDate(arguments[0].type) && !isDate32(arguments[0].type) && !isDateTime(arguments[0].type)
+                && !isDateTime64(arguments[0].type) && !isStringOrFixedString(arguments[0].type))
                 throw Exception(
                     "Illegal type " + arguments[0].type->getName() + " of 1st argument of function " + getName()
                         + ". Must be Date, Date32, DateTime or DateTime64.",
@@ -80,8 +87,8 @@ public:
         }
         else if (arguments.size() == 3)
         {
-            if (!isDate(arguments[0].type) && !isDate32(arguments[0].type)
-                && !isDateTime(arguments[0].type) && !isDateTime64(arguments[0].type))
+            if (!isDate(arguments[0].type) && !isDate32(arguments[0].type) && !isDateTime(arguments[0].type)
+                && !isDateTime64(arguments[0].type) && !isStringOrFixedString(arguments[0].type))
                 throw Exception(
                     "Illegal type " + arguments[0].type->getName() + " of argument of function " + getName()
                         + ". Must be Date, Date32, DateTime or DateTime64.",
@@ -120,18 +127,36 @@ public:
 
         if (which.isDate())
             return CustomWeekTransformImpl<DataTypeDate, ToDataType>::execute(
-                arguments, result_type, input_rows_count, Transform{});
+                arguments, result_type, input_rows_count, Transform{}, mysql_mode);
         else if (which.isDate32())
             return CustomWeekTransformImpl<DataTypeDate32, ToDataType>::execute(
-                arguments, result_type, input_rows_count, Transform{});
+                arguments, result_type, input_rows_count, Transform{}, mysql_mode);
         else if (which.isDateTime())
             return CustomWeekTransformImpl<DataTypeDateTime, ToDataType>::execute(
-                arguments, result_type, input_rows_count, Transform{});
+                arguments, result_type, input_rows_count, Transform{}, mysql_mode);
         else if (which.isDateTime64())
         {
             return CustomWeekTransformImpl<DataTypeDateTime64, ToDataType>::execute(
-                arguments, result_type, input_rows_count,
-                TransformDateTime64<Transform>{assert_cast<const DataTypeDateTime64 *>(from_type)->getScale()});
+                arguments,
+                result_type,
+                input_rows_count,
+                TransformDateTime64<Transform>{assert_cast<const DataTypeDateTime64 *>(from_type)->getScale()},
+                mysql_mode);
+        }
+        else if (which.isStringOrFixedString())
+        {
+            ColumnsWithTypeAndName converted;
+            ColumnsWithTypeAndName temp{arguments[0]};
+            auto to_datetime = FunctionFactory::instance().get("toDateTime", context_ptr);
+            auto col = to_datetime->build(temp)->execute(temp, std::make_shared<DataTypeDateTime64>(0), input_rows_count);
+            ColumnWithTypeAndName converted_col(col, std::make_shared<DataTypeDateTime64>(0), "unixtime");
+            converted.emplace_back(converted_col);
+            for (size_t i = 1; i < arguments.size(); i++)
+            {
+                converted.emplace_back(arguments[i]);
+            }
+            return CustomWeekTransformImpl<DataTypeDateTime, ToDataType>::execute(
+                converted, result_type, input_rows_count, Transform{}, mysql_mode);
         }
         else
             throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,

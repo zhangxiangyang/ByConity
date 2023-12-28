@@ -1,6 +1,9 @@
 syntax = "proto2";
 package DB.Protos;
 
+import "data_models.proto";
+import "plan_node_utils.proto";
+
 option cc_generic_services = true;
 
 message CancelQueryRequest {
@@ -11,24 +14,53 @@ message CancelQueryRequest {
 message CancelQueryResponse {
   required string ret_code = 1;
   optional string message = 2;
+  optional string exception = 3;
 };
+
+message RuntimeSegmentsMetrics {
+      required int64 cpu_micros = 1;
+}
+
+message SendBytesByParallelIndex {
+  optional uint64 parallel_index = 1;
+  optional uint64 bytes_sent = 2;
+}
+
+message SendBytes {
+  optional uint64 exchange_id = 1;
+  repeated SendBytesByParallelIndex bytes_by_index = 2;
+}
+
+message SenderMetrics {
+  optional AddressInfo address = 1;
+  repeated SendBytes send_bytes = 2;
+}
 
 message SendPlanSegmentStatusRequest {
   required string query_id = 1;
   required int32 segment_id = 2;
   required bool is_succeed = 3;
   required bool is_canceled = 4;
-  required int32 code = 5;
-  optional string message = 6;
+  optional RuntimeSegmentsMetrics metrics = 5;
+  required int32 code = 6;
+  optional string message = 7;
+  optional uint64 parallel_index = 8;
+  optional SenderMetrics sender_metrics = 9;
 }
 
 message SendPlanSegmentStatusResponse {
   optional string message = 1;
 }
 
+message TraceMeta {
+  required string traceparent = 1;
+  required string tracestate = 2;
+}
+
 message ExecutePlanSegmentRequest {
   // version number for plan segment serialize and deserialize
-  required uint32 brpc_protocol_revision = 1;
+  required uint32 brpc_protocol_minor_revision = 1;
+
   // the starting time of a distributed query
   required int64 initial_query_start_time = 2;
   // per query settings
@@ -66,9 +98,49 @@ message ExecutePlanSegmentRequest {
 
   // Cnch Transaction ID
   required uint64 txn_id = 24;
+
+  optional uint32 brpc_protocol_major_revision = 25;
+  optional uint64 primary_txn_id = 26;
+  // Opentelemetry protocol v2
+  optional TraceMeta trace_meta = 27;
+
+  optional string initial_user = 28;
+  optional bool check_session = 29;
 }
 
 message ExecutePlanSegmentResponse {
+  optional string message = 1;
+  optional WorkerNodeResourceData worker_resource_data = 2;
+  optional string address = 3;
+  optional string exception = 4;
+}
+
+message ReportProcessorProfileMetricRequest {
+  required uint64 event_time = 1;
+  required uint64 event_time_microseconds = 2;
+  required string query_id = 3;
+  required uint64 id = 4;
+  repeated uint64 parent_ids = 5;
+  required uint64 plan_step = 6;
+  required uint64 plan_group = 7;
+  required string processor_name = 8;
+  required uint32 elapsed_us = 9;
+  required uint32 input_wait_elapsed_us = 10;
+  required uint32 output_wait_elapsed_us = 11;
+  required uint64 input_rows = 12;
+  required uint64 input_bytes = 13;
+  required uint64 output_rows = 14;
+  required uint64 output_bytes = 15;
+  required int64 step_id = 16;
+  required string worker_address = 17;
+}
+
+message BatchReportProcessorProfileMetricRequest {
+  required string query_id = 1;
+  repeated ReportProcessorProfileMetricRequest request = 2;
+}
+
+message ReportProcessorProfileMetricResponse {
   optional string message = 1;
 }
 
@@ -79,4 +151,8 @@ service PlanSegmentManagerService {
   rpc cancelQuery(CancelQueryRequest) returns (CancelQueryResponse);
 
   rpc sendPlanSegmentStatus(SendPlanSegmentStatusRequest) returns (SendPlanSegmentStatusResponse);
+
+  rpc reportProcessorProfileMetrics(ReportProcessorProfileMetricRequest) returns (ReportProcessorProfileMetricResponse);
+
+  rpc batchReportProcessorProfileMetrics(BatchReportProcessorProfileMetricRequest) returns (ReportProcessorProfileMetricResponse);
 };

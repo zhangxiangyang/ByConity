@@ -22,8 +22,8 @@
 #include <Storages/MergeTree/MergeTreeBaseSelectProcessor.h>
 #include <Storages/MergeTree/MergeTreeRangeReader.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
-#include <Storages/MergeTree/IMergeTreeReader.h>
 #include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
+#include <Storages/MergeTree/Index/MergeTreeBitmapIndexReader.h>
 #include <Columns/FilterDescription.h>
 #include <Common/typeid_cast.h>
 #include <Common/escapeForFileName.h>
@@ -42,6 +42,7 @@ namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_COLUMN_FOR_FILTER;
     extern const int LOGICAL_ERROR;
+    extern const int INVALID_BITMAP_INDEX_READER;
 }
 
 
@@ -49,7 +50,7 @@ MergeTreeBaseSelectProcessor::MergeTreeBaseSelectProcessor(
     Block header,
     const MergeTreeMetaBase & storage_,
     const StorageMetadataPtr & metadata_snapshot_,
-    const PrewhereInfoPtr & prewhere_info_,
+    const SelectQueryInfo & query_info_,
     ExpressionActionsSettings actions_settings,
     UInt64 max_block_size_rows_,
     UInt64 preferred_block_size_bytes_,
@@ -57,10 +58,11 @@ MergeTreeBaseSelectProcessor::MergeTreeBaseSelectProcessor(
     const MergeTreeReaderSettings & reader_settings_,
     bool use_uncompressed_cache_,
     const Names & virt_column_names_)
-    : SourceWithProgress(transformHeader(std::move(header), prewhere_info_, storage_.getPartitionValueType(), virt_column_names_))
+    : SourceWithProgress(transformHeader(std::move(header), getPrewhereInfo(query_info_), storage_.getPartitionValueType(), virt_column_names_, getIndexContext(query_info_), query_info_.read_bitmap_index))
     , storage(storage_)
     , metadata_snapshot(metadata_snapshot_)
-    , prewhere_info(prewhere_info_)
+    , prewhere_info(getPrewhereInfo(query_info_))
+    , index_context(getIndexContext(query_info_))
     , max_block_size_rows(max_block_size_rows_)
     , preferred_block_size_bytes(preferred_block_size_bytes_)
     , preferred_max_column_in_block_size_bytes(preferred_max_column_in_block_size_bytes_)
@@ -90,6 +92,21 @@ MergeTreeBaseSelectProcessor::MergeTreeBaseSelectProcessor(
         prewhere_actions->prewhere_column_name = prewhere_info->prewhere_column_name;
         prewhere_actions->remove_prewhere_column = prewhere_info->remove_prewhere_column;
         prewhere_actions->need_filter = prewhere_info->need_filter;
+
+        LOG_TRACE(
+            &Poco::Logger::get("MergeTreeBaseSelectProcessor"),
+            "Prewhere column = {}, actions = {} ",
+            prewhere_info->prewhere_column_name,
+            prewhere_info->prewhere_actions->dumpDAG());
+    }
+    if (index_context)
+    {
+        auto * bitmap_index_info = dynamic_cast<BitmapIndexInfo *>(index_context->get(MergeTreeIndexInfo::Type::BITMAP).get());
+        if (bitmap_index_info)
+        {
+            const auto & name_set = bitmap_index_info->index_column_name_set;
+            bitmap_index_columns_superset.insert(name_set.begin(), name_set.end());
+        }
     }
 }
 
@@ -116,33 +133,139 @@ Chunk MergeTreeBaseSelectProcessor::generate()
 
 void MergeTreeBaseSelectProcessor::initializeRangeReaders(MergeTreeReadTask & current_task)
 {
-    if (metadata_snapshot->hasUniqueKey() && !task->delete_bitmap)
-        throw Exception("Expected delete bitmap exists for a unique table part: " + task->data_part->name, ErrorCodes::LOGICAL_ERROR);
-
+    size_t filtered_ratio_to_use_skip_read = reader_settings.read_settings.filtered_ratio_to_use_skip_read;
     if (prewhere_info)
     {
-        if (reader->getColumns().empty())
+        if (reader->getColumns().empty() && !reader->hasBitmapIndexReader())
         {
-            current_task.range_reader = MergeTreeRangeReader(pre_reader.get(), nullptr, prewhere_actions.get(), task->delete_bitmap, true);
+            current_task.range_reader = MergeTreeRangeReader(pre_reader.get(), nullptr, prewhere_actions.get(), task->delete_bitmap, true, filtered_ratio_to_use_skip_read);
         }
         else
         {
             MergeTreeRangeReader * pre_reader_ptr = nullptr;
             if (pre_reader != nullptr)
             {
-                current_task.pre_range_reader = MergeTreeRangeReader(pre_reader.get(), nullptr, prewhere_actions.get(), task->delete_bitmap, false);
+                current_task.pre_range_reader = MergeTreeRangeReader(pre_reader.get(), nullptr, prewhere_actions.get(), task->delete_bitmap, false, filtered_ratio_to_use_skip_read);
                 pre_reader_ptr = &current_task.pre_range_reader;
             }
 
-            current_task.range_reader = MergeTreeRangeReader(reader.get(), pre_reader_ptr, nullptr, task->delete_bitmap, true);
+            current_task.range_reader = MergeTreeRangeReader(reader.get(), pre_reader_ptr, nullptr, task->delete_bitmap, true, filtered_ratio_to_use_skip_read);
         }
     }
     else
     {
-        current_task.range_reader = MergeTreeRangeReader(reader.get(), nullptr, nullptr, task->delete_bitmap, true);
+        current_task.range_reader = MergeTreeRangeReader(reader.get(), nullptr, nullptr, task->delete_bitmap, true, filtered_ratio_to_use_skip_read);
     }
 }
 
+void MergeTreeBaseSelectProcessor::initializeReaders(
+    const MarkRanges & mark_ranges,
+    const IMergeTreeReader::ValueSizeMap & avg_value_size_hints,
+    const ReadBufferFromFileBase::ProfileCallback & profile_callback)
+{
+    if (use_uncompressed_cache)    
+        owned_uncompressed_cache = storage.getContext()->getUncompressedCache();
+
+    owned_mark_cache = storage.getContext()->getMarkCache();
+
+    if (!task->task_columns.bitmap_index_columns.empty())
+    {
+        index_executor = index_context ? 
+            index_context->getIndexExecutor(
+                task->data_part,
+                task->data_part->index_granularity,
+                storage.getSettings()->bitmap_index_segment_granularity,
+                storage.getSettings()->bitmap_index_serializing_granularity,
+                mark_ranges) : nullptr;
+        if (index_executor && index_executor->valid())
+            index_executor->initReader(MergeTreeIndexInfo::Type::BITMAP, task->task_columns.bitmap_index_columns);
+        else
+        {
+            throw Exception(
+                "Need to read bitmap index columns, but bitmap index reader is invalid. "
+                "Maybe memory limit exceeded, try again later",
+                ErrorCodes::INVALID_BITMAP_INDEX_READER);
+        }
+    }
+    else
+    {
+        /**
+         * if the current task has no bitmap-index (the current part has no bitmap-index), 
+         * but still has a bitmap-index reader,
+         * it means the current thread read a part with bitmap-index before, thus we need reset bitmap-index.
+         * 
+         */
+        if (index_executor)
+            index_executor.reset();
+    }
+
+    reader = task->data_part->getReader(
+        task->task_columns.columns,
+        metadata_snapshot,
+        mark_ranges,
+        owned_uncompressed_cache.get(),
+        owned_mark_cache.get(),
+        reader_settings,
+        index_executor.get(),
+        avg_value_size_hints,
+        profile_callback,
+        internal_progress_callback);
+
+    if (prewhere_info)
+    {
+        if (!task->task_columns.bitmap_index_pre_columns.empty())
+        {
+            pre_index_executor = prewhere_info->index_context ? 
+                prewhere_info->index_context->getIndexExecutor(
+                    task->data_part,
+                    task->data_part->index_granularity,
+                    storage.getSettings()->bitmap_index_segment_granularity,
+                    storage.getSettings()->bitmap_index_serializing_granularity, 
+                    mark_ranges) : nullptr;
+            if (pre_index_executor && pre_index_executor->valid())
+                pre_index_executor->initReader(MergeTreeIndexInfo::Type::BITMAP, task->task_columns.bitmap_index_pre_columns);
+            else
+            {
+                throw Exception(
+                    "Need to read prewhere bitmap index columns, but prewhere bitmap index reader is invalid. "
+                    "Maybe memory limit exceeded, try again later",
+                    ErrorCodes::INVALID_BITMAP_INDEX_READER);
+            }
+        }
+        else
+        {
+            if (pre_index_executor)
+                pre_index_executor.reset();
+        }
+
+        pre_reader = task->data_part->getReader(
+            task->task_columns.pre_columns,
+            metadata_snapshot,
+            mark_ranges,
+            owned_uncompressed_cache.get(),
+            owned_mark_cache.get(),
+            reader_settings,
+            pre_index_executor.get(),
+            avg_value_size_hints,
+            profile_callback,
+            internal_progress_callback);
+    }
+}
+
+// add mark ranges into segment bitmap grabed from the pool
+void MergeTreeBaseSelectProcessor::insertMarkRangesForSegmentBitmapIndexFunctions(
+    MergeTreeIndexExecutorPtr & index_executor_,
+    const MarkRanges & mark_ranges_inc)
+{
+    if (!index_executor_)
+        return;
+
+    auto bitmap_index_reader = index_executor_->getReader(MergeTreeIndexInfo::Type::BITMAP);
+    if (!bitmap_index_reader || !bitmap_index_reader->validIndexReader())
+        return;
+
+    bitmap_index_reader->addSegmentIndexesFromMarkRanges(mark_ranges_inc);
+}
 
 Chunk MergeTreeBaseSelectProcessor::readFromPartImpl()
 {
@@ -228,11 +351,39 @@ Chunk MergeTreeBaseSelectProcessor::readFromPartImpl()
     /// Reorder columns. TODO: maybe skip for default case.
     for (size_t ps = 0; ps < header_without_virtual_columns.columns(); ++ps)
     {
-        auto pos_in_sample_block = sample_block.getPositionByName(header_without_virtual_columns.getByPosition(ps).name);
-        ordered_columns.emplace_back(std::move(read_result.columns[pos_in_sample_block]));
+        const auto & name = header_without_virtual_columns.getByPosition(ps).name;
+        if (sample_block.has(name))
+        {
+            auto pos_in_sample_block = sample_block.getPositionByName(name);
+            ordered_columns.emplace_back(std::move(read_result.columns[pos_in_sample_block]));
+            if (read_result.bitmap_block.has(name))
+                read_result.bitmap_block.erase(name);
+
+        }
+        /// for bitmap index result column
+        else if (read_result.bitmap_block.has(name))
+        {
+            ordered_columns.emplace_back(std::move(read_result.bitmap_block.getByName(name).column));
+            read_result.bitmap_block.erase(name);
+        }
+        else if (!bitmap_index_columns_superset.contains(name))
+        {
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Cannot find columns " + name + " in result block");
+        }
+        else
+        {
+            ordered_columns.emplace_back(header_without_virtual_columns.getByPosition(ps).type->createColumnConstWithDefaultValue(read_result.num_rows));
+        }
     }
 
-    return Chunk(std::move(ordered_columns), read_result.num_rows);
+    auto chunk = Chunk(std::move(ordered_columns), read_result.num_rows);
+    /// When this function is call, sure task is not null
+    for (auto && col : read_result.bitmap_block)
+        chunk.addColumnToSideBlock(std::move(col));
+
+    return chunk;
 }
 
 
@@ -254,6 +405,7 @@ namespace
         virtual void insertArrayOfStringsColumn(const ColumnPtr & column, const String & name) = 0;
         virtual void insertStringColumn(const ColumnPtr & column, const String & name) = 0;
         virtual void insertUInt64Column(const ColumnPtr & column, const String & name) = 0;
+        virtual void insertUInt8Column(const ColumnPtr & column, const String & name) = 0;
         virtual void insertUUIDColumn(const ColumnPtr & column, const String & name) = 0;
 
         virtual void insertPartitionValueColumn(
@@ -379,6 +531,11 @@ namespace
         {
             block.insert({column, std::make_shared<DataTypeUInt64>(), name});
         }
+        
+        void insertUInt8Column(const ColumnPtr & column, const String & name) final
+        {
+            block.insert({column, std::make_shared<DataTypeUInt8>(), name});
+        }
 
         void insertUUIDColumn(const ColumnPtr & column, const String & name) final
         {
@@ -390,10 +547,17 @@ namespace
         {
             ColumnPtr column;
             if (rows)
+            {
+                //Tuple is just a vector hence
+                //partition_value.begin() and .end() is used here to initialize Tuple
+                //coverity[mismatched_iterator]
                 column = partition_value_type->createColumnConst(rows, Tuple(partition_value.begin(), partition_value.end()))
                              ->convertToFullColumnIfConst();
+            }
             else
+            {
                 column = partition_value_type->createColumn();
+            }
 
             block.insert({column, partition_value_type, name});
         }
@@ -420,6 +584,11 @@ namespace
             columns.push_back(column);
         }
 
+        void insertUInt8Column(const ColumnPtr & column, const String &) final
+        {
+            columns.push_back(column);
+        }
+
         void insertUUIDColumn(const ColumnPtr & column, const String &) final
         {
             columns.push_back(column);
@@ -430,10 +599,17 @@ namespace
         {
             ColumnPtr column;
             if (rows)
+            {
+                //Tuple is just a vector hence
+                //.begin() and .end() is used here to initialize Tuple with the contents in the range
+                //coverity[mismatched_iterator]
                 column = partition_value_type->createColumnConst(rows, Tuple(partition_value.begin(), partition_value.end()))
                              ->convertToFullColumnIfConst();
+            }
             else
+            {
                 column = partition_value_type->createColumn();
+            }
             columns.push_back(column);
         }
 
@@ -461,8 +637,18 @@ void MergeTreeBaseSelectProcessor::injectVirtualColumns(
 }
 
 Block MergeTreeBaseSelectProcessor::transformHeader(
-    Block block, const PrewhereInfoPtr & prewhere_info, const DataTypePtr & partition_value_type, const Names & virtual_columns)
+    Block block, const PrewhereInfoPtr & prewhere_info, const DataTypePtr & partition_value_type, const Names & virtual_columns, const MergeTreeIndexContextPtr & index_context_, bool read_bitmap_index)
 {
+    auto * bitmap_index_info = index_context_ ? dynamic_cast<BitmapIndexInfo *>(index_context_->get(MergeTreeIndexInfo::Type::BITMAP).get()) : nullptr;
+    if (bitmap_index_info)
+    {
+        if (auto projection_index_action = index_context_->getProjectionActions(false); projection_index_action && read_bitmap_index)
+        {
+            auto projection_index_expression = std::make_shared<ExpressionActions>(projection_index_action);
+            projection_index_expression->execute(block);
+        }
+        block = bitmap_index_info->updateHeader(std::move(block));
+    }
     if (prewhere_info)
     {
         if (prewhere_info->alias_actions)

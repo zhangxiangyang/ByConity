@@ -60,11 +60,14 @@ struct DataTypeWithConstInfo
 
 using DataTypesWithConstInfo = std::vector<DataTypeWithConstInfo>;
 
-
 #define TYPE_MAP_KV_STORE_FLAG      0x01
-#define TYPE_SECURITY_FLAG          0x04  /// unused
-#define TYPE_ENCRYPT_FLAG           0x08  /// unused
+#define TYPE_BITENGINE_ENCODE_FLAG  0x02
+// #define TYPE_SECURITY_FLAG          0x04  /// unused
+// #define TYPE_ENCRYPT_FLAG           0x08  /// unused
+#define TYPE_BLOOM_FLAG             0x10
 #define TYPE_COMPRESSION_FLAG       0x20
+#define TYPE_BITMAP_INDEX_FLAG          0x40
+#define TYPE_SEGMENT_BITMAP_INDEX_FLAG  0x80
 
 /** Properties of data type.
   *
@@ -302,6 +305,9 @@ public:
 
     bool isCompression() const { return flags & TYPE_COMPRESSION_FLAG;}
 
+    bool isBitmapIndex() const { return flags & TYPE_BITMAP_INDEX_FLAG || flags & TYPE_BLOOM_FLAG; }
+    bool isSegmentBitmapIndex() const { return flags & TYPE_SEGMENT_BITMAP_INDEX_FLAG; }
+
     virtual bool lowCardinality() const { return false; }
 
     /// Strings, Numbers, Date, DateTime, Nullable
@@ -333,6 +339,10 @@ public:
             flags ^= flag;
     }
 
+    /// Checks if this type is LowCardinality(Nullable(...))
+    virtual bool isLowCardinalityNullable() const { return false; }
+
+    bool isBitEngineEncode() const { return flags & TYPE_BITENGINE_ENCODE_FLAG; }
 protected:
     friend class DataTypeFactory;
     friend class AggregateFunctionSimpleState;
@@ -390,6 +400,8 @@ struct WhichDataType
     constexpr bool isFloat64() const { return idx == TypeIndex::Float64; }
     constexpr bool isFloat() const { return isFloat32() || isFloat64(); }
 
+    constexpr bool isNumber() const { return isInt() || isUInt() || isFloat() || isDecimal(); }
+
     constexpr bool isEnum8() const { return idx == TypeIndex::Enum8; }
     constexpr bool isEnum16() const { return idx == TypeIndex::Enum16; }
     constexpr bool isEnum() const { return isEnum8() || isEnum16(); }
@@ -399,8 +411,8 @@ struct WhichDataType
     constexpr bool isTime() const { return idx == TypeIndex::Time; }
     constexpr bool isDateTime() const { return idx == TypeIndex::DateTime; }
     constexpr bool isDateTime64() const { return idx == TypeIndex::DateTime64; }
-    bool isDateOrDateTime() const { return isDate() || isDateTime() || isDateTime64(); }
     constexpr bool isDateOrDate32() const { return isDate() || isDate32(); }
+    constexpr bool isDateOrDateTime() const { return isDate() || isDate32() || isDateTime() || isDateTime64(); }
 
     constexpr bool isString() const { return idx == TypeIndex::String; }
     constexpr bool isFixedString() const { return idx == TypeIndex::FixedString; }
@@ -540,6 +552,13 @@ inline bool isStringOrFixedString(const T & data_type)
 }
 
 template <typename T>
+inline bool isNumberOrString(const T & data_type)
+{
+    WhichDataType which(data_type);
+    return which.isNumber() || which.isStringOrFixedString();
+}
+
+template <typename T>
 inline bool isNotCreatable(const T & data_type)
 {
     WhichDataType which(data_type);
@@ -555,6 +574,21 @@ inline bool isNotDecimalButComparableToDecimal(const DataTypePtr & data_type)
 inline bool isCompilableType(const DataTypePtr & data_type)
 {
     return data_type->isValueRepresentedByNumber() && !isDecimal(data_type);
+}
+
+inline bool isBool(const DataTypePtr & data_type)
+{
+    return data_type->getName() == "Bool";
+}
+
+inline bool isBitEngineDataType(const DataTypePtr & data_type)
+{
+    return isBitmap64(data_type) && data_type->isBitEngineEncode();
+}
+
+inline bool isNullableOrLowCardinalityNullable(const DataTypePtr & data_type)
+{
+    return data_type->isNullable() || data_type->isLowCardinalityNullable();
 }
 
 template <typename DataType> constexpr bool IsDataTypeDecimal = false;

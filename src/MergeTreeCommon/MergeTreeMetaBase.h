@@ -19,18 +19,22 @@
 #include <Storages/IStorage.h>
 #include <Storages/MergeTree/MergeTreeDataFormatVersion.h>
 #include <Storages/extractKeyExpressionList.h>
+#include <Storages/MergeTree/CnchMergeTreeMutationEntry.h>
 #include <Storages/MergeTree/PinnedPartUUIDs.h>
 #include <Storages/MergeTree/MergeTreeMeta.h>
+#include <Storages/BitEngine/BitEngineHelper.h>
 #include <MergeTreeCommon/IMergeTreePartMeta.h>
 #include <Processors/Merges/Algorithms/Graphite.h>
 #include <Common/SimpleIncrement.h>
+#include <Transaction/TxnTimestamp.h>
 #include <Disks/StoragePolicy.h>
-
 
 namespace DB
 {
 
 class MutationCommands;
+class BitEngineDictionaryManager;
+using BitEngineDictionaryManagerPtr = std::shared_ptr<BitEngineDictionaryManager>;
 
 class MergeTreeMetaBase : public IStorage, public WithMutableContext, public MergeTreeDataPartTypeHelper
 {
@@ -150,6 +154,7 @@ public:
         const String & date_column_name,
         const MergingParams & merging_params_,
         std::unique_ptr<MergeTreeSettings> storage_settings_,
+        const String & logger_name_,
         bool require_part_metadata_,
         bool attach_,
         BrokenPartCallback broken_part_callback_ = [](const String &) {});
@@ -177,6 +182,8 @@ public:
     bool supportsMapImplicitColumn() const override { return true; }
 
     NamesAndTypesList getVirtuals() const override;
+
+    void checkColumnsValidity(const ColumnsDescription & columns) const override;
 
     bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand , ContextPtr query_context, const StorageMetadataPtr & metadata_snapshot) const override;
 
@@ -355,6 +362,11 @@ public:
     /// Return the partition expression types as a Tuple type. Return DataTypeUInt8 if partition expression is empty.
     DataTypePtr getPartitionValueType() const;
 
+    /// Get partition virtual expression
+    ASTs getPartVirtualExpr() const;
+
+    Block getSampleBlockWithVirtualColumns() const;
+
     /// Construct a block consisting only of possible virtual columns for part pruning.
     /// If one_part is true, fill in at most one part.
     Block getBlockWithVirtualPartColumns(const DataPartsVector & parts, bool one_part) const;
@@ -377,6 +389,29 @@ public:
     bool isBucketTable() const override { return getInMemoryMetadata().isClusterByKeyDefined(); }
     UInt64 getTableHashForClusterBy() const override; // to compare table engines efficiently
 
+    void addMutationEntry(const CnchMergeTreeMutationEntry & entry);
+    void removeMutationEntry(TxnTimestamp create_time);
+    Strings getPlainMutationEntries();
+
+    /// *********** START OF BitEngine-related members *********** ///
+    // BitEngine mode means the storage can work for BitEngine encode/decode
+    bool isBitEngineMode() const { return bitengine_dictionary_manager != nullptr; }
+    /// BitEngine table means the storage has `BitMap64 BitEngineEncode` clause,
+    /// that's to say, it's a `BitEngine table` in syntax.
+    bool isBitEngineTable() const { return !bitengine_columns.empty(); }
+    bool isBitEngineEncodeColumn(const String & name) const;
+    bool isBitEngineDictTable() const { return !getBitEngineConstraints().empty(); }
+
+    ConstraintsDescription getBitEngineConstraints() const;
+    void checkBitEngineConstraints() const;
+
+    /// parse BitEngine column and construct BitEngineDictionaryManager, it's called after
+    /// all schema and constraints checks are passed
+    virtual void registerBitEngineDictionaries();
+
+    auto getBitEngineDictionaryManager() { return bitengine_dictionary_manager; }
+
+    /// *********** END OF BitEngine-related members *********** ///
 
 protected:
     friend class IMergeTreeDataPart;
@@ -410,6 +445,14 @@ protected:
 
     /// Nullable key
     bool allow_nullable_key = false;
+
+    /// TODO: (zuochuang.zema) use one current_mutations_by_version for Storage and CnchMergeMutateThread.
+    /// Mutations in queue.
+    /// It's different from CnchMergeMutateThread::current_mutations_by_version which is fetched from KV every time.
+    /// We need know all mutations when query processing to do column name conversion.
+    /// See #getFirstAlterMutationCommandsForPart.
+    mutable std::mutex mutations_by_version_mutex;
+    std::map<TxnTimestamp, CnchMergeTreeMutationEntry> mutations_by_version;
 
     /// Work with data parts
 
@@ -489,10 +532,10 @@ protected:
             throw Exception("Can't modify " + (*it)->getNameWithState(), ErrorCodes::LOGICAL_ERROR);
     }
 
-    /// FIXME: add after supporting primary index cache
-    // PrimaryIndexCachePtr primary_index_cache;
-
     void checkProperties(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, bool attach = false) const;
+
+    /// Check version column constrains when create table
+    void checkVersionColumnConstraint();
 
     void setProperties(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, bool attach = false);
 
@@ -515,6 +558,27 @@ protected:
 
     /// Checks whether the column is in the primary key, possibly wrapped in a chain of functions with single argument.
     bool isPrimaryOrMinMaxKeyColumnPossiblyWrappedInFunctions(const ASTPtr & node, const StorageMetadataPtr & metadata_snapshot) const;
+
+    /// *********** START OF BitEngine-related members *********** ///
+    BitEngineDictionaryManagerPtr bitengine_dictionary_manager{nullptr};
+    BitEngineDictionaryTableMapping bitengine_dictionary_tables_mapping;
+    NamesAndTypesList bitengine_columns;
+
+    BitEngineDictionaryTableMapping parseUnderlyingDictionaryDependency(const String & mapping_str) const;
+    /// in initializing, parse BitEngine-related components (like columns, underlying_dictionary_table setting)
+    /// to check primarily whether there're illegal syntax
+    void parseAndCheckForBitEngine();
+
+    /// check whethere the underlying dictionary table is legal
+    virtual void checkUnderlyingDictionaryTable(const BitEngineHelper::DictionaryDatabaseAndTable &) {}
+
+    /// validate a giving BitEngineDictionaryTableMapping object
+    void checkSchemaForBitEngineTableImpl(const BitEngineDictionaryTableMapping  & dict_dependencies, const ContextPtr & context_) const;
+    /// validate the member bitengine_dictionary_tables_mapping
+    virtual void checkSchemaForBitEngineTable(const ContextPtr & context_) const;
+
+    /// *********** END OF BitEngine-related members *********** ///
+
 
 private:
     // Record all query ids which access the table. It's guarded by `query_id_set_mutex` and is always mutable.

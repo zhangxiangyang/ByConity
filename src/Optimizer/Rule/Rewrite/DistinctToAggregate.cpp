@@ -16,6 +16,7 @@
 #include <Optimizer/Rule/Rewrite/DistinctToAggregate.h>
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <Core/SortDescription.h>
 #include <Optimizer/Rule/Patterns.h>
 #include <QueryPlan/AggregatingStep.h>
 #include <QueryPlan/DistinctStep.h>
@@ -24,16 +25,11 @@ namespace DB
 {
 PatternPtr DistinctToAggregate::getPattern() const
 {
-    return Patterns::distinct();
+    return Patterns::distinct().result();
 }
 
 TransformResult DistinctToAggregate::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
 {
-    if (!rule_context.context->getSettingsRef().enable_distinct_to_aggregate)
-    {
-        return {};
-    }
-
     auto distinct_node = dynamic_cast<DistinctNode *>(node.get());
     if (!distinct_node)
         return {};
@@ -46,22 +42,22 @@ TransformResult DistinctToAggregate::transformImpl(PlanNodePtr node, const Captu
         NamesAndTypes arbitrary_names;
 
         // check decimal type, which is not support for group by columns
-        bool has_decimal_type = false;
-        for (const auto & column : node->getStep()->getOutputStream().header)
-        {
-            TypeIndex index = column.type->getTypeId();
-            if (index == TypeIndex::Decimal32 || index == TypeIndex::Decimal64 || index == TypeIndex::Decimal128)
-            {
-                has_decimal_type = true;
-                break;
-            }
-            if (!name_set.contains(column.name))
-                arbitrary_names.emplace_back(column.name, column.type);
-        }
-        if (has_decimal_type)
-        {
-            return {};
-        }
+        // bool has_decimal_type = false;
+        // for (const auto & column : node->getStep()->getOutputStream().header)
+        // {
+        //     TypeIndex index = column.type->getTypeId();
+        //     if (index == TypeIndex::Decimal32 || index == TypeIndex::Decimal64 || index == TypeIndex::Decimal128)
+        //     {
+        //         has_decimal_type = true;
+        //         break;
+        //     }
+        //     if (!name_set.contains(column.name))
+        //         arbitrary_names.emplace_back(column.name, column.type);
+        // }
+        // if (has_decimal_type)
+        // {
+        //     return {};
+        // }
 
         AggregateDescriptions descriptions;
         for (auto & name_and_type : arbitrary_names)
@@ -75,8 +71,10 @@ TransformResult DistinctToAggregate::transformImpl(PlanNodePtr node, const Captu
             aggregate_desc.function = AggregateFunctionFactory::instance().get("any", {name_and_type.type}, parameters, properties);
             descriptions.emplace_back(aggregate_desc);
         }
-        auto group_agg_step = std::make_shared<AggregatingStep>(node->getStep()->getOutputStream(), step.getColumns(), descriptions, GroupingSetsParamsList{}, true, GroupingDescriptions{}, false, false);
-        auto group_agg_node = PlanNodeBase::createPlanNode(rule_context.context->nextNodeId(), std::move(group_agg_step), node->getChildren());
+        auto group_agg_step = std::make_shared<AggregatingStep>(
+            node->getStep()->getOutputStream(), step.getColumns(), NameSet{}, descriptions, GroupingSetsParamsList{}, true);
+        auto group_agg_node
+            = PlanNodeBase::createPlanNode(rule_context.context->nextNodeId(), std::move(group_agg_step), node->getChildren());
         return group_agg_node;
     }
 

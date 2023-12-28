@@ -1,5 +1,7 @@
 #include <Interpreters/Set.h>
 #include <Common/ProfileEvents.h>
+#include <Common/JSONBuilder.h>
+#include <Columns/ColumnSet.h>
 #include <Interpreters/ArrayJoinAction.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/TableJoin.h>
@@ -11,11 +13,10 @@
 #include <Functions/IFunction.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/Operators.h>
+#include <Storages/MergeTree/Index/BitmapIndexHelper.h>
 #include <optional>
-#include <Columns/ColumnSet.h>
 #include <queue>
 #include <stack>
-#include <Common/JSONBuilder.h>
 
 #if defined(MEMORY_SANITIZER)
     #include <sanitizer/msan_interface.h>
@@ -321,15 +322,17 @@ namespace
         ColumnsWithTypeAndName & inputs;
         ColumnsWithTypeAndName columns = {};
         std::vector<ssize_t> inputs_pos = {};
+        Block * precomputed_res_columns;
         size_t num_rows = 0;
     };
 }
 
-static void executeAction(const ExpressionActions::Action & action, ExecutionContext & execution_context, bool dry_run)
+static void executeAction(const ExpressionActions::Action & action, ExecutionContext & execution_context, bool dry_run, std::set<String> * bitmap_input_name_set = nullptr)
 {
     auto & inputs = execution_context.inputs;
     auto & columns = execution_context.columns;
     auto & num_rows = execution_context.num_rows;
+    auto * precomputed_result = execution_context.precomputed_res_columns;
 
     switch (action.node->type)
     {
@@ -358,6 +361,16 @@ static void executeAction(const ExpressionActions::Action & action, ExecutionCon
                     arguments[i] = columns[action.arguments[i].pos];
             }
 
+            if (BitmapIndexHelper::isArraySetFunctions(action.node->function_base->getName()))
+            {
+                if (precomputed_result && precomputed_result->has(action.node->result_name))
+                {
+                    res_column = precomputed_result->getByName(action.node->result_name);
+                    precomputed_result->erase(action.node->result_name);
+                    break;
+                }
+            }
+
             ProfileEvents::increment(ProfileEvents::FunctionExecute);
             if (action.node->is_function_compiled)
                 ProfileEvents::increment(ProfileEvents::CompiledFunctionExecute);
@@ -377,9 +390,10 @@ static void executeAction(const ExpressionActions::Action & action, ExecutionCon
 
             array_join_key.column = array_join_key.column->convertToFullColumnIfConst();
 
-            const ColumnArray * array = typeid_cast<const ColumnArray *>(array_join_key.column.get());
-            if (!array)
-                throw Exception("ARRAY JOIN of not array: " + action.node->result_name, ErrorCodes::TYPE_MISMATCH);
+            const ColumnArray * array = getArrayJoinColumnRawPtr(array_join_key.column);
+            const auto & type = getArrayJoinDataType(array_join_key.type);
+            if (!array || !type)
+                throw Exception("ARRAY JOIN of not array/map: " + action.node->result_name, ErrorCodes::TYPE_MISMATCH);
 
             for (auto & column : columns)
                 if (column.column)
@@ -392,7 +406,7 @@ static void executeAction(const ExpressionActions::Action & action, ExecutionCon
             auto & res_column = columns[action.result_position];
 
             res_column.column = array->getDataPtr();
-            res_column.type = assert_cast<const DataTypeArray &>(*array_join_key.type).getNestedType();
+            res_column.type = assert_cast<const DataTypeArray &>(*type).getNestedType();
             res_column.name = action.node->result_name;
 
             num_rows = res_column.column->size();
@@ -432,7 +446,8 @@ static void executeAction(const ExpressionActions::Action & action, ExecutionCon
             {
                 /// Here we allow to skip input if it is not in block (in case it is not needed).
                 /// It may be unusual, but some code depend on such behaviour.
-                if (action.arguments.front().needed_later)
+                if (action.arguments.front().needed_later
+                    && !(bitmap_input_name_set && bitmap_input_name_set->find(action.node->result_name) != bitmap_input_name_set->end()))
                     throw Exception(ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK,
                                     "Not found column {} in block",
                                     action.node->result_name);
@@ -447,9 +462,15 @@ static void executeAction(const ExpressionActions::Action & action, ExecutionCon
 
 void ExpressionActions::execute(Block & block, size_t & num_rows, bool dry_run) const
 {
+    execute(block, nullptr, num_rows, dry_run);
+}
+
+void ExpressionActions::execute(Block & block, Block * precomputed_result, size_t & num_rows, bool dry_run) const
+{
     ExecutionContext execution_context
     {
         .inputs = block.data,
+        .precomputed_res_columns = precomputed_result,
         .num_rows = num_rows,
     };
 
@@ -473,12 +494,26 @@ void ExpressionActions::execute(Block & block, size_t & num_rows, bool dry_run) 
     }
 
     execution_context.columns.resize(num_columns);
-
+    
+    std::set<String> bitmap_input_name_set;
+    for (const auto & action : actions)
+    {
+        if (action.node->type == ActionsDAG::ActionType::FUNCTION && (BitmapIndexHelper::isArraySetFunctions(action.node->function_base->getName()) || BitmapIndexHelper::isBitmapFunctions(action.node->function_base->getName())))
+        {
+            for (const auto & child : action.node->children)
+            {
+                if (child->type == ActionsDAG::ActionType::INPUT)
+                {
+                    bitmap_input_name_set.emplace(child->result_name);
+                }
+            }
+        }
+    }
     for (const auto & action : actions)
     {
         try
         {
-            executeAction(action, execution_context, dry_run);
+            executeAction(action, execution_context, dry_run, &bitmap_input_name_set);
             checkLimits(execution_context.columns);
 
             //std::cerr << "Action: " << action.toString() << std::endl;
@@ -764,8 +799,8 @@ ExpressionActionsChain::ArrayJoinStep::ArrayJoinStep(ArrayJoinActionPtr array_jo
 
         if (array_join->columns.count(column.name) > 0)
         {
-            const auto * array = typeid_cast<const DataTypeArray *>(column.type.get());
-            column.type = array->getNestedType();
+            auto array_type = getArrayJoinDataType(column.type);
+            column.type = array_type->getNestedType();
             /// Arrays are materialized
             column.column = nullptr;
         }

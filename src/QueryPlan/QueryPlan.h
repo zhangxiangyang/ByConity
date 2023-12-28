@@ -19,6 +19,7 @@
 #include <Interpreters/Context_fwd.h>
 #include <QueryPlan/CTEInfo.h>
 #include <QueryPlan/PlanNodeIdAllocator.h>
+#include <Interpreters/StorageID.h>
 #include <Poco/Logger.h>
 
 #include <list>
@@ -58,6 +59,11 @@ namespace JSONBuilder
     using ItemPtr = std::unique_ptr<IItem>;
 }
 
+namespace Protos
+{
+    class QueryPlan;
+}
+
 /// A tree of query steps.
 /// The goal of QueryPlan is to build QueryPipeline.
 /// QueryPlan let delay pipeline creation which is helpful for pipeline-level optimizations.
@@ -72,7 +78,7 @@ public:
 
     QueryPlan & operator=(QueryPlan &&);
 
-    void allocateLocalTable(ContextPtr context);
+    std::set<StorageID> allocateLocalTable(ContextPtr context);
     PlanNodeIdAllocatorPtr & getIdAllocator() { return id_allocator; }
     void update(PlanNodePtr plan) { plan_node = std::move(plan); }
 
@@ -89,6 +95,8 @@ public:
         const QueryPlanOptimizationSettings & optimization_settings,
         const BuildQueryPipelineSettings & build_pipeline_settings);
 
+    /// add step_id for processors
+    static void updatePipelineStepInfo(QueryPipelinePtr & pipeline_ptr, QueryPlanStepPtr & step,size_t step_id);
     /// If initialized, build pipeline and convert to pipe. Otherwise, return empty pipe.
     Pipe convertToPipe(
         const QueryPlanOptimizationSettings & optimization_settings,
@@ -115,6 +123,7 @@ public:
     JSONBuilder::ItemPtr explainPlan(const ExplainPlanOptions & options);
     void explainPlan(WriteBuffer & buffer, const ExplainPlanOptions & options) const;
     void explainPipeline(WriteBuffer & buffer, const ExplainPipelineOptions & options) const;
+    void explainPipelineWithOptimizer(WriteBuffer & buffer, const ExplainPipelineOptions & options) const;
 
     /// Set upper limit for the recommend number of threads. Will be applied to the newly-created pipelines.
     /// TODO: make it in a better way.
@@ -144,7 +153,10 @@ public:
     Nodes & getNodes() { return nodes; }
 
     Node * getRoot() { return root; }
+    const Node * getRoot() const { return root; }
+    PlanNodePtr getPlanNodeRoot() const { return plan_node; }
     void setRoot(Node * root_) { root = root_; }
+    void setPlanNodeRoot(PlanNodePtr plan_node_) { plan_node = plan_node_; }
     CTENodes & getCTENodes() { return cte_nodes; }
 
     Node * getLastNode() { return &nodes.back(); }
@@ -155,21 +167,42 @@ public:
     UInt32 newPlanNodeId() { return (*max_node_id)++; }
     PlanNodePtr & getPlanNode() { return plan_node; }
     CTEInfo & getCTEInfo() { return cte_info; }
+    PlanNodePtr getPlanNodeById(PlanNodeId node_id) const;
+    const CTEInfo & getCTEInfo() const { return cte_info; }
 
     QueryPlan getSubPlan(QueryPlan::Node * node_);
+
+    static UInt32 getPlanNodeCount(PlanNodePtr node);
+
+    void toProto(Protos::QueryPlan & proto) const;
+    void fromProto(const Protos::QueryPlan & proto);
+
+    // handle when plan is tree-like, i.e., plan_node + cte_info
+    void toProtoTreeLike(Protos::QueryPlan & proto) const;
+    void fromProtoTreeLike(const Protos::QueryPlan & proto);
+
+    // handle when plan is flatten, i.e., root + nodes + cte_nodes
+    void toProtoFlatten(Protos::QueryPlan & proto) const;
+    void fromProtoFlatten(const Protos::QueryPlan & proto);
 
     void freshPlan();
 
     size_t getSize() const { return nodes.size(); }
 
+    void setResetStepId(bool reset_id) { reset_step_id = reset_id; }
+
+    QueryPlanPtr copy(ContextMutablePtr context);
 private:
     Poco::Logger * log = &Poco::Logger::get("QueryPlan");
+    // Flatten, in segment only
     Nodes nodes;
-    CTENodes cte_nodes;
-
+    CTENodes cte_nodes; // won't serialize
     Node * root = nullptr;
+
+    // Tree-Like, for optimizer
     PlanNodePtr plan_node = nullptr;
     CTEInfo cte_info;
+
     PlanNodeIdAllocatorPtr id_allocator;
 
     void checkInitialized() const;
@@ -179,6 +212,8 @@ private:
     size_t max_threads = 0;
     std::vector<std::shared_ptr<Context>> interpreter_context;
     std::shared_ptr<UInt32> max_node_id;
+    //Whether reset step id in serialize()，use for explain analyze.
+    bool reset_step_id = true;
 };
 
 std::string debugExplainStep(const IQueryPlanStep & step);

@@ -15,20 +15,20 @@
 
 #pragma once
 
-#include <Common/config.h>
 #include <Interpreters/Context_fwd.h>
 #include <Protos/cnch_worker_rpc.pb.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH.h>
+#include <Common/config.h>
 
+#include <Common/Brpc/BrpcServiceDefines.h>
 #include <common/logger_useful.h>
 
 namespace DB
 {
-
 class CnchWorkerServiceImpl : protected WithMutableContext, public DB::Protos::CnchWorkerService
 {
 public:
-    explicit CnchWorkerServiceImpl(ContextPtr context_);
+    explicit CnchWorkerServiceImpl(ContextMutablePtr context_);
     ~CnchWorkerServiceImpl() override;
 
     void executeSimpleQuery(
@@ -129,6 +129,20 @@ public:
         google::protobuf::Closure * done) override;
 #endif
 
+#if USE_MYSQL
+    void submitMySQLSyncThreadTask(
+        google::protobuf::RpcController * cntl,
+        const Protos::SubmitMySQLSyncThreadTaskReq * request,
+        Protos::SubmitMySQLSyncThreadTaskResp * response,
+        google::protobuf::Closure * done) override;
+
+    void checkMySQLSyncThreadStatus(
+        google::protobuf::RpcController * cntl,
+        const Protos::CheckMySQLSyncThreadStatusReq * request,
+        Protos::CheckMySQLSyncThreadStatusResp * response,
+        google::protobuf::Closure * done) override;
+#endif
+
     void preloadChecksumsAndPrimaryIndex(
         google::protobuf::RpcController * cntl,
         const Protos::PreloadChecksumsAndPrimaryIndexReq * request,
@@ -153,6 +167,12 @@ public:
         Protos::SendDataPartsResp * response,
         google::protobuf::Closure * done) override;
 
+    void sendResources(
+        google::protobuf::RpcController * cntl,
+        const Protos::SendResourcesReq * request,
+        Protos::SendResourcesResp * response,
+        google::protobuf::Closure * done) override;
+
     void removeWorkerResource(
         google::protobuf::RpcController * cntl,
         const Protos::RemoveWorkerResourceReq * request,
@@ -167,16 +187,29 @@ public:
         google::protobuf::Closure * done) override {}
         */
 
-    void sendCnchHiveDataParts(
+
+    void sendCnchFileDataParts(
         google::protobuf::RpcController * cntl,
-        const Protos::SendCnchHiveDataPartsReq * request,
-        Protos::SendCnchHiveDataPartsResp * response,
+        const Protos::SendCnchFileDataPartsReq * request,
+        Protos::SendCnchFileDataPartsResp * response,
         google::protobuf::Closure * done) override;
 
     void checkDataParts(
         google::protobuf::RpcController * cntl,
         const Protos::CheckDataPartsReq * request,
         Protos::CheckDataPartsResp * response,
+        google::protobuf::Closure * done) override;
+
+    void preloadDataParts(
+        google::protobuf::RpcController * cntl,
+        const Protos::PreloadDataPartsReq * request,
+        Protos::PreloadDataPartsResp * response,
+        google::protobuf::Closure * done) override;
+
+    void dropPartDiskCache(
+        google::protobuf::RpcController * cntl,
+        const Protos::DropPartDiskCacheReq * request,
+        Protos::DropPartDiskCacheResp * response,
         google::protobuf::Closure * done) override;
 
     void sendOffloading(
@@ -190,6 +223,10 @@ private:
 
     // class PreloadHandler;
     // std::shared_ptr<PreloadHandler> preload_handler;
+
+    ThreadPool thread_pool;
 };
+
+REGISTER_SERVICE_IMPL(CnchWorkerServiceImpl);
 
 }

@@ -27,6 +27,7 @@
 #include <Interpreters/StorageID.h>
 #include <Interpreters/Context_fwd.h>
 #include <Protos/cnch_common.pb.h>
+#include <Protos/data_models.pb.h>
 
 #include <brpc/closure_guard.h>
 #include <brpc/controller.h>
@@ -50,12 +51,27 @@ namespace DB::RPCHelpers
         pb_uuid.set_high(uuid.toUnderType().items[1]);
     }
 
-    inline StorageID createStorageID(const Protos::StorageID & id) { return StorageID(id.database(), id.table(), createUUID(id.uuid())); }
+    inline StorageID createStorageID(const Protos::StorageID & id)
+    {
+        auto storage_id = StorageID(id.database(), id.table(), createUUID(id.uuid()));
+        if (id.has_server_vw_name())
+            storage_id.server_vw_name = id.server_vw_name();
+        return storage_id;
+    }
     inline void fillStorageID(const StorageID & id, Protos::StorageID & pb_id)
     {
         pb_id.set_database(id.database_name);
         pb_id.set_table(id.table_name);
         fillUUID(id.uuid, *pb_id.mutable_uuid());
+        if (id.server_vw_name != DEFAULT_SERVER_VW_NAME)
+            pb_id.set_server_vw_name(id.server_vw_name);
+    }
+    inline StorageID createStorageID(const Protos::DataModelTable & table)
+    {
+        auto storage_id = StorageID(table.database(), table.name(), createUUID(table.uuid()));
+        if (table.has_server_vw_name())
+            storage_id.server_vw_name = table.server_vw_name();
+        return storage_id;
     }
 
     inline HostWithPorts createHostWithPorts(const Protos::HostWithPorts & hp)
@@ -70,6 +86,7 @@ namespace DB::RPCHelpers
             hp.hostname(),
         };
     }
+
 
     // inline BpQueryKeyPtr createBpQueryKey(const Protos::BpQueryKey & bqk)
     // {
@@ -134,7 +151,7 @@ namespace DB::RPCHelpers
     void assertController(const brpc::Controller & cntl);
 
     template <typename Resp>
-    void onAsyncCallDone(Resp * response, brpc::Controller * cntl, ExceptionHandler * handler)
+    void onAsyncCallDone(Resp * response, brpc::Controller * cntl, ExceptionHandlerPtr handler)
     {
         try
         {
@@ -145,6 +162,25 @@ namespace DB::RPCHelpers
         }
         catch (...)
         {
+            handler->setException(std::current_exception());
+        }
+    }
+
+    template <typename Resp>
+    void onAsyncCallDoneWithFailedInfo(Resp * response, brpc::Controller * cntl, ExceptionHandlerWithFailedInfoPtr handler, const DB::WorkerId worker_id)
+    {
+        int32_t error_code = 0;
+        try
+        {
+            std::unique_ptr<Resp> response_guard(response);
+            std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+            error_code = cntl->ErrorCode();
+            RPCHelpers::assertController(*cntl);
+            RPCHelpers::checkResponse(*response);
+        }
+        catch (...)
+        {
+            handler->addFailedRpc(worker_id, error_code);
             handler->setException(std::current_exception());
         }
     }

@@ -45,6 +45,14 @@ public:
     std::shared_ptr<IMergeTreeDataPart::MinMaxIndex> minmax_idx;
 
     std::shared_ptr<MergeTreePartInfo> info;
+
+    /// Get the txn id of the part.
+    /// For a normal insertion, the DataModelPart::txnID and DataModelPart::part_info::mutation are always the same.
+    /// But in some special cases(like ATTACH PARTITION, see CnchAttachProcessor::prepareParts),
+    /// the DataModelPart::txnID not equal to DataModelPart::part_info::mutation.
+    /// To handle this case, we need to set txnID and part_info::mutation separately, see DataModelHelpers::fillPartsModel.
+    /// And when getting txnID, use DataModelPart::txnID by default, and use mutation as fallback.
+    inline UInt64 txnID() const { return part_model->txnid() ? part_model->txnid() : part_model->part_info().mutation(); }
 };
 
 class DataPartInterface
@@ -62,8 +70,8 @@ public:
 class ServerDataPart : public std::enable_shared_from_this<ServerDataPart>, public DataPartInterface
 {
 public:
-    ServerDataPart(const DataModelPartWrapperPtr & part_model_wrapper_) : part_model_wrapper(part_model_wrapper_) {}
-    ServerDataPart(DataModelPartWrapperPtr && part_model_wrapper_) : part_model_wrapper(part_model_wrapper_) {}
+    explicit ServerDataPart(const DataModelPartWrapperPtr & part_model_wrapper_) : part_model_wrapper(part_model_wrapper_) { }
+    explicit ServerDataPart(DataModelPartWrapperPtr && part_model_wrapper_) : part_model_wrapper(part_model_wrapper_) { }
 
     virtual bool isServerDataPart() const override { return true; }
 
@@ -77,6 +85,8 @@ public:
     void setCommitTime(const UInt64 & new_commit_time) const;
     UInt64 getColumnsCommitTime() const;
     UInt64 getMutationCommitTime() const;
+    UInt64 getEndTime() const;
+    void setEndTime(UInt64 end_time) const;
 
     bool containsExactly(const ServerDataPart & other) const;
 
@@ -93,6 +103,7 @@ public:
     bool deleted() const;
     const Protos::DataModelPart & part_model() const;
     const std::shared_ptr<IMergeTreeDataPart::MinMaxIndex> & minmax_idx() const;
+    UInt64 txnID() const;
 
     const MergeTreePartInfo & info() const;
     const String & name() const;
@@ -114,6 +125,16 @@ public:
 
     void setVirtualPartSize(const UInt64 & virtual_part_size) const;
     UInt64 getVirtualPartSize() const;
+
+    void setHostPort(const String & disk_cache_host_port_, const String & assign_compute_host_port_) const
+    {
+        disk_cache_host_port = disk_cache_host_port_;
+        assign_compute_host_port = assign_compute_host_port_;
+    }
+
+    mutable String disk_cache_host_port;
+    mutable String assign_compute_host_port;
+
 private:
     mutable std::optional<UInt64> commit_time;
     mutable ServerDataPartPtr prev_part;

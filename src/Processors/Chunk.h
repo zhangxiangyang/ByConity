@@ -22,6 +22,7 @@
 #pragma once
 
 #include <Columns/IColumn.h>
+#include <Core/Block.h>
 #include <unordered_map>
 
 namespace DB
@@ -41,7 +42,9 @@ public:
         ChunkMissingValues = 3,
         ChunksToMerge = 4,
         RepartitionChunkInfo = 5,
-        SelectorInfo = 6
+        SelectorInfo = 6,
+        Totals = 7,
+        Extremes = 8
     };
 
     virtual ~ChunkInfo() = default;
@@ -64,6 +67,18 @@ protected:
         return typeid(lhs) == typeid(rhs) // Allow compare only instances of the same dynamic type
             && lhs.isEqual(rhs);
     }
+};
+
+class ChunkInfoTotals: public ChunkInfo
+{
+public:
+    Type getType() const override { return Type::Totals; }
+};
+
+class ChunkInfoExtremes: public ChunkInfo
+{
+public:
+    Type getType() const override { return Type::Extremes; }
 };
 
 using ChunkInfoPtr = std::shared_ptr<const ChunkInfo>;
@@ -91,6 +106,7 @@ public:
         : columns(std::move(other.columns))
         , num_rows(other.num_rows)
         , chunk_info(std::move(other.chunk_info))
+        , owned_side_block(std::move(other.owned_side_block))
     {
         other.num_rows = 0;
     }
@@ -105,6 +121,8 @@ public:
     {
         columns = std::move(other.columns);
         chunk_info = std::move(other.chunk_info);
+        if (other.owned_side_block && other.owned_side_block->columns() > 0)
+            owned_side_block = std::move(other.owned_side_block);
         num_rows = other.num_rows;
         other.num_rows = 0;
         return *this;
@@ -116,6 +134,7 @@ public:
     {
         columns.swap(other.columns);
         chunk_info.swap(other.chunk_info);
+        owned_side_block.swap(other.owned_side_block);
         std::swap(num_rows, other.num_rows);
     }
 
@@ -124,6 +143,7 @@ public:
         num_rows = 0;
         columns.clear();
         chunk_info.reset();
+        owned_side_block.reset();
     }
 
     const Columns & getColumns() const { return columns; }
@@ -136,6 +156,9 @@ public:
 
     const ChunkInfoPtr & getChunkInfo() const { return chunk_info; }
     void setChunkInfo(ChunkInfoPtr chunk_info_) { chunk_info = std::move(chunk_info_); }
+    const Block * getSideBlock() const { return owned_side_block.get(); }
+    Block * getSideBlock() { return owned_side_block.get(); }
+    void addColumnToSideBlock(ColumnWithTypeAndName && col);
 
     UInt64 getNumRows() const { return num_rows; }
     UInt64 getNumColumns() const { return columns.size(); }
@@ -153,10 +176,14 @@ public:
 
     std::string dumpStructure() const;
 
+    void append(const Chunk & chunk);
+    void append(const Chunk & chunk, size_t from, size_t length); // append rows [from, from+length) of chunk
+
 private:
     Columns columns;
     UInt64 num_rows = 0;
     ChunkInfoPtr chunk_info;
+    std::unique_ptr<Block> owned_side_block;
 
     void checkNumRowsIsConsistent();
 };

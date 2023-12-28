@@ -41,6 +41,7 @@
 #include <Common/RWLock.h>
 #include <Common/TypePromotion.h>
 #include <Common/HostWithPorts.h>
+#include "ResourceManagement/CommonData.h"
 #include <Transaction/TxnTimestamp.h>
 
 #include <optional>
@@ -139,6 +140,7 @@ public:
     std::string getTableName() const { return storage_id.table_name; }
     std::string getDatabaseName() const { return storage_id.database_name; }
     UUID getStorageUUID() const { return storage_id.uuid; }
+    std::string getServerVwName() const { return storage_id.server_vw_name; }
 
     /// Returns true if the storage receives data from a remote server or servers.
     virtual bool isRemote() const { return false; }
@@ -188,6 +190,8 @@ public:
     /// This is true for most storages that store data on disk.
     virtual bool prefersLargeBlocks() const { return true; }
 
+    /// Returns true if the storage is for system, which cannot be target of SHOW CREATE TABLE.
+    virtual bool isSystemStorage() const { return false; }
 
     /// Optional size information of each physical column.
     /// Currently it's only used by the MergeTree family for query optimizations.
@@ -238,10 +242,17 @@ public:
     virtual bool isBucketTable() const {return false;}
     virtual UInt64 getTableHashForClusterBy() const {return 0;}
 
+    /// Return true if storage can execute lightweight delete.
+    virtual bool supportsLightweightDelete() const { return false; }
+
+    virtual std::optional<String> getVirtualWarehouseName(VirtualWarehouseType /*vw_type*/) const { return {}; }
+
 protected:
     /// Returns whether the column is virtual - by default all columns are real.
     /// Initially reserved virtual column name may be shadowed by real column.
     bool isVirtualColumn(const String & column_name, const StorageMetadataPtr & metadata_snapshot) const;
+
+    void setServerVwName(const std::string & server_vw_name) { storage_id.server_vw_name = server_vw_name; }
 
 private:
 
@@ -584,6 +595,9 @@ public:
     /// Checks validity of the data
     virtual CheckResults checkData(const ASTPtr & /* query */, ContextPtr /* context */) { throw Exception("Check query is not supported for " + getName() + " storage", ErrorCodes::NOT_IMPLEMENTED); }
 
+    /// Checks validity of the data and auto remove invailid metadata
+    virtual CheckResults autoRemoveData(const ASTPtr & /* query */, ContextPtr /* context */) { throw Exception("Check query with auto remove is not supported for " + getName() + " storage", ErrorCodes::NOT_IMPLEMENTED); }
+
     /// Checks that table could be dropped right now
     /// Otherwise - throws an exception with detailed information.
     /// We do not use mutex because it is not very important that the size could change during the operation.
@@ -655,9 +669,6 @@ public:
     ///
     /// Does not takes underlying Storage (if any) into account.
     virtual std::optional<UInt64> lifetimeBytes() const { return {}; }
-
-    void serialize(WriteBuffer & buf) const;
-    static StoragePtr deserialize(ReadBuffer & buf, const ContextPtr & context);
 
     bool is_detached{false};
 

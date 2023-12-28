@@ -17,7 +17,8 @@
 #include <WorkerTasks/MergeTreeDataReclusterMutator.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH.h>
 #include <Storages/StorageCloudMergeTree.h>
-#include <CloudServices/commitCnchParts.h>
+#include <CloudServices/CnchDataWriter.h>
+#include <Transaction/ICnchTransaction.h>
 
 namespace DB
 {
@@ -69,8 +70,9 @@ void CloudMergeTreeReclusterTask::executeImpl()
     parts_to_commit.insert(parts_to_commit.end(), clustered_tmp_parts.begin(), clustered_tmp_parts.end());
 
     CnchDataWriter cnch_writer(storage, getContext(), ManipulationType::Clustering, params.task_id);
-    cnch_writer.dumpAndCommitCnchParts(parts_to_commit);
-
+    auto res = cnch_writer.dumpAndCommitCnchParts(parts_to_commit);
+    getContext()->getCurrentTransaction()->commitV2();
+    cnch_writer.preload(res.parts);
 }
 
 }

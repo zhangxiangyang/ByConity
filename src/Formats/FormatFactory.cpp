@@ -17,6 +17,8 @@
 #include <Processors/Formats/Impl/ParallelParsingInputFormat.h>
 #include <Processors/Formats/Impl/ParallelFormattingOutputFormat.h>
 #include <Poco/URI.h>
+#include <IO/CompressionMethod.h>
+#include <boost/algorithm/string/case_conv.hpp>
 
 #include <IO/ReadHelpers.h>
 
@@ -34,6 +36,7 @@ namespace ErrorCodes
     extern const int FORMAT_IS_NOT_SUITABLE_FOR_INPUT;
     extern const int FORMAT_IS_NOT_SUITABLE_FOR_OUTPUT;
     extern const int UNSUPPORTED_METHOD;
+    extern const int BAD_ARGUMENTS;
 }
 
 const FormatFactory::Creators & FormatFactory::getCreators(const String & name) const
@@ -77,6 +80,8 @@ FormatSettings getFormatSettings(ContextPtr context, const Settings & settings)
     format_settings.custom.row_between_delimiter = settings.format_custom_row_between_delimiter;
     format_settings.date_time_input_format = settings.date_time_input_format;
     format_settings.date_time_output_format = settings.date_time_output_format;
+    format_settings.bool_true_representation = settings.bool_true_representation;
+    format_settings.bool_false_representation = settings.bool_false_representation;
     format_settings.enable_streaming = settings.output_format_enable_streaming;
     format_settings.import_nested_json = settings.input_format_import_nested_json;
     format_settings.input_allow_errors_num = settings.input_format_allow_errors_num;
@@ -86,8 +91,12 @@ FormatSettings getFormatSettings(ContextPtr context, const Settings & settings)
     format_settings.json.named_tuples_as_objects = settings.output_format_json_named_tuples_as_objects;
     format_settings.json.quote_64bit_integers = settings.output_format_json_quote_64bit_integers;
     format_settings.json.quote_denormals = settings.output_format_json_quote_denormals;
+    format_settings.parquet.allow_missing_columns = settings.input_format_parquet_allow_missing_columns;
     format_settings.null_as_default = settings.input_format_null_as_default;
+    format_settings.parquet.allow_missing_columns = settings.input_format_parquet_allow_missing_columns;
+    format_settings.parquet.case_insensitive_column_matching = settings.input_format_parquet_case_insensitive_column_matching;
     format_settings.parquet.row_group_size = settings.output_format_parquet_row_group_size;
+    format_settings.parquet.max_block_size = settings.input_format_parquet_max_block_size;
     format_settings.pretty.charset = settings.output_format_pretty_grid_charset.toString() == "ASCII" ? FormatSettings::Pretty::Charset::ASCII : FormatSettings::Pretty::Charset::UTF8;
     format_settings.pretty.color = settings.output_format_pretty_color;
     format_settings.pretty.max_column_pad_width = settings.output_format_pretty_max_column_pad_width;
@@ -98,6 +107,7 @@ FormatSettings getFormatSettings(ContextPtr context, const Settings & settings)
     format_settings.regexp.regexp = settings.format_regexp;
     format_settings.regexp.skip_unmatched = settings.format_regexp_skip_unmatched;
     format_settings.schema.format_schema = settings.format_schema;
+    /// Remember to set local format_schema_path for each table to support multi-tanants
     format_settings.schema.format_schema_path = context->getFormatSchemaPath();
     format_settings.schema.is_server = context->hasGlobalContext() && (context->getGlobalContext()->getApplicationType() == Context::ApplicationType::SERVER);
     format_settings.skip_unknown_fields = settings.input_format_skip_unknown_fields;
@@ -114,6 +124,10 @@ FormatSettings getFormatSettings(ContextPtr context, const Settings & settings)
     format_settings.with_names_use_header = settings.input_format_with_names_use_header;
     format_settings.write_statistics = settings.output_format_write_statistics;
     format_settings.arrow.low_cardinality_as_dictionary = settings.output_format_arrow_low_cardinality_as_dictionary;
+    format_settings.arrow.allow_missing_columns = settings.input_format_arrow_allow_missing_columns;
+    format_settings.orc.allow_missing_columns = settings.input_format_orc_allow_missing_columns;
+    format_settings.protobuf.enable_multiple_message = settings.input_format_protobuf_enable_multiple_message;
+    format_settings.protobuf.default_length_parser = settings.input_format_protobuf_default_length_parser;
 
     /// Validate avro_schema_registry_url with RemoteHostFilter when non-empty and in Server context
     if (format_settings.schema.is_server)
@@ -382,6 +396,7 @@ void FormatFactory::registerInputFormat(const String & name, InputCreator input_
     if (target)
         throw Exception("FormatFactory: Input format " + name + " is already registered", ErrorCodes::LOGICAL_ERROR);
     target = std::move(input_creator);
+    registerFileExtension(name, name);
 }
 
 void FormatFactory::registerOutputFormat(const String & name, OutputCreator output_creator)
@@ -390,7 +405,76 @@ void FormatFactory::registerOutputFormat(const String & name, OutputCreator outp
     if (target)
         throw Exception("FormatFactory: Output format " + name + " is already registered", ErrorCodes::LOGICAL_ERROR);
     target = std::move(output_creator);
+    registerFileExtension(name, name);
 }
+
+void FormatFactory::registerFileExtension(const String & extension, const String & format_name)
+{
+    file_extension_formats[boost::to_lower_copy(extension)] = format_name;
+}
+
+String FormatFactory::getFormatFromFileName(String file_name, bool throw_if_not_found, String format_name)
+{
+    if (!format_name.empty() && format_name != "auto")
+        return format_name;
+
+    if (file_name == "stdin")
+        return getFormatFromFileDescriptor(STDIN_FILENO);
+
+    CompressionMethod compression_method = chooseCompressionMethod(file_name, "");
+    if (CompressionMethod::None != compression_method)
+    {
+        auto pos = file_name.find_last_of('.');
+        if (pos != String::npos)
+            file_name = file_name.substr(0, pos);
+    }
+
+    auto pos = file_name.find_last_of('.');
+    if (pos == String::npos)
+    {
+        if (throw_if_not_found)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot determine the file format by it's extension");
+        return "";
+    }
+
+    String file_extension = file_name.substr(pos + 1, String::npos);
+    boost::algorithm::to_lower(file_extension);
+    auto it = file_extension_formats.find(file_extension);
+    if (it == file_extension_formats.end())
+    {
+        if (throw_if_not_found)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot determine the file format by it's extension");
+        return "";
+    }
+    return it->second;
+}
+
+String FormatFactory::getFormatFromFileDescriptor(int fd)
+{
+#ifdef OS_LINUX
+    std::string proc_path = fmt::format("/proc/self/fd/{}", fd);
+    char file_path[PATH_MAX] = {'\0'};
+    if (readlink(proc_path.c_str(), file_path, sizeof(file_path) - 1) != -1)
+        return getFormatFromFileName(file_path, false);
+    return "";
+#elif defined(OS_DARWIN)
+    char file_path[PATH_MAX] = {'\0'};
+    if (fcntl(fd, F_GETPATH, file_path) != -1)
+        return getFormatFromFileName(file_path, false);
+    return "";
+#else
+    (void)fd;
+    return "";
+#endif
+}
+
+void FormatFactory::checkFormatName(const String & name) const
+{
+    auto it = dict.find(name);
+    if (it == dict.end())
+        throw Exception("Unknown format " + name, ErrorCodes::UNKNOWN_FORMAT);
+}
+
 
 void FormatFactory::registerInputFormatProcessor(const String & name, InputProcessorCreator input_creator)
 {
@@ -398,6 +482,7 @@ void FormatFactory::registerInputFormatProcessor(const String & name, InputProce
     if (target)
         throw Exception("FormatFactory: Input format " + name + " is already registered", ErrorCodes::LOGICAL_ERROR);
     target = std::move(input_creator);
+    registerFileExtension(name, name);
 }
 
 void FormatFactory::registerOutputFormatProcessor(const String & name, OutputProcessorCreator output_creator)
@@ -406,6 +491,7 @@ void FormatFactory::registerOutputFormatProcessor(const String & name, OutputPro
     if (target)
         throw Exception("FormatFactory: Output format " + name + " is already registered", ErrorCodes::LOGICAL_ERROR);
     target = std::move(output_creator);
+    registerFileExtension(name, name);
 }
 
 void FormatFactory::registerFileSegmentationEngine(const String & name, FileSegmentationEngine file_segmentation_engine)

@@ -23,7 +23,7 @@
 #include <Interpreters/DistributedStages/InterpreterDistributedStages.h>
 #include <Interpreters/DistributedStages/InterpreterPlanSegment.h>
 #include <Interpreters/DistributedStages/PlanSegmentSplitter.h>
-#include <Interpreters/DistributedStages/executePlanSegment.h>
+#include <Interpreters/DistributedStages/MPPQueryCoordinator.h>
 #include <Interpreters/InterpreterSelectWithUnionQuery.h>
 #include <Interpreters/InterpreterSetQuery.h>
 #include <Interpreters/RewriteDistributedQueryVisitor.h>
@@ -35,6 +35,7 @@
 #include <Parsers/IAST.h>
 #include <Storages/IStorage.h>
 #include <Storages/SelectQueryInfo.h>
+
 
 namespace DB
 {
@@ -117,7 +118,7 @@ PlanSegmentPtr MockPlanSegment(ContextPtr context)
 
     plan_segment->appendPlanSegmentInput(left);
     plan_segment->appendPlanSegmentInput(right);
-    plan_segment->setPlanSegmentOutput(output);
+    plan_segment->appendPlanSegmentOutput(output);
 
     /***
      * only read from system.one
@@ -219,7 +220,8 @@ void MockTestQuery(PlanSegmentTree * plan_segment_tree, ContextMutablePtr contex
 
 BlockIO InterpreterDistributedStages::executePlanSegment()
 {
-    return executePlanSegmentTree(plan_segment_tree, context);
+    auto coodinator = std::make_shared<MPPQueryCoordinator>(std::move(plan_segment_tree), context, MPPQueryOptions());
+    return coodinator->execute();
 }
 
 void InterpreterDistributedStages::initSettings()

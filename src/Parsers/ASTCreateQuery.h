@@ -21,13 +21,16 @@
 
 #pragma once
 
-#include <Parsers/ASTQueryWithTableAndOutput.h>
-#include <Parsers/ASTQueryWithOnCluster.h>
+#include <Interpreters/StorageID.h>
 #include <Parsers/ASTDictionary.h>
 #include <Parsers/ASTDictionaryAttributeDeclaration.h>
 #include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTQueryWithOnCluster.h>
+#include <Parsers/ASTQueryWithTableAndOutput.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Parsers/ASTTableOverrides.h>
 #include <Interpreters/StorageID.h>
+#include "Parsers/IAST_fwd.h"
 
 namespace DB
 {
@@ -70,6 +73,8 @@ public:
     ASTExpressionList * constraints = nullptr;
     ASTExpressionList * projections = nullptr;
     IAST              * primary_key = nullptr;
+    ASTExpressionList * foreign_keys = nullptr;
+    ASTExpressionList * unique = nullptr; // unique is not enforced.
 
     String getID(char) const override { return "Columns definition"; }
 
@@ -78,8 +83,27 @@ public:
     ASTPtr clone() const override;
 
     void formatImpl(const FormatSettings & s, FormatState & state, FormatStateStacked frame) const override;
+
+    bool empty() const
+    {
+        return (!columns || columns->children.empty()) && (!indices || indices->children.empty()) && (!constraints || constraints->children.empty())
+            && (!projections || projections->children.empty()) && (!foreign_keys || foreign_keys->children.empty())&& (!unique || unique->children.empty());
+    }
 };
 
+class ASTCreateSnapshotQuery : public ASTQueryWithTableAndOutput
+{
+public:
+    bool if_not_exists = false;
+    StorageID to_table_id = StorageID::createEmpty();
+    Int32 ttl_in_days = 0;
+
+    String getID(char delim) const override { return String("CreateSnapshotQuery") + delim + database + delim + table; }
+
+    ASTPtr clone() const override;
+
+    void formatQueryImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+};
 
 /// CREATE TABLE or ATTACH TABLE query
 class ASTCreateQuery : public ASTQueryWithTableAndOutput, public ASTQueryWithOnCluster
@@ -95,6 +119,7 @@ public:
     bool replace_view{false}; /// CREATE OR REPLACE VIEW
     bool ignore_replicated{false};
     bool ignore_async{false};
+    bool ignore_bitengine_encode{false};
     bool ignore_ttl{false};
 
     ASTColumns * columns_list = nullptr;
@@ -107,6 +132,7 @@ public:
     String as_table;
     ASTPtr as_table_function;
     ASTSelectWithUnionQuery * select = nullptr;
+    IAST * comment = nullptr;
 
     bool is_dictionary{false}; /// CREATE DICTIONARY
     ASTExpressionList * dictionary_attributes_list = nullptr; /// attributes of
@@ -115,12 +141,16 @@ public:
     std::optional<UInt64> live_view_timeout;    /// For CREATE LIVE VIEW ... WITH TIMEOUT ...
     std::optional<UInt64> live_view_periodic_refresh;    /// For CREATE LIVE VIEW ... WITH [PERIODIC] REFRESH ...
 
+    ASTSetQuery* catalog_properties;
+
     bool attach_short_syntax{false};
 
     std::optional<String> attach_from_path = std::nullopt;
 
     bool replace_table{false};
     bool create_or_replace{false};
+
+    ASTTableOverrideList * table_overrides = nullptr; /// For CREATE DATABASE with engines that automatically create tables
 
     /** Get the text that identifies this element. */
     String getID(char delim) const override { return (attach ? "AttachQuery" : "CreateQuery") + (delim + database) + delim + table; }

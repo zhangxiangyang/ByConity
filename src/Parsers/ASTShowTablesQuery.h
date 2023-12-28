@@ -30,22 +30,25 @@ namespace DB
 {
 
 
-/** Query SHOW TABLES or SHOW DATABASES or SHOW CLUSTERS
+/** Query SHOW TABLES or SHOW DATABASES or SHOW CLUSTERS or SHOW SNAPSHOTS
   */
 class ASTShowTablesQuery : public ASTQueryWithOutput
 {
 public:
+    bool catalog{false};
     bool databases{false};
     bool clusters{false};
     bool cluster{false};
     bool dictionaries{false};
+    bool snapshots{false};
     bool m_settings{false};
     bool changed{false};
     bool temporary{false};
     bool history{false};   // if set true, will show databases/tables in trash.
-
+    bool external{false};
     String cluster_str;
-    String from;
+    String from; // database name
+    String from_catalog; // catalog name
     String like;
 
     bool not_like{false};

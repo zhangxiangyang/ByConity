@@ -27,18 +27,24 @@
 #include <type_traits>
 #include <functional>
 
-#include <Common/Exception.h>
-#include <Common/AllocatorWithMemoryTracking.h>
-#include <Core/Types.h>
-#include <Core/Defines.h>
 #include <Core/DecimalFunctions.h>
+#include <Core/Defines.h>
+#include <Core/Types.h>
 #include <Core/UUID.h>
+#include <Protos/EnumMacros.h>
+#include <Protos/enum.pb.h>
+#include <Common/AllocatorWithMemoryTracking.h>
+#include <Common/Exception.h>
 #include <common/DayNum.h>
 #include <common/strong_typedef.h>
 
-
 namespace DB
 {
+
+namespace Protos
+{
+    class Field;
+}
 
 namespace ErrorCodes
 {
@@ -274,65 +280,35 @@ public:
     struct Types
     {
         /// Type tag.
-        enum Which
-        {
-            Null    = 0,
-            UInt64  = 1,
-            Int64   = 2,
-            Float64 = 3,
-            UInt128 = 4,
-            Int128  = 5,
-
-            String  = 16,
-            Array   = 17,
-            Tuple   = 18,
-            Decimal32  = 19,
-            Decimal64  = 20,
-            Decimal128 = 21,
-            AggregateFunctionState = 22,
-            Decimal256 = 23,
-            UInt256 = 24,
-            Int256  = 25,
-            Map = 26,
-            UUID = 27,
-            ByteMap = 28,
-            BitMap64 = 29,
-
+        ENUM_WITH_PROTO_CONVERTER_C_STYLE(
+            Which, // enum name
+            Protos::FieldType, // proto enum message
+            (Null, 0),
+            (UInt64, 1),
+            (Int64, 2),
+            (Float64, 3),
+            (UInt128, 4),
+            (Int128, 5),
+            (String, 16),
+            (Array, 17),
+            (Tuple, 18),
+            (Decimal32, 19),
+            (Decimal64, 20),
+            (Decimal128, 21),
+            (AggregateFunctionState, 22),
+            (Decimal256, 23),
+            (UInt256, 24),
+            (Int256, 25),
+            (Map, 26),
+            (UUID, 27),
+            (ByteMap, 28),
+            (BitMap64, 29),
+            (SketchBinary, 30),
             // Special types for index analysis
-            NegativeInfinity = 254,
-            PositiveInfinity = 255,
-        };
+            (NegativeInfinity, 254),
+            (PositiveInfinity, 255));
 
-        static const char * toString(Which which)
-        {
-            switch (which)
-            {
-                case Null:    return "Null";
-                case NegativeInfinity: return "-Inf";
-                case PositiveInfinity: return "+Inf";
-                case UInt64:  return "UInt64";
-                case UInt128: return "UInt128";
-                case UInt256: return "UInt256";
-                case Int64:   return "Int64";
-                case Int128:  return "Int128";
-                case Int256:  return "Int256";
-                case UUID:    return "UUID";
-                case Float64: return "Float64";
-                case String:  return "String";
-                case Array:   return "Array";
-                case Tuple:   return "Tuple";
-                case Map:     return "Map";
-                case ByteMap:     return "Map";
-                case Decimal32:  return "Decimal32";
-                case Decimal64:  return "Decimal64";
-                case Decimal128: return "Decimal128";
-                case Decimal256: return "Decimal256";
-                case AggregateFunctionState: return "AggregateFunctionState";
-                case BitMap64: return "BitMap64";
-            }
-
-            throw Exception("Bad type of Field", ErrorCodes::BAD_TYPE_OF_FIELD);
-        }
+        static const char * toString(Which which);
     };
 
 
@@ -387,6 +363,22 @@ public:
         create(data, size);
     }
 
+    Field(const char8_t * data, size_t size, bool is_sketch_binary)
+    {
+        if (is_sketch_binary)
+        {
+            new (&storage) String(reinterpret_cast<const char *>(data), size);
+            which = Types::SketchBinary;
+        }
+        else
+        {
+            create(data, size);
+        }
+    }
+
+    void toProto(Protos::Field & proto) const;
+    void fillFromProto(const Protos::Field & proto);
+
     Field & operator= (const Field & rhs)
     {
         if (this != &rhs)
@@ -429,7 +421,13 @@ public:
     Field & operator= (const std::string_view & str);
     Field & operator= (const String & str) { return *this = std::string_view{str}; }
     Field & operator= (String && str);
-    Field & operator= (const char * str) { return *this = std::string_view{str}; }
+    Field & operator= (const char * str)
+    {
+        if (!str)
+            return *this = Null{};
+        else
+            return *this = std::string_view{str};
+    }
 
     ~Field()
     {
@@ -445,7 +443,9 @@ public:
     bool isNegativeInfinity() const { return which == Types::NegativeInfinity; }
     bool isPositiveInfinity() const { return which == Types::PositiveInfinity; }
 
-
+    bool isArray() const { return which == Types::Array; }
+    bool isTuple() const { return which == Types::Tuple; }
+    
     template <typename T>
     NearestFieldType<std::decay_t<T>> & get();
 
@@ -511,6 +511,7 @@ public:
             case Types::UUID:    return get<UUID>()    < rhs.get<UUID>();
             case Types::Float64: return get<Float64>() < rhs.get<Float64>();
             case Types::String:  return get<String>()  < rhs.get<String>();
+            case Types::SketchBinary:  return get<String>()  < rhs.get<String>();
             case Types::Array:   return get<Array>()   < rhs.get<Array>();
             case Types::Tuple:   return get<Tuple>()   < rhs.get<Tuple>();
             case Types::Map:     return get<Map>()     < rhs.get<Map>();
@@ -553,6 +554,7 @@ public:
             case Types::UUID:    return get<UUID>().toUnderType() <= rhs.get<UUID>().toUnderType();
             case Types::Float64: return get<Float64>() <= rhs.get<Float64>();
             case Types::String:  return get<String>()  <= rhs.get<String>();
+            case Types::SketchBinary:  return get<String>()  <= rhs.get<String>();
             case Types::Array:   return get<Array>()   <= rhs.get<Array>();
             case Types::Tuple:   return get<Tuple>()   <= rhs.get<Tuple>();
             case Types::Map:     return get<Map>()     <= rhs.get<Map>();
@@ -595,6 +597,7 @@ public:
             }
             case Types::UUID:    return get<UUID>()    == rhs.get<UUID>();
             case Types::String:  return get<String>()  == rhs.get<String>();
+            case Types::SketchBinary:  return get<String>()  == rhs.get<String>();
             case Types::Array:   return get<Array>()   == rhs.get<Array>();
             case Types::Tuple:   return get<Tuple>()   == rhs.get<Tuple>();
             case Types::Map:     return get<Map>()     == rhs.get<Map>();
@@ -643,6 +646,7 @@ public:
             case Types::UUID:    return f(field.template get<UUID>());
             case Types::Float64: return f(field.template get<Float64>());
             case Types::String:  return f(field.template get<String>());
+            case Types::SketchBinary:  return f(field.template get<String>());
             case Types::Array:   return f(field.template get<Array>());
             case Types::Tuple:   return f(field.template get<Tuple>());
             case Types::Map:     return f(field.template get<Map>());
@@ -661,8 +665,111 @@ public:
         __builtin_unreachable();
     }
 
+    /// Do some conversion or deserialization work base on type
+    template <typename F>
+    static Field dispatch(F && f, Field::Types::Which type)
+    {
+        switch (type)
+        {
+            case Types::Null:
+                return f.template operator()<Null>();
+            case Types::NegativeInfinity:
+                return f.template operator()<NegativeInfinity>();
+            case Types::PositiveInfinity:
+                return f.template operator()<PositiveInfinity>();
+// gcc 8.2.1
+#if !defined(__clang__)
+#    pragma GCC diagnostic push
+#    pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
+            case Types::UInt64:
+                return f.template operator()<UInt64>();
+            case Types::UInt128:
+                return f.template operator()<UInt128>();
+            case Types::UInt256:
+                return f.template operator()<UInt256>();
+            case Types::Int64:
+                return f.template operator()<Int64>();
+            case Types::Int128:
+                return f.template operator()<Int128>();
+            case Types::Int256:
+                return f.template operator()<Int256>();
+            case Types::UUID:
+                return f.template operator()<UUID>();
+            case Types::Float64:
+                return f.template operator()<Float64>();
+            case Types::String:
+                return f.template operator()<String>();
+            case Types::SketchBinary:
+                return f.template operator()<String>();
+            case Types::Array:
+                return f.template operator()<Array>();
+            case Types::Tuple:
+                return f.template operator()<Tuple>();
+            case Types::Map:
+                return f.template operator()<Map>();
+            case Types::ByteMap:
+                return f.template operator()<ByteMap>();
+            case Types::Decimal32:
+                return f.template operator()<Decimal32>();
+            case Types::Decimal64:
+                return f.template operator()<Decimal64>();
+            case Types::Decimal128:
+                return f.template operator()<Decimal128>();
+            case Types::Decimal256:
+                return f.template operator()<Decimal256>();
+            case Types::AggregateFunctionState:
+                return f.template operator()<AggregateFunctionStateData>();
+            case Types::BitMap64:
+                return f.template operator()<BitMap64>();
+#if !defined(__clang__)
+#    pragma GCC diagnostic pop
+#endif
+        }
+
+        __builtin_unreachable();
+    }
+
     String dump() const;
     static Field restoreFromDump(const std::string_view & dump_);
+
+    /**
+     * Covert field value to string, can be used to visualize the field value.
+     *
+     * @return Empty string if the field type is not supported.
+     *
+     * TODO: add unit test!
+     */
+    [[nodiscard]] String toString() const
+    {
+        switch (which)
+        {
+            case Types::UInt64:
+                return std::to_string(get<UInt64>());
+            case Types::Int64:
+                return std::to_string(get<Int64>());
+            case Types::Float64:
+                return std::to_string(get<Float64>());
+            case Types::UInt128:
+            {
+                uint64_t high = get<UInt128>() << 64;
+                uint64_t low = get<UInt128>() << 128;
+                return fmt::format("{}{}", high, low);
+            }
+            case Types::Int128:
+            {
+                int64_t high = get<Int128>() << 64;
+                uint64_t low = get<UInt128>() << 128;
+                return fmt::format("{}{}", high, low);
+            }
+            case Types::String:
+                return get<String>();
+
+            default:
+                // Other types are not currently supported
+                return "";
+        }
+    }
 
 private:
     std::aligned_union_t<DBMS_MIN_FIELD_SIZE - sizeof(Types::Which),

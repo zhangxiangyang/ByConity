@@ -512,6 +512,7 @@ static void appendBlock(const Block & from, Block & to)
                 /// If there is no column, then the exception was thrown in the middle of append, in the insertRangeFrom()
                 if (!col_to)
                 {
+                     // coverity[use_after_move]
                     col_to = std::move(last_col);
                     /// Suppress clang-tidy [bugprone-use-after-move]
                     last_col = {};
@@ -1091,7 +1092,7 @@ void StorageBuffer::alter(const AlterCommands & params, ContextPtr local_context
 
     StorageInMemoryMetadata new_metadata = *metadata_snapshot;
     params.apply(new_metadata, local_context);
-    DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(local_context, table_id, new_metadata);
+    DatabaseCatalog::instance().getDatabase(table_id.database_name, local_context)->alterTable(local_context, table_id, new_metadata);
     setInMemoryMetadata(new_metadata);
 }
 

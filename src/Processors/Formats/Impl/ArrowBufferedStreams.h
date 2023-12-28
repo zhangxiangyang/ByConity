@@ -3,7 +3,9 @@
 #if USE_ARROW || USE_ORC || USE_PARQUET
 
 #include <arrow/io/interfaces.h>
-
+#define ORC_MAGIC_BYTES "ORC"
+#define PARQUET_MAGIC_BYTES "PAR1"
+#define ARROW_MAGIC_BYTES "ARROW1"
 namespace DB
 {
 
@@ -37,7 +39,7 @@ private:
 class RandomAccessFileFromSeekableReadBuffer : public arrow::io::RandomAccessFile
 {
 public:
-    RandomAccessFileFromSeekableReadBuffer(SeekableReadBuffer & in_, off_t file_size_);
+    RandomAccessFileFromSeekableReadBuffer(SeekableReadBuffer & in_, off_t file_size_, bool avoid_buffering_);
 
     arrow::Result<int64_t> GetSize() override;
 
@@ -57,8 +59,36 @@ private:
     SeekableReadBuffer & in;
     off_t file_size;
     bool is_open = false;
-
+    bool avoid_buffering =false;
     ARROW_DISALLOW_COPY_AND_ASSIGN(RandomAccessFileFromSeekableReadBuffer);
+};
+
+class RandomAccessFileFromRandomAccessReadBuffer : public arrow::io::RandomAccessFile
+{
+public:
+    explicit RandomAccessFileFromRandomAccessReadBuffer(SeekableReadBuffer & in_, size_t file_size_);
+
+    // These are thread safe.
+    arrow::Result<int64_t> GetSize() override;
+    arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) override;
+    arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position, int64_t nbytes) override;
+    arrow::Future<std::shared_ptr<arrow::Buffer>> ReadAsync(
+        const arrow::io::IOContext&, int64_t position, int64_t nbytes) override;
+
+    // These are not thread safe, and arrow shouldn't call them. Return NotImplemented error.
+    arrow::Status Seek(int64_t) override;
+    arrow::Result<int64_t> Tell() const override;
+    arrow::Result<int64_t> Read(int64_t, void*) override;
+    arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t) override;
+
+    arrow::Status Close() override;
+    bool closed() const override { return !is_open; }
+
+private:
+    SeekableReadBuffer & in;
+    size_t file_size;
+    bool is_open = true;
+    ARROW_DISALLOW_COPY_AND_ASSIGN(RandomAccessFileFromRandomAccessReadBuffer);
 };
 
 class ArrowInputStreamFromReadBuffer : public arrow::io::InputStream
@@ -80,6 +110,7 @@ private:
 };
 
 std::shared_ptr<arrow::io::RandomAccessFile> asArrowFile(ReadBuffer & in);
+std::shared_ptr<arrow::io::RandomAccessFile> asArrowFile(SeekableReadBuffer & in, size_t file_size, bool avoid_buffering = false);
 
 }
 

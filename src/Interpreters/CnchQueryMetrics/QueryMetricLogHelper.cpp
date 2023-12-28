@@ -127,7 +127,7 @@ void extractDatabaseAndTableNames(const ContextPtr & context, const ASTPtr & ast
     {
         ASTs all_tables;
         bool dummy = false;
-        select_union->collectAllTables(all_tables, dummy);
+        ASTSelectQuery::collectAllTables(select_union, all_tables, dummy);
         bool first = true;
         for (const auto & db_table : all_tables)
         {
@@ -159,13 +159,13 @@ void extractDatabaseAndTableNames(const ContextPtr & context, const ASTPtr & ast
 
         if (insert->select)
         {
-            const auto & select_ast = insert->select->as<ASTSelectWithUnionQuery &>();
+            const auto * select_ast = insert->select->as<ASTSelectWithUnionQuery>();
             ASTs all_tables;
             bool dummy = false;
-            select_ast.collectAllTables(all_tables, dummy);
+            ASTSelectQuery::collectAllTables(select_ast, all_tables, dummy);
             for (const auto & db_table : all_tables)
             {
-                auto table_id = context->resolveStorageID(db_table);
+                StorageID table_id{db_table};
                 String database_name = table_id.database_name;
                 String table_name = table_id.table_name;
                 if (database_name.empty())
@@ -191,7 +191,7 @@ static bool checkSelectForFilteredTables(const ASTPtr & ast, const ContextPtr & 
     {
         std::vector<ASTPtr> all_base_tables;
         bool dummy = false;
-        select_ast->collectAllTables(all_base_tables, dummy);
+        ASTSelectQuery::collectAllTables(select_ast, all_base_tables, dummy);
         for (auto & table_ast : all_base_tables)
         {
             DatabaseAndTableWithAlias database_table(table_ast);
@@ -200,7 +200,8 @@ static bool checkSelectForFilteredTables(const ASTPtr & ast, const ContextPtr & 
             if ((database == CNCH_SYSTEM_LOG_DB_NAME || database == "system")
                 && ((!context->getSettingsRef().enable_query_metrics_tables_profiling
                         && (table == CNCH_SYSTEM_LOG_QUERY_METRICS_TABLE_NAME || table == CNCH_SYSTEM_LOG_QUERY_WORKER_METRICS_TABLE_NAME))
-                    || (!context->getSettingsRef().enable_kafka_log_profiling && table == CNCH_SYSTEM_LOG_KAFKA_LOG_TABLE_NAME)))
+                    || (!context->getSettingsRef().enable_kafka_log_profiling && table == CNCH_SYSTEM_LOG_KAFKA_LOG_TABLE_NAME)
+                    || (!context->getSettingsRef().enable_materialized_mysql_log_profiling && table == CNCH_SYSTEM_LOG_MATERIALIZED_MYSQL_LOG_TABLE_NAME)))
             {
                 return true;
             }
@@ -228,7 +229,7 @@ void insertCnchQueryMetric(
     if (ast && checkSelectForFilteredTables(ast, context))
     {
         LOG_DEBUG(&Poco::Logger::get("QueryMetricLogHelper"),
-            "Not inserting query metric for SELECT query from query metrics or kafka log tables");
+            "Not inserting query metric for SELECT query from query metrics or kafka/materialized_mysql log tables");
         return;
     }
     else
@@ -278,7 +279,7 @@ void insertCnchQueryMetric(
         {
             read_rows = info->read_rows;
             read_bytes = info->read_bytes;
-            read_cached_bytes = info->disk_cache_bytes;
+            read_cached_bytes = info->disk_cache_read_bytes;
 
             write_rows = info->written_rows;
             write_bytes = info->written_bytes;
@@ -347,7 +348,7 @@ void insertCnchQueryMetric(
         UInt64 peak_memory = (info) ? info->peak_memory_usage : 0;
         UInt32 read_rows = (info) ? info->read_rows : 0;
         UInt64 read_bytes = (info) ? info->read_bytes : 0;
-        UInt64 read_cached_bytes = (info) ? info->disk_cache_bytes : 0;
+        UInt64 read_cached_bytes = (info) ? info->disk_cache_read_bytes : 0;
         UInt32 write_rows = (info) ? info->written_rows : 0;
         UInt64 write_bytes = (info) ? info->written_bytes : 0;
         UInt64 write_duration = (info) ? info->written_duration : 0;

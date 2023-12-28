@@ -15,6 +15,7 @@
 
 #include <CloudServices/CnchCreateQueryHelper.h>
 
+#include <Interpreters/ApplyWithSubqueryVisitor.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/InterpreterCreateQuery.h>
 #include <Parsers/ASTCreateQuery.h>
@@ -24,6 +25,9 @@
 #include <Parsers/parseQuery.h>
 #include <Storages/IStorage.h>
 #include <Storages/StorageFactory.h>
+#include "Storages/ColumnsDescription.h"
+#include "Storages/ForeignKeysDescription.h"
+#include "Storages/UniqueNotEnforcedDescription.h"
 
 namespace DB
 {
@@ -32,7 +36,14 @@ std::shared_ptr<ASTCreateQuery> getASTCreateQueryFromString(const String & query
 {
     ParserCreateQuery parser_create;
     const auto & settings = context->getSettingsRef();
-    return std::dynamic_pointer_cast<ASTCreateQuery>(parseQuery(parser_create, query, settings.max_query_size, settings.max_parser_depth));
+    auto create_ast = std::dynamic_pointer_cast<ASTCreateQuery>(parseQuery(parser_create, query, settings.max_query_size, settings.max_parser_depth));
+    create_ast->attach = true;
+    create_ast->create = false;
+
+    if (create_ast->select && create_ast->isView())
+        ApplyWithSubqueryVisitor().visit(*create_ast->select);
+
+    return create_ast;
 }
 
 std::shared_ptr<ASTCreateQuery> getASTCreateQueryFromStorage(const IStorage & storage, const ContextPtr & context)
@@ -40,19 +51,42 @@ std::shared_ptr<ASTCreateQuery> getASTCreateQueryFromStorage(const IStorage & st
     return getASTCreateQueryFromString(storage.getCreateTableSql(), context);
 }
 
-StoragePtr createStorageFromQuery(const String & query, ContextMutablePtr & context)
+StoragePtr createStorageFromQuery(const String & query, const ContextPtr & context)
 {
     auto ast = getASTCreateQueryFromString(query, context);
+
+    ColumnsDescription columns;
+    if (ast->columns_list && ast->columns_list->columns)
+    {
+        columns = InterpreterCreateQuery::getColumnsDescription(*ast->columns_list->columns, context, true /*attach*/);
+    }
+    ConstraintsDescription constrants;
+    if (ast->columns_list && ast->columns_list->constraints)
+    {
+        constrants = InterpreterCreateQuery::getConstraintsDescription(ast->columns_list->constraints);
+    }
+    ForeignKeysDescription foreign_keys;
+    if (ast->columns_list && ast->columns_list->foreign_keys)
+    {
+        foreign_keys = InterpreterCreateQuery::getForeignKeysDescription(ast->columns_list->foreign_keys);
+    }
+    UniqueNotEnforcedDescription unique_not_enforced;
+    if (ast->columns_list && ast->columns_list->unique)
+    {
+        unique_not_enforced = InterpreterCreateQuery::getUniqueNotEnforcedDescription(ast->columns_list->unique);
+    }
 
     return StorageFactory::instance().get(
         *ast,
         "",
-        context,
+        Context::createCopy(context),
         context->getGlobalContext(),
         // Set attach = true to avoid making columns nullable due to ANSI settings, because the dialect change
         // should NOT affect existing tables.
-        InterpreterCreateQuery::getColumnsDescription(*ast->columns_list->columns, context, true /*attach*/),
-        InterpreterCreateQuery::getConstraintsDescription(ast->columns_list->constraints),
+        columns,
+        constrants,
+        foreign_keys,
+        unique_not_enforced,
         false /*has_force_restore_data_flag*/);
 }
 

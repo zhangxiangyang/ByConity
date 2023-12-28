@@ -192,10 +192,15 @@ struct IntegerRoundingComputation
 
     static ALWAYS_INLINE void compute(const T * __restrict in, size_t scale, T * __restrict out)
     {
-        if (sizeof(T) <= sizeof(scale) && scale > size_t(std::numeric_limits<T>::max()))
-            *out = 0;
-        else
-            *out = compute(*in, scale);
+        if constexpr (scale_mode == ScaleMode::Negative && sizeof(T) <= sizeof(scale))
+        {
+            if (scale > size_t(std::numeric_limits<T>::max()))
+            {
+                *out = 0;
+                return;
+            }
+        }
+        *out = compute(*in, scale);
     }
 
 };
@@ -721,7 +726,8 @@ public:
             && !executeNum<Float64>(in, out, boundaries)
             && !executeDecimal<Decimal32>(in, out, boundaries)
             && !executeDecimal<Decimal64>(in, out, boundaries)
-            && !executeDecimal<Decimal128>(in, out, boundaries))
+            && !executeDecimal<Decimal128>(in, out, boundaries)
+            && !executeDecimal<Decimal256>(in, out, boundaries))
         {
             throw Exception{"Illegal column " + in->getName() + " of first argument of function " + getName(), ErrorCodes::ILLEGAL_COLUMN};
         }

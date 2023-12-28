@@ -24,6 +24,7 @@
 #include <ServiceDiscovery/ServiceDiscoveryFactory.h>
 #include <ServiceDiscovery/ServiceDiscoveryConsul.h>
 #include <Storages/HDFS/HDFSFileSystem.h>
+#include <Storages/HDFS/HDFSAuth.h>
 #include <hdfs/hdfs.h>
 #include <common/logger_useful.h>
 #include <common/scope_guard.h>
@@ -198,8 +199,6 @@ HDFSBuilderPtr createHDFSBuilder(const Poco::URI & uri, const String & hdfs_user
             service_name = uri.getHost();
         }
     }
-
-
 
     hdfsBuilderSetUserName(builder.get(), hdfs_user.c_str());
 
@@ -534,7 +533,7 @@ ssize_t HDFSFileSystem::getCapacity() const
 }
 
 void HDFSFileSystem::list(const std::string& path,
-    std::vector<std::string>& filenames) const
+    std::vector<std::string>& filenames, std::vector<size_t> & sizes) const
 {
     HDFSFSPtr fs_copy = getFS();
     int num = 0;
@@ -549,6 +548,7 @@ void HDFSFileSystem::list(const std::string& path,
     {
         Poco::Path filename(files[i].mName);
         filenames.push_back(filename.getFileName());
+        sizes.push_back(files[i].mSize);
     }
     hdfsFreeFileInfo(files, num);
 }
@@ -793,13 +793,13 @@ HDFSConnectionParams::HDFSConnectionParams()
 HDFSConnectionParams::HDFSConnectionParams(HDFSConnectionType t, const String & hdfs_user_, const String & hdfs_service_)
     : conn_type(t), hdfs_user(hdfs_user_), hdfs_service(hdfs_service_), addrs()
 {
-    lookupOnNeed();
+    // lookupOnNeed();
 }
 
 HDFSConnectionParams::HDFSConnectionParams(HDFSConnectionType t, const String & hdfs_user_, const std::vector<IpWithPort>& addrs_ )
     : conn_type(t), hdfs_user(hdfs_user_), hdfs_service(""), addrs(addrs_)
 {
-    lookupOnNeed();
+    // lookupOnNeed();
 }
 
 HDFSConnectionParams HDFSConnectionParams::parseHdfsFromConfig(
@@ -817,26 +817,28 @@ HDFSConnectionParams HDFSConnectionParams::parseHdfsFromConfig(
 
     String hdfs_user = config.getString(hdfs_user_key, "clickhouse");
 
+    HDFSConnectionParams connect_params;
+
     if (config.has(cfs_addr_key))
     {
         // for ip:port, poco cannot parse it correctly. the ip will be parsed as scheme.
         Poco::URI cfs_uri(addSchemeOnNeed(cfs_addr_key, "cfs://"));
         String host = cfs_uri.getHost();
         int port = cfs_uri.getPort() == 0 ? 65212 : cfs_uri.getPort();
-        return HDFSConnectionParams(CONN_CFS, hdfs_user, {{host, port}});
+        connect_params = HDFSConnectionParams(CONN_CFS, hdfs_user, {{host, port}});
     }
     else if (config.has(hdfs_addr_key))
     {
         Poco::URI hdfs_uri(addSchemeOnNeed(config.getString(hdfs_addr_key), "hdfs://"));
         String host = hdfs_uri.getHost();
         int port = hdfs_uri.getPort() == 0 ? 65212 : hdfs_uri.getPort();
-        return HDFSConnectionParams(CONN_HDFS, hdfs_user, {{host, port}});
+        connect_params = HDFSConnectionParams(CONN_HDFS, hdfs_user, {{host, port}});
     }
     else if (config.has(hdfs_ha_key))
     {
-        return HDFSConnectionParams(CONN_HA, hdfs_user, config.getString(hdfs_ha_key));
+        connect_params = HDFSConnectionParams(CONN_HA, hdfs_user, config.getString(hdfs_ha_key));
     }
-    else if (config.has(hdfs_nnproxy_key))
+    else
     {
         // hdfs_nnproxy could refer to both cfs and nnproxy.
         String hdfs_nnproxy = config.getString(hdfs_nnproxy_key, "nnproxy");
@@ -847,15 +849,18 @@ HDFSConnectionParams HDFSConnectionParams::parseHdfsFromConfig(
             HDFSConnectionType conn_type = isCfsScheme(proxy_uri.getScheme()) ? CONN_CFS : CONN_HDFS;
             String host = proxy_uri.getHost();
             int port = proxy_uri.getPort() == 0 ? 65212 : proxy_uri.getPort();
-            return HDFSConnectionParams(conn_type, hdfs_user, {{host, port}});
+            connect_params = HDFSConnectionParams(conn_type, hdfs_user, {{host, port}});
         }
         else
         {
             // this is a nnproxy.
-            return HDFSConnectionParams(CONN_NNPROXY, hdfs_user, hdfs_nnproxy);
+            connect_params = HDFSConnectionParams(CONN_NNPROXY, hdfs_user, hdfs_nnproxy);
         }
     }
-    return HDFSConnectionParams();
+
+    connect_params.krb5_params = HDFSKrb5Params::parseKrb5FromConfig(config, config_prefix);
+
+    return connect_params;
 }
 
 HDFSConnectionParams HDFSConnectionParams::parseFromMisusedNNProxyStr(String hdfs_nnproxy,String hdfs_user)
@@ -880,23 +885,49 @@ HDFSConnectionParams HDFSConnectionParams::parseFromMisusedNNProxyStr(String hdf
 
 void HDFSConnectionParams::lookupOnNeed()
 {
+    // if (conn_type != CONN_NNPROXY)
+    //     return;
+
+    // HostWithPortsVec nnproxys = lookupNNProxy(hdfs_service);
+    // assert(nnproxys.size() > 0);
+    // for (auto it : nnproxys)
+    // {
+    //     addrs.emplace_back(it.getHost(), it.tcp_port);
+    // }
+    // // ensure the nnproxy picked is not the same as the broken one.
+    // nnproxy_index = brokenNNs.findOneGoodNN(nnproxys);
+    inited = true;
+}
+
+std::vector<HDFSConnectionParams::IpWithPort> HDFSConnectionParams::lookupAndShuffle() const 
+{
+    std::vector<IpWithPort> ret;
     if (conn_type != CONN_NNPROXY)
-        return;
+        return ret;
 
     HostWithPortsVec nnproxys = lookupNNProxy(hdfs_service);
     assert(nnproxys.size() > 0);
+    shuffleAddrs(nnproxys);
     for (auto it : nnproxys)
     {
-        addrs.emplace_back(it.getHost(), it.tcp_port);
+        ret.emplace_back(it.host, it.tcp_port);
     }
-    // ensure the nnproxy picked is not the same as the broken one.
-    nnproxy_index = brokenNNs.findOneGoodNN(nnproxys);
-    inited = true;
+    return ret;
+}
+
+void HDFSConnectionParams::shuffleAddrs(HostWithPortsVec & shuffle_addrs) const
+{
+    if (shuffle_addrs.size() < 2)
+        return;
+
+    static thread_local std::random_device shuffle_rd{};
+    auto dist = std::mt19937{shuffle_rd()};
+    std::shuffle(shuffle_addrs.begin(),shuffle_addrs.end(), dist);
 }
 
 void HDFSConnectionParams::setNNProxyBroken()
 {
-    if( conn_type != CONN_NNPROXY || !inited) {
+    if (conn_type != CONN_NNPROXY || !inited) {
         return;
     }
     brokenNNs.insert(addrs[nnproxy_index].first);
@@ -908,6 +939,7 @@ Poco::URI HDFSConnectionParams::formatPath(const String & path) const
     switch (conn_type)
     {
         case CONN_NNPROXY: {
+            auto addrs_from_nnproxy = lookupAndShuffle();
             uri.setScheme("hdfs");
             if (use_nnproxy_ha)
             {
@@ -915,8 +947,8 @@ Poco::URI HDFSConnectionParams::formatPath(const String & path) const
             }
             else
             {
-                uri.setHost(addrs[nnproxy_index].first);
-                uri.setPort(addrs[nnproxy_index].second);
+                uri.setHost(addrs_from_nnproxy[0].first);
+                uri.setPort(addrs_from_nnproxy[0].second);
             }
             return uri;
         }
@@ -957,6 +989,14 @@ HDFSBuilderPtr HDFSConnectionParams::createBuilder(const Poco::URI & uri) const
     // set read/connect timeout, default value in libhdfs3 is about 1 hour, and too large
 
     HDFSBuilderPtr builder(raw_builder);
+
+    //set krb5 auth and init
+    if(krb5_params.need_kinit)
+    {
+        krb5_params.setHDFSKrb5Config(builder.get());
+        krb5_params.runKinit();
+    }
+
     if (!uri.getHost().empty())
     {
         auto normalizedHost =  std::get<0>(safeNormalizeHost(uri.getHost()));
@@ -981,14 +1021,15 @@ HDFSBuilderPtr HDFSConnectionParams::createBuilder(const Poco::URI & uri) const
     switch (conn_type)
     {
         case CONN_NNPROXY: {
+            auto addrs_from_nnproxy = lookupAndShuffle();
             if (use_nnproxy_ha)
             {
-                setHdfsHaConfig(builder, hdfs_service, hdfs_user, addrs);
+                setHdfsHaConfig(builder, hdfs_service, hdfs_user, addrs_from_nnproxy);
                 return builder;
             }
             else
             {
-                IpWithPort targetNode = addrs[nnproxy_index];
+                IpWithPort targetNode = addrs_from_nnproxy[0];
                 setHdfsDirectConfig(builder, hdfs_user, "hdfs://" + std::get<0>(safeNormalizeHost(targetNode.first)), targetNode.second);
                 return builder;
             }
@@ -1168,7 +1209,8 @@ void setLastModified(const std::string& path, const Poco::Timestamp& ts)
 
 void list(const std::string& path, std::vector<std::string>& files)
 {
-    getDefaultHdfsFileSystem()->list(path, files);
+    std::vector<size_t> sizes;
+    getDefaultHdfsFileSystem()->list(path, files, sizes);
 }
 
 bool isFile(const std::string& path)

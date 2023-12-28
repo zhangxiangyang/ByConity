@@ -58,6 +58,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS 1) # Write compile_commands.json
 set(CMAKE_LINK_DEPENDS_NO_SHARED 1) # Do not relink all depended targets on .so
 set(CMAKE_CONFIGURATION_TYPES "RelWithDebInfo;Debug;Release;MinSizeRel" CACHE STRING "" FORCE)
 set(CMAKE_DEBUG_POSTFIX "d" CACHE STRING "Generate debug library name with a postfix.")    # To be consistent with CMakeLists from contrib libs.
+set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
 
 # Enable the ability to organize targets into hierarchies of "folders" for capable GUI-based IDEs.
 # For more info see https://cmake.org/cmake/help/latest/prop_gbl/USE_FOLDERS.html
@@ -544,7 +545,6 @@ include (cmake/find/miniselect.cmake)
 include (cmake/find/hdfs3.cmake) # uses protobuf
 include (cmake/find/poco.cmake)
 include (cmake/find/curl.cmake)
-include (cmake/find/s3.cmake)
 include (cmake/find/base64.cmake)
 include (cmake/find/parquet.cmake)
 include (cmake/find/simdjson.cmake)
@@ -558,7 +558,7 @@ include (cmake/find/libpqxx.cmake)
 include (cmake/find/nuraft.cmake)
 include (cmake/find/yaml-cpp.cmake)
 include (cmake/find/json-c.cmake)
-include (cmake/find/libnuma.cmake)
+include (cmake/find/phmap.cmake)
 
 if(NOT USE_INTERNAL_PARQUET_LIBRARY)
     set (ENABLE_ORC OFF CACHE INTERNAL "")
@@ -576,6 +576,10 @@ include (cmake/find/brpc.cmake)
 include (cmake/find/breakpad.cmake)
 include (cmake/find/benchmark.cmake)
 include (cmake/find/hivemetastore.cmake)
+include (cmake/find/cjson.cmake)
+include (cmake/find/java-extensions.cmake)
+include (cmake/find/cppjieba.cmake)
+include (cmake/find/tsquery.cmake)
 
 set (USE_INTERNAL_CITYHASH_LIBRARY ON CACHE INTERNAL "")
 find_contrib_lib(cityhash)
@@ -634,6 +638,17 @@ include (cmake/warnings.cmake)
 # Check if needed compiler flags are supported
 include (cmake/check_flags.cmake)
 
+# ClickHouse developers may use platform-dependent code under some macro (e.g. `#ifdef ENABLE_MULTITARGET`).
+# If turned ON, this option defines such macro.
+# See `src/Functions/TargetSpecific.h`
+option(ENABLE_MULTITARGET_CODE "Enable platform-dependent code" ON)
+
+if (ENABLE_MULTITARGET_CODE)
+    add_compile_definitions(ENABLE_MULTITARGET_CODE=1)
+else()
+    add_compile_definitions(ENABLE_MULTITARGET_CODE=0)
+endif()
+
 add_subdirectory (base)
 add_subdirectory (src)
 add_subdirectory (programs)
@@ -643,3 +658,4 @@ add_subdirectory (utils)
 include (cmake/print_include_directories.cmake)
 
 include (cmake/sanitize_target_link_libraries.cmake)
+include (cmake/build_info.cmake)
